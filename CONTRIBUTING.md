@@ -25,7 +25,8 @@ you have the right to distribute under that license.
 
 Keep discussions respectful, specific, and focused on the work. Harassment and
 disclosure of another person's private information are not acceptable. Maintainers
-may remove inappropriate content or restrict participation.
+may remove inappropriate content or restrict participation. Follow the
+[Code of Conduct](CODE_OF_CONDUCT.md) when participating in this project.
 
 For vulnerabilities, follow [SECURITY.md](SECURITY.md) instead of opening a
 public issue.

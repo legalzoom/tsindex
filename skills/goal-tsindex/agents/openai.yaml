@@ -1,0 +1,4 @@
+interface:
+  display_name: "/goal-tsindex"
+  short_description: "Start local tsindex code navigation"
+  default_prompt: "Use /goal-tsindex (the $goal-tsindex skill) to start tsindex for this repo and use tsindex MCP tools for code navigation."

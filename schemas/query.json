@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "description": "Result `range` values are `[start_row, start_col, end_row, end_col]`: rows are 1-based, columns are 0-based UTF-8 BYTE offsets (tree-sitter convention, not character indexes), and the end is exclusive.",
+  "properties": {
+    "language": { "type": "string" },
+    "repo": { "type": "string" },
+    "query": { "type": "string" },
+    "file_glob": { "type": "string" },
+    "capture": { "type": "string" },
+    "limit": { "type": "integer", "minimum": 1, "description": "Cap on captures returned before truncation. Defaults to the server `default_result_limit`, clamped to `max_result_limit`. Capture text is char-capped at `capture_char_limit`." },
+    "offset": { "type": "integer", "minimum": 0, "description": "Stable pagination offset over the capture stream. Use `next_offset` from the response to resume." }
+  },
+  "required": ["language", "query"]
+}

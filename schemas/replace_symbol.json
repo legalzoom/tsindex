@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "description": "Result `old_range`/`new_range` values are `[start_row, start_col, end_row, end_col]`: rows are 1-based, columns are 0-based UTF-8 BYTE offsets (tree-sitter convention, not character indexes), and the end is exclusive.",
+  "properties": {
+    "file": { "type": "string", "description": "Repo-relative path to the file to edit." },
+    "name": { "type": "string", "description": "Name of the symbol to replace." },
+    "new_body": { "type": "string", "description": "Replacement text for the symbol. Spans the symbol's full line range, including the same leading indentation get_symbol returns in its body. Do not append a trailing newline." },
+    "repo": { "type": "string", "description": "Repo containing the file. Optional when the catalog has a single repo." },
+    "kind": { "type": "string", "description": "Optional symbol kind (e.g. function, class) to disambiguate when several symbols share the name." },
+    "qualified": { "type": "string", "description": "Optional dotted container path exactly as get_symbol reports in `qualified` (e.g. `Outer.method`). Use it when several same-kind symbols share the name in different containers — `kind` cannot tell those apart." },
+    "row": { "type": "integer", "minimum": 1, "description": "Optional 1-based start row of the intended symbol (its `range[0]`). Use it when duplicates share both kind and container, e.g. two C++ overloads of the same function. (A C prototype and its definition differ in `kind`: `prototype` vs `function`.)" }
+  },
+  "required": ["file", "name", "new_body"]
+}

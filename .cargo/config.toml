@@ -1,0 +1,5 @@
+# Keep cargo-spawned binaries (cargo test / cargo run) from writing usage
+# telemetry into the developer's real ~/.tsindex. Installed binaries are
+# unaffected: this only applies to processes cargo itself launches.
+[env]
+TSINDEX_HOME = { value = "target/tsindex-home", relative = true }

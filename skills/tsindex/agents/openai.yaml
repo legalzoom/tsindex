@@ -1,0 +1,4 @@
+interface:
+  display_name: "tsindex"
+  short_description: "Start and use local tsindex code navigation"
+  default_prompt: "Use $tsindex to start tsindex for this repo and use tsindex MCP tools for code navigation."

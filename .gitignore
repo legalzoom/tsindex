@@ -1,0 +1,16 @@
+/target
+.tsindex/
+.worktrees/
+dist/
+.claude/
+.codex/
+.DS_Store
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jsonl
+/scripts/

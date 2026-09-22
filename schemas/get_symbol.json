@@ -1,0 +1,17 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "description": "Result `range` values are `[start_row, start_col, end_row, end_col]`: rows are 1-based, columns are 0-based UTF-8 BYTE offsets (tree-sitter convention, not character indexes), and the end is exclusive.",
+  "properties": {
+    "name": { "type": "string", "description": "A single symbol name. Provide this or `names`." },
+    "names": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Several symbol names to fetch in ONE call. Prefer this when you need multiple symbols — it batches the lookups and saves round-trips. Distinguish results by each match's `name` field." },
+    "repo": { "type": "string" },
+    "kind": { "type": "string" },
+    "file_glob": { "type": "string" },
+    "include_body": { "type": "boolean", "description": "When true, each match includes its verbatim source `body` — for understanding a symbol. It cannot be used to skip Edit's required file read; to rewrite a whole symbol without reading, use replace_symbol." },
+    "context_lines": { "type": "integer", "minimum": 0 },
+    "max_body_lines": { "type": "integer", "minimum": 1, "description": "Keep this many source lines per returned `body`, eliding the middle with an additional `… N lines elided …` marker line that reports the true line count. The serialized body may therefore contain up to `max_body_lines + 1` lines. Omit to use `default_body_line_limit`; explicit values are clamped to `max_body_line_limit`." },
+    "limit": { "type": "integer", "minimum": 1, "description": "Cap on matches returned per name before truncation. Defaults to the server `default_result_limit`, clamped to `max_result_limit`. Results are split fairly across the requested names. The effective page size may be smaller than `limit` because of the server's serialized-byte budget (`max_response_chars`), which shrinks a page that would otherwise exceed the client's tool-result cap. Always follow `next_offset` to resume rather than assuming you received `limit` results per name." },
+    "offset": { "type": "integer", "minimum": 0, "description": "Stable pagination offset — skip this many matches per name (in `name, repo, file, row, col` order) before emitting. Use `next_offset` from the response to resume." }
+  }
+}

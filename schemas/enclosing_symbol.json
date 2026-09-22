@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "description": "Result `range` values are `[start_row, start_col, end_row, end_col]`: rows are 1-based, columns are 0-based UTF-8 BYTE offsets (tree-sitter convention, not character indexes), and the end is exclusive.",
+  "properties": {
+    "file": { "type": "string" },
+    "row": { "type": "integer", "minimum": 1, "description": "A single 1-based row (matches the `file:line` numbers in get_symbol/find_references output and your editor). Provide this or `rows`." },
+    "rows": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 1, "description": "Several 1-based rows in the same file to resolve in ONE call — e.g. every line of a stack trace or diff hunk. Row-only; results come back per row under `results`." },
+    "col": { "type": "integer", "minimum": 0, "description": "0-based UTF-8 byte offset within the row (tree-sitter convention), NOT a character index — they differ on lines containing non-ASCII text. Same unit as the `range` columns every tool returns." },
+    "repo": { "type": "string" },
+    "include_body": { "type": "boolean" },
+    "context_lines": { "type": "integer", "minimum": 0 },
+    "depth": { "type": "integer", "minimum": 1 },
+    "max_body_lines": { "type": "integer", "minimum": 1, "description": "Keep this many source lines per returned `body`, eliding the middle with an additional `… N lines elided …` marker line that reports the true line count. The serialized body may therefore contain up to `max_body_lines + 1` lines. Omit to use `default_body_line_limit`; explicit values are clamped to `max_body_line_limit`." },
+    "limit": { "type": "integer", "minimum": 1, "description": "Cap on how many `rows` are resolved in one call (batch path only). Defaults to the server `default_result_limit`, clamped to `max_result_limit`. The effective page size may be smaller than `limit` because of the server's serialized-byte budget (`max_response_chars`), which shrinks a page that would otherwise exceed the client's tool-result cap. Always follow `next_offset` to resume rather than assuming you received `limit` results." },
+    "offset": { "type": "integer", "minimum": 0, "description": "Stable pagination offset over the requested `rows` list (batch path only) — skip this many rows before resolving. Use `next_offset` from the response to resume." }
+  },
+  "required": ["file"]
+}

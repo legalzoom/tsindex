@@ -1,0 +1,18 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "description": "Result `range` values are `[start_row, start_col, end_row, end_col]`: rows are 1-based, columns are 0-based UTF-8 BYTE offsets (tree-sitter convention, not character indexes), and the end is exclusive.",
+  "properties": {
+    "names": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "One or more identifiers to find references for. Always pass an array: use `[\"symbol\"]` for one identifier. Batching saves round-trips before a multi-symbol refactor; when multiple identifiers are requested, each reference carries its `name` so you can tell them apart." },
+    "repo": { "type": "string" },
+    "scope": { "type": "string" },
+    "exclude_tests": { "type": "boolean" },
+    "include_declarations": { "type": "boolean", "description": "Include declaration-name occurrences. Off by default so the defining declaration is not reported as a use." },
+    "group_by_file": { "type": "boolean", "description": "Group results by file. When the response is `truncated`, `groups` covers only the returned slice — it is NOT the full set of matching files, and its length is not the distinct-file count. Use the response's `total_files` for the distinct-file count (across ALL requested names combined, pre-pagination); paginate via `next_offset` before reporting any per-file totals." },
+    "snippet_lines": { "type": "integer", "minimum": 0, "description": "Lines of snippet per reference. 1 (default) collapses to the reference's own line; a larger value pads with that many surrounding lines kept verbatim, placing the reference in the MIDDLE of the block. When you pass more than 1, the reference line is `range[0] - snippet_start_row` within `snippet` — use that field, never assume `range` points at the snippet's first line." },
+    "limit": { "type": "integer", "minimum": 1, "description": "Cap on references returned before truncation. Defaults to the server `default_result_limit`, clamped to `max_result_limit`. The effective page size may be smaller than `limit` because of the server's serialized-byte budget (`max_response_chars`), which shrinks a page that would otherwise exceed the client's tool-result cap. Always follow `next_offset` to resume rather than assuming you received `limit` results." },
+    "offset": { "type": "integer", "minimum": 0, "description": "Stable pagination offset over the reference list (in `name, repo, file, row, col` order). Use `next_offset` from the response to resume." },
+    "counts_only": { "type": "boolean", "description": "Aggregate-only mode. When true, return exact per-file reference counts, the overall `total`, `total_files`, and (for multi-name) per-name `names` totals — with NO per-reference rows, snippets, or pagination. `total`/`total_files`/`names` are always exact, computed over the FULL filtered set in one pass. The `files` array is capped by the server's byte budget: when the full list won't fit, the top `files_returned` by count are kept and `files_truncated` is set (narrow with `scope` or fewer names to see more). A fraction of the row-level payload. Use it for 'how many references / which files use X' questions instead of paging. Ignores `limit`, `offset`, `group_by_file`, and `snippet_lines`." }
+  },
+  "required": ["names"]
+}

@@ -1,0 +1,18 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "description": "Result `range` values are `[start_row, start_col, end_row, end_col]`: rows are 1-based, columns are 0-based UTF-8 BYTE offsets (tree-sitter convention, not character indexes), and the end is exclusive.",
+  "properties": {
+    "file": { "type": "string" },
+    "repo": { "type": "string" },
+    "depth": { "type": "integer", "minimum": 1 },
+    "include_signatures": { "type": "boolean" },
+    "include_docstrings": { "type": "boolean" },
+    "include_imports": { "type": "boolean", "description": "Include import/use rows. Off by default — they bloat the outline and rarely aid orientation." },
+    "include_bodies_for": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Names whose full body to inline into the outline. Orient AND fetch selected bodies in one call — saves a round-trip vs an outline followed by separate get_symbol calls. Bodies appear on matching nodes' `body` field." },
+    "max_body_lines": { "type": "integer", "minimum": 1, "description": "Keep this many source lines per inlined body (from `include_bodies_for`), eliding the middle with an additional `… N lines elided …` marker line that reports the true line count. The serialized body may therefore contain up to `max_body_lines + 1` lines. Omit to use `default_body_line_limit`; explicit values are clamped to `max_body_line_limit`." },
+    "limit": { "type": "integer", "minimum": 1, "description": "Cap on the number of top-level outline symbols returned before truncation. Defaults to the server `default_result_limit`, clamped to `max_result_limit`. Pagination operates on the outer symbol list only." },
+    "offset": { "type": "integer", "minimum": 0, "description": "Stable pagination offset over the top-level symbol list. Use `next_offset` from the response to resume." }
+  },
+  "required": ["file"]
+}

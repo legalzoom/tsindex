@@ -33,8 +33,8 @@ When a release is available, download the macOS binary for your architecture
 (arm64 or x86_64) and `checksums.txt` from the
 [Releases page](https://github.com/legalzoom/tsindex/releases).
 Verify its checksum with `shasum -a 256`, make it executable with `chmod +x`,
-and place it in a directory on your `PATH`. Releases also include the MIT
-license, third-party notices, and build provenance when available.
+and place it in a directory on your `PATH`. Releases also include the MIT and
+Apache-2.0 license texts, third-party notices, and build provenance when available.
 See [SECURITY.md](SECURITY.md) for verification details.
 
 ### From source
@@ -494,11 +494,13 @@ cargo test
 
 Maintainers publish a release by pushing a `vX.Y.Z` tag matching `Cargo.toml`
 from the reviewed `main` branch. GitHub Actions builds the macOS binaries,
-generates checksums and provenance, and attaches the project license and
+generates checksums and provenance, and attaches the project license texts and
 third-party notices. Existing release versions are not overwritten.
 
-tsindex is available under the [MIT license](LICENSE). Dependency licenses and
-copyright notices are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+tsindex is available under either the [MIT license](LICENSE-MIT) or the
+[Apache License, Version 2.0](LICENSE-APACHE), at your option
+(`MIT OR Apache-2.0`). Dependency licenses and copyright notices are listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ### Project layout
 

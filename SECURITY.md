@@ -32,6 +32,6 @@ tsindex does not send them to an analytics service.
 
 ## Release verification
 
-Releases include checksums, the project license, and third-party notices. Verify
+Releases include checksums, the project license texts, and third-party notices. Verify
 the checksums before using a binary. When a release includes a GitHub build
 attestation, verify it with `gh attestation verify <binary> --repo legalzoom/tsindex`.

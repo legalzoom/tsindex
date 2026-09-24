@@ -20,8 +20,9 @@ CI also scans for credentials and dependency advisories. Update
 license texts and copyright notices. Check the relevant dependency's published
 source if its package omits the license text.
 
-Contributions are made under the project's MIT license. Only contribute code
-you have the right to distribute under that license.
+Contributions are made under the same dual MIT OR Apache-2.0 terms as the
+project, allowing recipients to choose either license. Only contribute code
+you have the right to offer under both licenses.
 
 Keep discussions respectful, specific, and focused on the work. Harassment and
 disclosure of another person's private information are not acceptable. Maintainers

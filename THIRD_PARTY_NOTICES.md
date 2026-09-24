@@ -2,7 +2,8 @@
 
 This inventory covers the registry dependencies in `Cargo.lock`, including
 build, development, and platform-specific dependencies. A particular binary
-may use a subset. The project MIT license does not replace these terms.
+may use a subset. The project's MIT OR Apache-2.0 licensing does not replace
+these terms.
 
 License texts are reproduced from checksum-verified published packages or
 the upstream revisions recorded in their package metadata. The SCSS grammar

@@ -174,6 +174,9 @@ fn mcp_watcher_skips_dependency_symlinks_and_refreshes_source() -> Result<()> {
     fs::create_dir(&dependency)?;
     fs::create_dir(root.join("node_modules"))?;
     symlink(&dependency, root.join("node_modules/linked"))?;
+    // A dependency store linked from the top level sits outside every ignored
+    // directory, so only the no-follow registration walk keeps it unwatched.
+    symlink(&dependency, root.join("linked"))?;
     fs::create_dir_all(root.join("generated/nested"))?;
     fs::write(root.join(".tsindexignore"), "generated/\n")?;
 
@@ -182,6 +185,9 @@ fn mcp_watcher_skips_dependency_symlinks_and_refreshes_source() -> Result<()> {
             .arg("--root")
             .arg(&root)
             .args(["serve", "--mcp"])
+            // Each step below waits out one debounce window; keep it short.
+            .env("TSINDEX_WATCH_DEBOUNCE_MS", "200")
+            // Never written, but it must stay open: the server exits on stdin EOF.
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -189,7 +195,7 @@ fn mcp_watcher_skips_dependency_symlinks_and_refreshes_source() -> Result<()> {
     );
     let stderr = server.0.stderr.take().unwrap();
     let (ready_tx, ready_rx) = mpsc::channel();
-    let reader = thread::spawn(move || {
+    thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
             if line.contains("repos for changes") {
                 let _ = ready_tx.send(());
@@ -197,76 +203,85 @@ fn mcp_watcher_skips_dependency_symlinks_and_refreshes_source() -> Result<()> {
         }
     });
 
-    let result = (|| -> Result<()> {
-        ready_rx
-            .recv_timeout(Duration::from_secs(10))
-            .context("MCP watcher did not finish registering directories")?;
+    ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .context("MCP watcher did not finish registering directories")?;
 
-        // Inspect the real inotify registrations: filtering dependency events
-        // after registration cannot prevent symlink fan-out and memory growth.
-        let mut watched_inodes = HashSet::new();
-        for info in fs::read_dir(format!("/proc/{}/fdinfo", server.0.id()))? {
-            for line in fs::read_to_string(info?.path())?.lines() {
-                if line.starts_with("inotify ") {
-                    for field in line.split_whitespace() {
-                        if let Some(inode) = field.strip_prefix("ino:") {
-                            watched_inodes.insert(u64::from_str_radix(inode, 16)?);
-                        }
+    // Inspect the real inotify registrations: filtering dependency events
+    // after registration cannot prevent symlink fan-out and memory growth.
+    let mut watched_inodes = HashSet::new();
+    for info in fs::read_dir(format!("/proc/{}/fdinfo", server.0.id()))? {
+        // The startup build is closing its own descriptors concurrently;
+        // one that vanished between listing and reading is not inotify's.
+        let Ok(contents) = fs::read_to_string(info?.path()) else {
+            continue;
+        };
+        for line in contents.lines() {
+            if line.starts_with("inotify ") {
+                for field in line.split_whitespace() {
+                    if let Some(inode) = field.strip_prefix("ino:") {
+                        watched_inodes.insert(u64::from_str_radix(inode, 16)?);
                     }
                 }
             }
         }
+    }
+    assert!(
+        watched_inodes.contains(&fs::metadata(root.join("src"))?.ino()),
+        "ordinary source directories must still be watched"
+    );
+    assert!(
+        !watched_inodes.contains(&fs::metadata(&dependency)?.ino()),
+        "recursive registration must not follow linked dependency trees"
+    );
+    for ignored in ["node_modules", "generated", "generated/nested"] {
         assert!(
-            watched_inodes.contains(&fs::metadata(root.join("src"))?.ino()),
-            "ordinary source directories must still be watched"
+            !watched_inodes.contains(&fs::metadata(root.join(ignored))?.ino()),
+            "ignored directory {ignored} must not consume an inotify watch"
         );
-        assert!(
-            !watched_inodes.contains(&fs::metadata(&dependency)?.ino()),
-            "recursive registration must not follow linked dependency trees"
-        );
-        for ignored in ["node_modules", "generated", "generated/nested"] {
-            assert!(
-                !watched_inodes.contains(&fs::metadata(root.join(ignored))?.ino()),
-                "ignored directory {ignored} must not consume an inotify watch"
-            );
-        }
+    }
 
-        let wait_for_symbol = |name: &str| -> Result<()> {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                let found = rusqlite::Connection::open_with_flags(
-                    root.join(".tsindex/index.db"),
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    let wait_for_symbol = |name: &str| -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let found = rusqlite::Connection::open_with_flags(
+                root.join(".tsindex/index.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM symbols WHERE name = ?1",
+                    [name],
+                    |row| row.get::<_, u64>(0),
                 )
-                .and_then(|conn| {
-                    conn.query_row(
-                        "SELECT COUNT(*) FROM symbols WHERE name = ?1",
-                        [name],
-                        |row| row.get::<_, u64>(0),
-                    )
-                });
-                if matches!(found, Ok(count) if count > 0) {
-                    return Ok(());
-                }
-                anyhow::ensure!(Instant::now() < deadline, "symbol {name} was not refreshed");
-                thread::sleep(Duration::from_millis(100));
+            });
+            if matches!(found, Ok(count) if count > 0) {
+                return Ok(());
             }
-        };
-        wait_for_symbol("alpha")?;
-        fs::write(root.join("src/a.py"), "def after_edit():\n    return 2\n")?;
-        wait_for_symbol("after_edit")?;
-        fs::create_dir_all(root.join("new/nested"))?;
-        let added = root.join("new/nested/added.py");
-        fs::write(&added, "def added_directory():\n    return 3\n")?;
-        wait_for_symbol("added_directory")?;
-        fs::write(&added, "def edited_new_directory():\n    return 4\n")?;
-        wait_for_symbol("edited_new_directory")?;
-        Ok(())
-    })();
-
-    drop(server);
-    reader.join().expect("stderr reader panicked");
-    result
+            anyhow::ensure!(Instant::now() < deadline, "symbol {name} was not refreshed");
+            thread::sleep(Duration::from_millis(100));
+        }
+    };
+    wait_for_symbol("alpha")?;
+    fs::write(root.join("src/a.py"), "def after_edit():\n    return 2\n")?;
+    wait_for_symbol("after_edit")?;
+    fs::create_dir_all(root.join("new/nested"))?;
+    let added = root.join("new/nested/added.py");
+    fs::write(&added, "def added_directory():\n    return 3\n")?;
+    wait_for_symbol("added_directory")?;
+    fs::write(&added, "def edited_new_directory():\n    return 4\n")?;
+    wait_for_symbol("edited_new_directory")?;
+    // Un-ignoring a directory must index what is already inside it and
+    // register watches there, so later edits inside it are seen as well.
+    let unignored = root.join("generated/nested/g.py");
+    fs::write(&unignored, "def unignored():\n    return 5\n")?;
+    fs::write(root.join(".tsindexignore"), "")?;
+    wait_for_symbol("unignored")?;
+    fs::write(&unignored, "def edited_unignored():\n    return 6\n")?;
+    wait_for_symbol("edited_unignored")?;
+    // `server` kills the child when dropped, including on early `?` returns;
+    // its stderr then closes and the reader thread ends on its own.
+    Ok(())
 }
 
 fn http(port: u16, request: &str) -> Result<String> {

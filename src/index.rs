@@ -565,9 +565,7 @@ impl Runtime {
             };
             // An edited ignore file changes which of its siblings/descendants
             // are indexable; re-evaluate the whole directory it governs.
-            if absolute
-                .file_name()
-                .is_some_and(|name| name == ".gitignore" || name == ".tsindexignore")
+            if is_ignore_file(&absolute)
                 && let Some(parent) = absolute.parent()
             {
                 absolute = parent.to_path_buf();
@@ -802,15 +800,7 @@ impl Runtime {
         // Always allow the root itself so the walk can start.
         needed_dirs.insert(workspace.root.clone());
 
-        let mut builder = WalkBuilder::new(&workspace.root);
-        builder.hidden(false);
-        builder.git_ignore(true);
-        builder.git_exclude(true);
-        builder.git_global(true);
-        builder.add_custom_ignore_filename(".tsindexignore");
-        for pattern in &workspace.ignore {
-            builder.add_ignore(pattern);
-        }
+        let mut builder = workspace_walk_builder(workspace);
         let prune = needed_dirs.clone();
         let changed_dirs = target_dirs.clone();
         let foreign_roots = self.other_workspace_roots(workspace)?;
@@ -898,8 +888,13 @@ impl Runtime {
             })?;
 
         let (tx, rx) = mpsc::channel::<DebounceEventResult>();
-        // 2s debounce window coalesces bursts of events into one rebuild.
-        //
+        // 2s debounce window coalesces bursts of events into one rebuild. The
+        // real-binary watcher test shortens it so its steps do not idle for
+        // seconds each; nothing else should set it.
+        let debounce = std::env::var("TSINDEX_WATCH_DEBOUNCE_MS")
+            .ok()
+            .and_then(|millis| millis.parse().ok())
+            .map_or(Duration::from_secs(2), Duration::from_millis);
         // Pass `NoCache` explicitly instead of the default `RecommendedCache`.
         // On non-Linux platforms `RecommendedCache` is `FileIdMap`, which
         // recursively scans the watched tree and stores a `FileId` per path to
@@ -910,14 +905,15 @@ impl Runtime {
         // cache is pure overhead. Linux already uses `NoCache`; this makes
         // every platform match.
         let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
-            Duration::from_secs(2),
+            debounce,
             None,
             tx,
             NoCache::new(),
-            // The index walk never follows directory symlinks. Match that
-            // boundary here: pnpm dependency links otherwise expand into
-            // duplicate watched paths before ignored events can be filtered,
-            // exhausting memory and forcing the whole machine into swap.
+            // Defense in depth only: this flag is read solely by recursive
+            // inotify/kqueue registrations, Linux registers non-recursive
+            // watches below, and FSEvents ignores it. The boundary that keeps
+            // pnpm dependency links from expanding into duplicate watched
+            // trees is the pruning walk in `register_watch_directories`.
             notify::Config::default().with_follow_symlinks(false),
         )
         .context("failed to start filesystem watcher")?;
@@ -927,33 +923,27 @@ impl Runtime {
             // ignored dependencies and worktrees. Prune before registration;
             // filtering their later events cannot bound startup memory or watches.
             #[cfg(target_os = "linux")]
-            let registration =
-                register_watch_directories(workspace, &db_dir, &workspaces, |path| {
-                    debouncer.watch(path, RecursiveMode::NonRecursive)
-                });
-            #[cfg(not(target_os = "linux"))]
-            let registration = debouncer
-                .watch(&workspace.root, RecursiveMode::Recursive)
-                .map_err(anyhow::Error::from);
-            if let Err(error) = registration {
-                let message = format!("{error:#}");
-                if cfg!(target_os = "linux")
-                    && (message.contains("No space left on device")
-                        || error.downcast_ref::<notify::Error>().is_some_and(|error| {
-                            matches!(error.kind, notify::ErrorKind::MaxFilesWatch)
-                        }))
-                {
-                    return Err(anyhow!(
-                        "failed to watch {}: inotify watch limit reached. \
-                         Raise it with `sudo sysctl fs.inotify.max_user_watches=524288` \
-                         (persist in /etc/sysctl.conf), or watch fewer/lower-level roots.",
-                        workspace.root.display()
-                    ));
-                }
-                return Err(error)
-                    .with_context(|| format!("failed to watch {}", workspace.root.display()));
+            {
+                let registered = register_watch_directories(
+                    workspace,
+                    &db_dir,
+                    &workspaces,
+                    std::slice::from_ref(&workspace.root),
+                    |path| debouncer.watch(path, RecursiveMode::NonRecursive),
+                )?;
+                eprintln!(
+                    "watching {} ({}): {registered} directories",
+                    workspace.name,
+                    workspace.root.display()
+                );
             }
-            eprintln!("watching {} ({})", workspace.name, workspace.root.display());
+            #[cfg(not(target_os = "linux"))]
+            {
+                debouncer
+                    .watch(&workspace.root, RecursiveMode::Recursive)
+                    .map_err(|error| watch_failure(workspace, error.into()))?;
+                eprintln!("watching {} ({})", workspace.name, workspace.root.display());
+            }
         }
         eprintln!("watching {} repos for changes", workspaces.len());
 
@@ -978,21 +968,22 @@ impl Runtime {
         // it walks, so repos can intentionally index paths such as `build/` or
         // `dist/`.
         run_watch_event_loop(rx, &db_dir, &workspaces, |changed| {
-            // Nonrecursive watches need registrations for new/moved source
-            // directories and newly included paths after ignore-rule edits.
-            // Re-register existing directories too: deletion and recreation
-            // removes their kernel watch even when their path stays the same.
+            // Nonrecursive watches cover only the directories registered so
+            // far: new, moved or recreated directories (deletion drops the
+            // kernel watch even when the path comes back) and paths included
+            // by an ignore-rule edit each need a pass over their subtree. A
+            // failed pass is logged, not propagated: the next event can repair
+            // a missing watch, but a skipped index update is lost for good.
             #[cfg(target_os = "linux")]
-            if changed.iter().any(|path| {
-                fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
-                    || path
-                        .file_name()
-                        .is_some_and(|name| name == ".gitignore" || name == ".tsindexignore")
-            }) {
-                for workspace in &workspaces {
-                    register_watch_directories(workspace, &db_dir, &workspaces, |path| {
-                        debouncer.watch(path, RecursiveMode::NonRecursive)
-                    })?;
+            for (idx, targets) in registration_targets(&workspaces, changed) {
+                if let Err(error) = register_watch_directories(
+                    &workspaces[idx],
+                    &db_dir,
+                    &workspaces,
+                    &targets,
+                    |path| debouncer.watch(path, RecursiveMode::NonRecursive),
+                ) {
+                    eprintln!("watch registration failed: {error:#}");
                 }
             }
             self.update_paths_cached(changed, &mut language_cache)
@@ -2639,12 +2630,7 @@ impl Runtime {
     /// Walks prune these so a nested repo's files are indexed only under the
     /// repo that owns them (deepest root wins, matching `best_workspace_for_path`).
     fn other_workspace_roots(&self, workspace: &Workspace) -> Result<HashSet<PathBuf>> {
-        Ok(self
-            .workspaces()?
-            .into_iter()
-            .filter(|other| other.root != workspace.root)
-            .map(|other| other.root)
-            .collect())
+        Ok(foreign_workspace_roots(workspace, &self.workspaces()?))
     }
 
     pub fn source_path(&self, repo: &str, file: &str) -> Result<PathBuf> {
@@ -2685,15 +2671,7 @@ impl Runtime {
     }
 
     fn walk_source_files(&self, workspace: &Workspace) -> Result<Vec<PathBuf>> {
-        let mut builder = WalkBuilder::new(&workspace.root);
-        builder.hidden(false);
-        builder.git_ignore(true);
-        builder.git_exclude(true);
-        builder.git_global(true);
-        builder.add_custom_ignore_filename(".tsindexignore");
-        for pattern in &workspace.ignore {
-            builder.add_ignore(pattern);
-        }
+        let mut builder = workspace_walk_builder(workspace);
         let foreign_roots = self.other_workspace_roots(workspace)?;
         builder.filter_entry(move |entry| {
             !(entry.file_type().is_some_and(|t| t.is_dir()) && foreign_roots.contains(entry.path()))
@@ -4898,85 +4876,209 @@ const WATCH_IGNORED_FILE_SUFFIXES: &[&str] = &[".tsbuildinfo"];
 
 const WATCH_IGNORED_COMPONENT_PATHS: &[&[&str]] = &[&[".claude", "worktrees"]];
 
-/// Register only directories that can contribute source files. Inotify's own
-/// recursive walk ignores these rules and follows dependency symlink graphs;
-/// using individual watches keeps both traversal and registrations bounded.
+/// The ignore file the indexer honors in addition to Git's.
+const CUSTOM_IGNORE_FILENAME: &str = ".tsindexignore";
+
+/// Files whose edits change which paths the walks yield. `.ignore` is honored
+/// by the `ignore` crate next to `.gitignore`; `.git/info/exclude` and the
+/// global excludes file are not listed because they live under the pruned
+/// `.git` directory or outside the tree, where no watch can observe them.
+const IGNORE_FILE_NAMES: &[&str] = &[".gitignore", ".ignore", CUSTOM_IGNORE_FILENAME];
+
+fn is_ignore_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| IGNORE_FILE_NAMES.contains(&name))
+}
+
+/// The one ignore configuration shared by every walk over a workspace, so the
+/// full build, the incremental update and the Linux watch registration agree
+/// on which paths exist. Callers add their own `filter_entry` pruning.
+fn workspace_walk_builder(workspace: &Workspace) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(&workspace.root);
+    builder.hidden(false);
+    // Symlinked dependency stores (pnpm's `node_modules/.pnpm`, Nix and Bazel
+    // outputs) would otherwise be indexed and watched once per link.
+    builder.follow_links(false);
+    builder.git_ignore(true);
+    builder.git_exclude(true);
+    builder.git_global(true);
+    builder.add_custom_ignore_filename(CUSTOM_IGNORE_FILENAME);
+    for pattern in &workspace.ignore {
+        builder.add_ignore(pattern);
+    }
+    builder
+}
+
+/// Canonical roots of every configured workspace other than `workspace`.
+/// Walks prune these so a nested repo's files are indexed and watched only
+/// under the repo that owns them (deepest root wins, matching
+/// `best_workspace_for_path`).
+fn foreign_workspace_roots(workspace: &Workspace, workspaces: &[Workspace]) -> HashSet<PathBuf> {
+    workspaces
+        .iter()
+        .filter(|other| other.root != workspace.root)
+        .map(|other| other.root.clone())
+        .collect()
+}
+
+/// `inotify_add_watch` failed with ENOSPC: the per-user watch budget is spent.
+fn is_watch_limit(error: &notify::Error) -> bool {
+    matches!(error.kind, notify::ErrorKind::MaxFilesWatch)
+}
+
+/// Attribute a registration failure to its workspace, and turn the bare "OS
+/// file watch limit reached" into the remedy operators actually need.
+fn watch_failure(workspace: &Workspace, error: anyhow::Error) -> anyhow::Error {
+    let error = if error
+        .downcast_ref::<notify::Error>()
+        .is_some_and(is_watch_limit)
+    {
+        error.context(
+            "inotify watch limit reached; raise it with \
+             `sudo sysctl fs.inotify.max_user_watches=524288` (persist in \
+             /etc/sysctl.conf) or watch fewer/lower-level roots",
+        )
+    } else {
+        error
+    };
+    error.context(format!("failed to watch {}", workspace.root.display()))
+}
+
+#[cfg(target_os = "linux")]
+fn is_under_any(path: &Path, dirs: &[PathBuf]) -> bool {
+    dirs.iter().any(|dir| path.starts_with(dir))
+}
+
+/// The registration passes a batch of changed paths calls for: per workspace
+/// index, the directories whose subtrees must be (re)walked. An ignore-rule
+/// edit governs its directory's subtree; a directory event (created, moved in
+/// or recreated) governs that directory; plain file changes need no watch.
+/// Nested workspaces below a target are pruned from their parent's walk, so
+/// they take a pass of their own.
+#[cfg(target_os = "linux")]
+fn registration_targets(
+    workspaces: &[Workspace],
+    changed: &[PathBuf],
+) -> Vec<(usize, Vec<PathBuf>)> {
+    let mut targets: Vec<Vec<PathBuf>> = vec![Vec::new(); workspaces.len()];
+    for path in changed {
+        let target = if is_ignore_file(path) {
+            path.parent().map(Path::to_path_buf)
+        } else if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+            Some(path.clone())
+        } else {
+            None
+        };
+        let Some(target) = target else {
+            continue;
+        };
+        if let Some(idx) = best_workspace_for_path(workspaces, &target) {
+            targets[idx].push(target.clone());
+        }
+        for (idx, workspace) in workspaces.iter().enumerate() {
+            if workspace.root != target && workspace.root.starts_with(&target) {
+                targets[idx].push(workspace.root.clone());
+            }
+        }
+    }
+    targets
+        .into_iter()
+        .enumerate()
+        .filter(|(_, dirs)| !dirs.is_empty())
+        .map(|(idx, mut dirs)| {
+            dirs.sort();
+            dirs.dedup();
+            (idx, dirs)
+        })
+        .collect()
+}
+
+/// Register a non-recursive watch for every directory under `targets` that can
+/// contribute source files, returning how many were registered. Inotify's own
+/// recursive walk ignores the ignore rules and follows dependency symlink
+/// graphs; walking here keeps both traversal and registrations bounded.
+///
+/// Failures below the root are skipped exactly as the indexer's walks skip
+/// them: a directory that vanished or cannot be read has nothing to watch, and
+/// the index must keep updating regardless. A failing root (the workspace is
+/// gone or unreadable) and the inotify watch limit (every later directory
+/// would fail the same way) are reported.
 #[cfg(target_os = "linux")]
 fn register_watch_directories(
     workspace: &Workspace,
     db_dir: &Path,
     workspaces: &[Workspace],
+    targets: &[PathBuf],
     mut register: impl FnMut(&Path) -> notify::Result<()>,
-) -> Result<()> {
-    let mut builder = WalkBuilder::new(&workspace.root);
-    builder.hidden(false);
-    builder.follow_links(false);
-    builder.git_ignore(true);
-    builder.git_exclude(true);
-    builder.git_global(true);
-    builder.add_custom_ignore_filename(".tsindexignore");
-    for pattern in &workspace.ignore {
-        builder.add_ignore(pattern);
+) -> Result<usize> {
+    // The walk descends through the targets' ancestors (already watched, so
+    // not re-registered) and into everything below the targets.
+    let mut ancestors: HashSet<PathBuf> = HashSet::new();
+    for target in targets {
+        let mut current = target.parent();
+        while let Some(dir) = current.filter(|dir| dir.starts_with(&workspace.root)) {
+            ancestors.insert(dir.to_path_buf());
+            current = dir.parent();
+        }
     }
+    let mut builder = workspace_walk_builder(workspace);
+    // `filter_entry` demands a `'static + Send + Sync` closure, so it owns
+    // copies of everything it consults.
     let db_dir = db_dir.to_path_buf();
-    let foreign_roots: HashSet<_> = workspaces
-        .iter()
-        .filter(|other| other.root != workspace.root)
-        .map(|other| other.root.clone())
-        .collect();
+    let foreign_roots = foreign_workspace_roots(workspace, workspaces);
     let workspaces = workspaces.to_vec();
+    let subtrees = targets.to_vec();
     builder.filter_entry(move |entry| {
-        // A nested workspace owns its subtree, matching the indexing walk.
-        // Its own registration pass adds these watches exactly once.
-        entry.depth() == 0
-            || (!foreign_roots.contains(entry.path())
-                && watch_path_is_relevant(entry.path(), &db_dir, &workspaces))
+        // Directories only (files are never registered), owned by this
+        // workspace, passing the same control-directory filter as events, and
+        // on the way to or below a target.
+        entry.file_type().is_some_and(|kind| kind.is_dir())
+            && !foreign_roots.contains(entry.path())
+            && watch_path_is_relevant(entry.path(), &db_dir, &workspaces)
+            && (ancestors.contains(entry.path()) || is_under_any(entry.path(), &subtrees))
     });
+    // The walk reports a missing or unreadable root as a depth-less error
+    // indistinguishable from an unreadable ignore file, so check it up front:
+    // nothing below a failing root can be watched.
+    if let Err(error) = fs::read_dir(&workspace.root) {
+        return Err(watch_failure(
+            workspace,
+            anyhow::Error::from(error).context(format!("cannot read {}", workspace.root.display())),
+        ));
+    }
+    let mut registered = 0usize;
     for entry in builder.build() {
         let entry = match entry {
             Ok(entry) => entry,
-            // Live directory trees can disappear or become unreadable during
-            // traversal. Keep registering the rest; root failures remain fatal.
-            Err(error)
-                if error.depth().is_some_and(|depth| depth > 0)
-                    && error.io_error().is_some_and(|error| {
-                        matches!(
-                            error.kind(),
-                            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-                        )
-                    }) =>
-            {
+            Err(error) => {
                 eprintln!("watch discovery skipped: {error}");
                 continue;
             }
-            Err(error) => return Err(error).context("failed to discover watch directories"),
         };
-        if entry.file_type().is_some_and(|kind| kind.is_dir())
-            && let Err(error) = register(entry.path())
+        // The root is yielded unfiltered; register it only when it is a target.
+        if !entry.file_type().is_some_and(|kind| kind.is_dir())
+            || !is_under_any(entry.path(), targets)
         {
-            // A directory may change after enumeration but before inotify
-            // registration. Skip only transient child failures; resource
-            // limits and root failures must reach the caller.
-            let transient = match &error.kind {
-                notify::ErrorKind::PathNotFound => true,
-                notify::ErrorKind::Io(error) => matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-                ),
-                _ => false,
-            };
-            if entry.depth() > 0 && transient {
-                eprintln!(
-                    "watch registration skipped {}: {error}",
-                    entry.path().display()
-                );
-                continue;
-            }
-            return Err(error)
-                .with_context(|| format!("failed to watch {}", entry.path().display()));
+            continue;
         }
+        if let Err(error) = register(entry.path()) {
+            if is_watch_limit(&error) || entry.depth() == 0 {
+                return Err(watch_failure(
+                    workspace,
+                    anyhow::Error::from(error)
+                        .context(format!("failed to watch {}", entry.path().display())),
+                ));
+            }
+            eprintln!(
+                "watch registration skipped {}: {error}",
+                entry.path().display()
+            );
+            continue;
+        }
+        registered += 1;
     }
-    Ok(())
+    Ok(registered)
 }
 
 /// Returns true if a changed path could plausibly affect the index. Used to
@@ -5032,6 +5134,18 @@ fn watch_path_is_relevant(path: &Path, db_dir: &Path, workspaces: &[Workspace]) 
         .any(|name| WATCH_IGNORED_DIR_COMPONENTS.contains(name))
 }
 
+/// Access events the watcher itself causes while indexing (opening directories
+/// and reading files). `Close(Write)` is not one of them: a writer that edits
+/// a file in place through a shared mapping emits no `Modify`, so the close is
+/// its only notification.
+fn is_read_only_access(kind: &notify::EventKind) -> bool {
+    use notify::event::{AccessKind, AccessMode};
+    matches!(
+        kind,
+        notify::EventKind::Access(access) if !matches!(access, AccessKind::Close(AccessMode::Write))
+    )
+}
+
 fn run_watch_event_loop(
     rx: std::sync::mpsc::Receiver<DebounceEventResult>,
     db_dir: &Path,
@@ -5048,18 +5162,28 @@ fn run_watch_event_loop(
                     .iter()
                     // Reads from our own index walk must not feed another
                     // registration/update cycle; source changes arrive as
-                    // create, modify, or remove events instead.
-                    .filter(|event| !matches!(event.kind, notify::EventKind::Access(_)))
+                    // create, modify, remove or close-after-write events.
+                    .filter(|event| !is_read_only_access(&event.kind))
                     .flat_map(|event| event.paths.iter())
                     .filter(|path| watch_path_is_relevant(path, db_dir, workspaces))
                     .cloned()
                     .collect();
+                // A queue overflow (inotify IN_Q_OVERFLOW, FSEvents
+                // kFSEventStreamEventFlagMustScanSubDirs) arrives as a
+                // path-less event flagged for rescan: the kernel dropped
+                // notifications, so treat every workspace root as changed. The
+                // root path re-registers the tree's watches and the update
+                // walks it, fast-pathing unchanged files on mtime and size.
+                if events.iter().any(|event| event.need_rescan()) {
+                    eprintln!("watch: event queue overflowed; rescanning every workspace");
+                    changed.extend(workspaces.iter().map(|workspace| workspace.root.clone()));
+                }
                 changed.sort();
                 changed.dedup();
                 if !changed.is_empty()
                     && let Err(error) = update(&changed)
                 {
-                    eprintln!("watch update failed: {error}");
+                    eprintln!("watch update failed: {error:#}");
                 }
             }
             Err(errors) => {
@@ -5936,10 +6060,16 @@ mod tests {
             ),
         ] {
             let mut registered = HashSet::new();
-            register_watch_directories(workspace, &root.join(".tsindex"), &workspaces, |path| {
-                assert!(registered.insert(path.to_path_buf()));
-                Ok(())
-            })?;
+            register_watch_directories(
+                workspace,
+                &root.join(".tsindex"),
+                &workspaces,
+                std::slice::from_ref(&workspace.root),
+                |path| {
+                    assert!(registered.insert(path.to_path_buf()));
+                    Ok(())
+                },
+            )?;
             assert_eq!(registered, expected);
         }
         Ok(())
@@ -5964,6 +6094,7 @@ mod tests {
             &workspace,
             &root.join(".tsindex"),
             std::slice::from_ref(&workspace),
+            std::slice::from_ref(&root),
             |path| {
                 if path == root.join("vanishing") {
                     fs::remove_dir(path).expect("remove disappearing child");
@@ -5998,6 +6129,7 @@ mod tests {
             &workspace,
             &root.join(".tsindex"),
             std::slice::from_ref(&workspace),
+            std::slice::from_ref(&root),
             |_| Err(notify::Error::path_not_found()),
         )
         .expect_err("a root registration failure must remain fatal");
@@ -6009,6 +6141,7 @@ mod tests {
             &workspace,
             &root.join(".tsindex"),
             std::slice::from_ref(&workspace),
+            std::slice::from_ref(&root),
             |path| {
                 if path == root {
                     Ok(())
@@ -6022,17 +6155,146 @@ mod tests {
             limit_error.downcast_ref::<notify::Error>().unwrap().kind,
             notify::ErrorKind::MaxFilesWatch
         ));
+        assert!(
+            format!("{limit_error:#}").contains("fs.inotify.max_user_watches"),
+            "the limit error must carry the sysctl remedy: {limit_error:#}"
+        );
         fs::remove_dir_all(&root)?;
         assert!(
             register_watch_directories(
                 &workspace,
                 &root.join(".tsindex"),
                 std::slice::from_ref(&workspace),
+                std::slice::from_ref(&root),
                 |_| Ok(()),
             )
             .is_err(),
             "a missing workspace root must not appear successfully watched"
         );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn watch_registration_skips_symlinks_ignored_and_unreadable_directories() -> Result<()> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempdir()?;
+        let base = dir.path().canonicalize()?;
+        let root = base.join("repo");
+        for child in [
+            "src/pkg",
+            "node_modules/dep",
+            "generated/nested",
+            "build/out",
+            "unreadable",
+            ".git/objects",
+        ] {
+            fs::create_dir_all(root.join(child))?;
+        }
+        fs::write(root.join(".tsindexignore"), "generated/\n")?;
+        fs::write(root.join(".gitignore"), "build/\n")?;
+        // A dependency store linked from the top level sits outside every
+        // ignored directory, so only the no-follow walk keeps it out.
+        let store = base.join("store");
+        fs::create_dir_all(store.join("lib"))?;
+        symlink(&store, root.join("linked"))?;
+        fs::set_permissions(root.join("unreadable"), fs::Permissions::from_mode(0o000))?;
+        let workspace = Workspace {
+            name: "repo".to_string(),
+            root: root.clone(),
+            languages: Vec::new(),
+            ignore: Vec::new(),
+        };
+
+        let mut registered = HashSet::new();
+        let count = register_watch_directories(
+            &workspace,
+            &root.join(".tsindex"),
+            std::slice::from_ref(&workspace),
+            std::slice::from_ref(&root),
+            |path| {
+                registered.insert(path.to_path_buf());
+                Ok(())
+            },
+        )?;
+        fs::set_permissions(root.join("unreadable"), fs::Permissions::from_mode(0o755))?;
+
+        // `unreadable` is listed by its parent and registered; only descending
+        // into it fails, which must not abort the pass (as root it simply has
+        // no children, so the expectation holds either way).
+        assert_eq!(
+            registered,
+            HashSet::from([
+                root.clone(),
+                root.join("src"),
+                root.join("src/pkg"),
+                root.join("unreadable"),
+            ])
+        );
+        assert_eq!(count, registered.len());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn watch_registration_targets_scope_passes_to_changed_subtrees() -> Result<()> {
+        let dir = tempdir()?;
+        let outer = dir.path().canonicalize()?.join("outer");
+        let inner = outer.join("vendor/inner");
+        for child in ["src/new/deep", "src/old", "vendor/inner/lib"] {
+            fs::create_dir_all(outer.join(child))?;
+        }
+        fs::write(outer.join("src/old/a.py"), "")?;
+        fs::write(outer.join(".gitignore"), "")?;
+        let workspaces: Vec<_> = [("outer", &outer), ("inner", &inner)]
+            .into_iter()
+            .map(|(name, root)| Workspace {
+                name: name.to_string(),
+                root: root.clone(),
+                languages: Vec::new(),
+                ignore: Vec::new(),
+            })
+            .collect();
+
+        // A file edit needs no pass; a new directory scopes its owner's pass to
+        // that subtree; an ignore edit scopes it to the governed directory and
+        // sends every nested workspace below it on a pass of its own.
+        assert!(registration_targets(&workspaces, &[outer.join("src/old/a.py")]).is_empty());
+        assert_eq!(
+            registration_targets(
+                &workspaces,
+                &[outer.join("src/new"), outer.join("vendor/inner/lib")]
+            ),
+            vec![
+                (0, vec![outer.join("src/new")]),
+                (1, vec![inner.join("lib")])
+            ]
+        );
+        assert_eq!(
+            registration_targets(&workspaces, &[outer.join(".gitignore")]),
+            vec![(0, vec![outer.clone()]), (1, vec![inner.clone()])]
+        );
+
+        // A subtree pass traverses the ancestors but registers only the target
+        // and its descendants.
+        let mut registered = Vec::new();
+        let count = register_watch_directories(
+            &workspaces[0],
+            &outer.join(".tsindex"),
+            &workspaces,
+            &[outer.join("src/new")],
+            |path| {
+                registered.push(path.to_path_buf());
+                Ok(())
+            },
+        )?;
+        registered.sort();
+        assert_eq!(
+            registered,
+            vec![outer.join("src/new"), outer.join("src/new/deep")]
+        );
+        assert_eq!(count, 2);
         Ok(())
     }
 
@@ -6108,6 +6370,13 @@ mod tests {
                 .add_path(source.clone()),
             Instant::now(),
         )]))?;
+        // A close-after-write is the only notification an in-place mmap writer
+        // produces, so it must still trigger an update.
+        tx.send(Ok(vec![DebouncedEvent::new(
+            Event::new(EventKind::Access(AccessKind::Close(AccessMode::Write)))
+                .add_path(source.clone()),
+            Instant::now(),
+        )]))?;
         tx.send(Ok(vec![DebouncedEvent::new(
             Event::new(EventKind::Any)
                 .add_path(source.clone())
@@ -6115,11 +6384,19 @@ mod tests {
                 .add_path(ignored_db),
             Instant::now(),
         )]))?;
+        // A queue overflow carries no paths; every workspace root is rescanned.
+        tx.send(Ok(vec![DebouncedEvent::new(
+            Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan),
+            Instant::now(),
+        )]))?;
         drop(tx);
         handle.join().expect("watch loop exits when channel closes");
 
         let updates = updates.lock().expect("updates lock");
-        assert_eq!(updates.as_slice(), &[vec![source]]);
+        assert_eq!(
+            updates.as_slice(),
+            &[vec![source.clone()], vec![source], vec![repo]]
+        );
         Ok(())
     }
 

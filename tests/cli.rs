@@ -149,6 +149,126 @@ fn mcp_stdio_emits_only_json_rpc_lines() -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn mcp_watcher_skips_dependency_symlinks_and_refreshes_source() -> Result<()> {
+    use std::collections::HashSet;
+    use std::os::unix::fs::{MetadataExt, symlink};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    // Kill and reap the real server even when a watcher assertion fails.
+    struct Server(std::process::Child);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let dir = tempdir()?;
+    let root = dir.path().join("repo");
+    fixture(&root)?;
+    let dependency = dir.path().join("dependency-store");
+    fs::create_dir(&dependency)?;
+    fs::create_dir(root.join("node_modules"))?;
+    symlink(&dependency, root.join("node_modules/linked"))?;
+    fs::create_dir_all(root.join("generated/nested"))?;
+    fs::write(root.join(".tsindexignore"), "generated/\n")?;
+
+    let mut server = Server(
+        Command::new(BIN)
+            .arg("--root")
+            .arg(&root)
+            .args(["serve", "--mcp"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
+    let stderr = server.0.stderr.take().unwrap();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if line.contains("repos for changes") {
+                let _ = ready_tx.send(());
+            }
+        }
+    });
+
+    let result = (|| -> Result<()> {
+        ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .context("MCP watcher did not finish registering directories")?;
+
+        // Inspect the real inotify registrations: filtering dependency events
+        // after registration cannot prevent symlink fan-out and memory growth.
+        let mut watched_inodes = HashSet::new();
+        for info in fs::read_dir(format!("/proc/{}/fdinfo", server.0.id()))? {
+            for line in fs::read_to_string(info?.path())?.lines() {
+                if line.starts_with("inotify ") {
+                    for field in line.split_whitespace() {
+                        if let Some(inode) = field.strip_prefix("ino:") {
+                            watched_inodes.insert(u64::from_str_radix(inode, 16)?);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            watched_inodes.contains(&fs::metadata(root.join("src"))?.ino()),
+            "ordinary source directories must still be watched"
+        );
+        assert!(
+            !watched_inodes.contains(&fs::metadata(&dependency)?.ino()),
+            "recursive registration must not follow linked dependency trees"
+        );
+        for ignored in ["node_modules", "generated", "generated/nested"] {
+            assert!(
+                !watched_inodes.contains(&fs::metadata(root.join(ignored))?.ino()),
+                "ignored directory {ignored} must not consume an inotify watch"
+            );
+        }
+
+        let wait_for_symbol = |name: &str| -> Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let found = rusqlite::Connection::open_with_flags(
+                    root.join(".tsindex/index.db"),
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .and_then(|conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM symbols WHERE name = ?1",
+                        [name],
+                        |row| row.get::<_, u64>(0),
+                    )
+                });
+                if matches!(found, Ok(count) if count > 0) {
+                    return Ok(());
+                }
+                anyhow::ensure!(Instant::now() < deadline, "symbol {name} was not refreshed");
+                thread::sleep(Duration::from_millis(100));
+            }
+        };
+        wait_for_symbol("alpha")?;
+        fs::write(root.join("src/a.py"), "def after_edit():\n    return 2\n")?;
+        wait_for_symbol("after_edit")?;
+        fs::create_dir_all(root.join("new/nested"))?;
+        let added = root.join("new/nested/added.py");
+        fs::write(&added, "def added_directory():\n    return 3\n")?;
+        wait_for_symbol("added_directory")?;
+        fs::write(&added, "def edited_new_directory():\n    return 4\n")?;
+        wait_for_symbol("edited_new_directory")?;
+        Ok(())
+    })();
+
+    drop(server);
+    reader.join().expect("stderr reader panicked");
+    result
+}
+
 fn http(port: u16, request: &str) -> Result<String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port))?;
     stream.write_all(request.as_bytes())?;

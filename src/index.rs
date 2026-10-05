@@ -914,14 +914,35 @@ impl Runtime {
             None,
             tx,
             NoCache::new(),
-            notify::Config::default(),
+            // The index walk never follows directory symlinks. Match that
+            // boundary here: pnpm dependency links otherwise expand into
+            // duplicate watched paths before ignored events can be filtered,
+            // exhausting memory and forcing the whole machine into swap.
+            notify::Config::default().with_follow_symlinks(false),
         )
         .context("failed to start filesystem watcher")?;
 
         for workspace in &workspaces {
-            if let Err(error) = debouncer.watch(&workspace.root, RecursiveMode::Recursive) {
-                let message = error.to_string();
-                if cfg!(target_os = "linux") && message.contains("No space left on device") {
+            // Linux registers every recursive inotify path eagerly, including
+            // ignored dependencies and worktrees. Prune before registration;
+            // filtering their later events cannot bound startup memory or watches.
+            #[cfg(target_os = "linux")]
+            let registration =
+                register_watch_directories(workspace, &db_dir, &workspaces, |path| {
+                    debouncer.watch(path, RecursiveMode::NonRecursive)
+                });
+            #[cfg(not(target_os = "linux"))]
+            let registration = debouncer
+                .watch(&workspace.root, RecursiveMode::Recursive)
+                .map_err(anyhow::Error::from);
+            if let Err(error) = registration {
+                let message = format!("{error:#}");
+                if cfg!(target_os = "linux")
+                    && (message.contains("No space left on device")
+                        || error.downcast_ref::<notify::Error>().is_some_and(|error| {
+                            matches!(error.kind, notify::ErrorKind::MaxFilesWatch)
+                        }))
+                {
                     return Err(anyhow!(
                         "failed to watch {}: inotify watch limit reached. \
                          Raise it with `sudo sysctl fs.inotify.max_user_watches=524288` \
@@ -957,6 +978,23 @@ impl Runtime {
         // it walks, so repos can intentionally index paths such as `build/` or
         // `dist/`.
         run_watch_event_loop(rx, &db_dir, &workspaces, |changed| {
+            // Nonrecursive watches need registrations for new/moved source
+            // directories and newly included paths after ignore-rule edits.
+            // Re-register existing directories too: deletion and recreation
+            // removes their kernel watch even when their path stays the same.
+            #[cfg(target_os = "linux")]
+            if changed.iter().any(|path| {
+                fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+                    || path
+                        .file_name()
+                        .is_some_and(|name| name == ".gitignore" || name == ".tsindexignore")
+            }) {
+                for workspace in &workspaces {
+                    register_watch_directories(workspace, &db_dir, &workspaces, |path| {
+                        debouncer.watch(path, RecursiveMode::NonRecursive)
+                    })?;
+                }
+            }
             self.update_paths_cached(changed, &mut language_cache)
         });
 
@@ -4860,6 +4898,87 @@ const WATCH_IGNORED_FILE_SUFFIXES: &[&str] = &[".tsbuildinfo"];
 
 const WATCH_IGNORED_COMPONENT_PATHS: &[&[&str]] = &[&[".claude", "worktrees"]];
 
+/// Register only directories that can contribute source files. Inotify's own
+/// recursive walk ignores these rules and follows dependency symlink graphs;
+/// using individual watches keeps both traversal and registrations bounded.
+#[cfg(target_os = "linux")]
+fn register_watch_directories(
+    workspace: &Workspace,
+    db_dir: &Path,
+    workspaces: &[Workspace],
+    mut register: impl FnMut(&Path) -> notify::Result<()>,
+) -> Result<()> {
+    let mut builder = WalkBuilder::new(&workspace.root);
+    builder.hidden(false);
+    builder.follow_links(false);
+    builder.git_ignore(true);
+    builder.git_exclude(true);
+    builder.git_global(true);
+    builder.add_custom_ignore_filename(".tsindexignore");
+    for pattern in &workspace.ignore {
+        builder.add_ignore(pattern);
+    }
+    let db_dir = db_dir.to_path_buf();
+    let foreign_roots: HashSet<_> = workspaces
+        .iter()
+        .filter(|other| other.root != workspace.root)
+        .map(|other| other.root.clone())
+        .collect();
+    let workspaces = workspaces.to_vec();
+    builder.filter_entry(move |entry| {
+        // A nested workspace owns its subtree, matching the indexing walk.
+        // Its own registration pass adds these watches exactly once.
+        entry.depth() == 0
+            || (!foreign_roots.contains(entry.path())
+                && watch_path_is_relevant(entry.path(), &db_dir, &workspaces))
+    });
+    for entry in builder.build() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            // Live directory trees can disappear or become unreadable during
+            // traversal. Keep registering the rest; root failures remain fatal.
+            Err(error)
+                if error.depth().is_some_and(|depth| depth > 0)
+                    && error.io_error().is_some_and(|error| {
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                        )
+                    }) =>
+            {
+                eprintln!("watch discovery skipped: {error}");
+                continue;
+            }
+            Err(error) => return Err(error).context("failed to discover watch directories"),
+        };
+        if entry.file_type().is_some_and(|kind| kind.is_dir())
+            && let Err(error) = register(entry.path())
+        {
+            // A directory may change after enumeration but before inotify
+            // registration. Skip only transient child failures; resource
+            // limits and root failures must reach the caller.
+            let transient = match &error.kind {
+                notify::ErrorKind::PathNotFound => true,
+                notify::ErrorKind::Io(error) => matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ),
+                _ => false,
+            };
+            if entry.depth() > 0 && transient {
+                eprintln!(
+                    "watch registration skipped {}: {error}",
+                    entry.path().display()
+                );
+                continue;
+            }
+            return Err(error)
+                .with_context(|| format!("failed to watch {}", entry.path().display()));
+        }
+    }
+    Ok(())
+}
+
 /// Returns true if a changed path could plausibly affect the index. Used to
 /// suppress rebuild triggers for internal metadata; the actual ignore rules are
 /// still enforced by the indexer's walk.
@@ -4927,6 +5046,10 @@ fn run_watch_event_loop(
                 // paths instead of re-walking every repo.
                 let mut changed: Vec<PathBuf> = events
                     .iter()
+                    // Reads from our own index walk must not feed another
+                    // registration/update cycle; source changes arrive as
+                    // create, modify, or remove events instead.
+                    .filter(|event| !matches!(event.kind, notify::EventKind::Access(_)))
                     .flat_map(|event| event.paths.iter())
                     .filter(|path| watch_path_is_relevant(path, db_dir, workspaces))
                     .cloned()
@@ -5785,6 +5908,134 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn watch_registration_assigns_nested_directories_to_their_workspace() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().canonicalize()?.join("outer");
+        let nested = root.join("inner");
+        fs::create_dir_all(root.join("src"))?;
+        fs::create_dir_all(nested.join("src"))?;
+        let workspaces: Vec<_> = [("outer", &root), ("inner", &nested)]
+            .into_iter()
+            .map(|(name, root)| Workspace {
+                name: name.to_string(),
+                root: root.clone(),
+                languages: Vec::new(),
+                ignore: Vec::new(),
+            })
+            .collect();
+        for (workspace, expected) in [
+            (
+                &workspaces[0],
+                HashSet::from([root.clone(), root.join("src")]),
+            ),
+            (
+                &workspaces[1],
+                HashSet::from([nested.clone(), nested.join("src")]),
+            ),
+        ] {
+            let mut registered = HashSet::new();
+            register_watch_directories(workspace, &root.join(".tsindex"), &workspaces, |path| {
+                assert!(registered.insert(path.to_path_buf()));
+                Ok(())
+            })?;
+            assert_eq!(registered, expected);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn watch_registration_continues_after_transient_child_errors() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().canonicalize()?.join("repo");
+        for child in ["vanishing", "unreadable", "src"] {
+            fs::create_dir_all(root.join(child))?;
+        }
+        let workspace = Workspace {
+            name: "repo".to_string(),
+            root: root.clone(),
+            languages: Vec::new(),
+            ignore: Vec::new(),
+        };
+        let mut registered = HashSet::new();
+        register_watch_directories(
+            &workspace,
+            &root.join(".tsindex"),
+            std::slice::from_ref(&workspace),
+            |path| {
+                if path == root.join("vanishing") {
+                    fs::remove_dir(path).expect("remove disappearing child");
+                    return Err(notify::Error::path_not_found());
+                }
+                if path == root.join("unreadable") {
+                    return Err(notify::Error::io(std::io::Error::from(
+                        std::io::ErrorKind::PermissionDenied,
+                    )));
+                }
+                registered.insert(path.to_path_buf());
+                Ok(())
+            },
+        )?;
+        assert_eq!(registered, HashSet::from([root.clone(), root.join("src")]));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn watch_registration_preserves_root_and_resource_errors() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().canonicalize()?.join("repo");
+        fs::create_dir_all(root.join("src"))?;
+        let workspace = Workspace {
+            name: "repo".to_string(),
+            root: root.clone(),
+            languages: Vec::new(),
+            ignore: Vec::new(),
+        };
+        let root_error = register_watch_directories(
+            &workspace,
+            &root.join(".tsindex"),
+            std::slice::from_ref(&workspace),
+            |_| Err(notify::Error::path_not_found()),
+        )
+        .expect_err("a root registration failure must remain fatal");
+        assert!(matches!(
+            root_error.downcast_ref::<notify::Error>().unwrap().kind,
+            notify::ErrorKind::PathNotFound
+        ));
+        let limit_error = register_watch_directories(
+            &workspace,
+            &root.join(".tsindex"),
+            std::slice::from_ref(&workspace),
+            |path| {
+                if path == root {
+                    Ok(())
+                } else {
+                    Err(notify::Error::new(notify::ErrorKind::MaxFilesWatch))
+                }
+            },
+        )
+        .expect_err("inotify exhaustion must remain fatal even for a child");
+        assert!(matches!(
+            limit_error.downcast_ref::<notify::Error>().unwrap().kind,
+            notify::ErrorKind::MaxFilesWatch
+        ));
+        fs::remove_dir_all(&root)?;
+        assert!(
+            register_watch_directories(
+                &workspace,
+                &root.join(".tsindex"),
+                std::slice::from_ref(&workspace),
+                |_| Ok(()),
+            )
+            .is_err(),
+            "a missing workspace root must not appear successfully watched"
+        );
+        Ok(())
+    }
+
     #[test]
     fn watch_event_loop_does_not_update_while_idle() -> Result<()> {
         // CPU regression guard: the event-driven watcher must block while idle.
@@ -5820,6 +6071,8 @@ mod tests {
 
     #[test]
     fn watch_event_loop_updates_once_per_non_empty_event_batch() -> Result<()> {
+        use notify::event::{AccessKind, AccessMode};
+
         let dir = tempdir()?;
         // Canonicalize for the same reason as
         // watch_filter_skips_internal_metadata_and_keeps_source: macOS
@@ -5847,6 +6100,14 @@ mod tests {
             });
         });
 
+        // Walking directories and reading source during indexing must not
+        // schedule another registration/update cycle on their own.
+        tx.send(Ok(vec![DebouncedEvent::new(
+            Event::new(EventKind::Access(AccessKind::Open(AccessMode::Read)))
+                .add_path(repo.join("src"))
+                .add_path(source.clone()),
+            Instant::now(),
+        )]))?;
         tx.send(Ok(vec![DebouncedEvent::new(
             Event::new(EventKind::Any)
                 .add_path(source.clone())

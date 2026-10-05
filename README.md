@@ -110,6 +110,18 @@ sessions stay fresh without an external `watch`. Use `TSINDEX_START_MODE=watch`
 only when you want a foreground watcher for CLI-only sessions that never start
 `serve --mcp`.
 
+The filesystem watcher does not follow directory symlinks, matching the index
+walk. This keeps linked dependency graphs such as pnpm's `node_modules` from
+expanding into duplicate watched paths and exhausting memory. On Linux, watcher
+registration also honors ignore files and excludes dependency and control
+directories before allocating inotify watches. Nested workspaces register only
+their own directories. Missing or unreadable child directories are skipped
+while root and resource-limit failures remain errors. Newly created source
+directories are registered when their parent reports the change. Other platforms
+retain their native recursive watcher and filter ignored events before updates.
+`--no-refresh serve --mcp` disables automatic refresh and watching when you need
+a server that only reads an existing index.
+
 ---
 
 ## Quick start

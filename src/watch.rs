@@ -127,6 +127,17 @@ impl<W: Watcher> WatchRegistry<W> {
             // workspace watch when both happen to use the same path.
             return Ok(());
         }
+        if self.paths.contains_key(path) {
+            // Upgrade a discovery probe to a native recursive source watch.
+            // Replacing it explicitly avoids leaking the old Windows handle
+            // or appending duplicate paths to an FSEvents stream.
+            if let Err(error) = self.watcher.unwatch(path)
+                && !already_unwatched(&error)
+            {
+                return Err(error);
+            }
+            self.paths.remove(path);
+        }
         self.watcher.watch(path, mode)?;
         self.paths.insert(path.to_path_buf(), mode);
         Ok(())
@@ -156,11 +167,7 @@ impl<W: Watcher> WatchRegistry<W> {
             match self.watcher.unwatch(&path) {
                 Ok(()) => {}
                 // Inotify automatically removes deleted directory watches.
-                Err(error)
-                    if matches!(error.kind, notify::ErrorKind::WatchNotFound)
-                        || matches!(&error.kind, notify::ErrorKind::Io(io)
-                        if io.kind() == std::io::ErrorKind::NotFound
-                            || io.raw_os_error() == Some(libc::EINVAL)) => {}
+                Err(error) if already_unwatched(&error) => {}
                 Err(error) => {
                     eprintln!("watch removal failed {}: {error}", path.display());
                     continue;
@@ -169,6 +176,13 @@ impl<W: Watcher> WatchRegistry<W> {
             self.paths.remove(&path);
         }
     }
+}
+
+fn already_unwatched(error: &notify::Error) -> bool {
+    matches!(error.kind, notify::ErrorKind::WatchNotFound)
+        || matches!(&error.kind, notify::ErrorKind::Io(io)
+            if io.kind() == std::io::ErrorKind::NotFound
+                || (cfg!(target_os = "linux") && io.raw_os_error() == Some(libc::EINVAL)))
 }
 
 #[cfg(test)]
@@ -280,27 +294,32 @@ mod tests {
     -> notify::Result<()> {
         let mut registry =
             WatchRegistry::new(CountingWatcher::new(|_| {}, notify::Config::default())?);
+        registry.watch(Path::new("repo"), RecursiveMode::NonRecursive)?;
         registry.watch(Path::new("repo"), RecursiveMode::Recursive)?;
+        assert_eq!(
+            registry.watcher.removes, 1,
+            "upgrade must release the old native probe"
+        );
         registry.watch(Path::new("repo"), RecursiveMode::NonRecursive)?;
         assert_eq!(
-            registry.watcher.adds, 1,
+            registry.watcher.adds, 2,
             "a probe must not downgrade the recursive root"
         );
         registry.watch(Path::new("repo/rules"), RecursiveMode::NonRecursive)?;
         registry.watch(Path::new("other"), RecursiveMode::Recursive)?;
         registry.invalidate(&HashSet::from(["repo".into()]));
         assert_eq!(
-            registry.watcher.removes, 2,
+            registry.watcher.removes, 3,
             "a lost root invalidates all registered descendants"
         );
         registry.watch(Path::new("other"), RecursiveMode::Recursive)?;
         assert_eq!(
-            registry.watcher.adds, 3,
+            registry.watcher.adds, 4,
             "an unrelated root retains its live watch"
         );
         registry.watch(Path::new("repo"), RecursiveMode::Recursive)?;
         assert_eq!(
-            registry.watcher.adds, 4,
+            registry.watcher.adds, 5,
             "a recreated root must be registered again"
         );
         Ok(())

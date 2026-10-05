@@ -919,15 +919,9 @@ impl Runtime {
         // ignored ancestor during a long startup walk otherwise has no event
         // route. Recheck ownership after probe installation to catch arrivals
         // between the initial workspace lookup and that installation as well.
-        let mut extra_dirs = self.watch_input_directories(&workspaces);
-        for path in &extra_dirs {
-            watcher.watch(path, RecursiveMode::NonRecursive)?;
-        }
-        let workspaces = self.workspaces()?;
-        extra_dirs = self.watch_input_directories(&workspaces);
-        for path in &extra_dirs {
-            watcher.watch(path, RecursiveMode::NonRecursive)?;
-        }
+        let (workspaces, _) = self.prepare_watch_inputs(&workspaces, |path| {
+            watcher.watch(path, RecursiveMode::NonRecursive)
+        })?;
 
         for workspace in &workspaces {
             // Linux registers every recursive inotify path eagerly, including
@@ -991,15 +985,14 @@ impl Runtime {
                 } else {
                     watcher.invalidate(&batch.invalidated);
                 }
-                for path in self.watch_input_directories(workspaces) {
-                    if let Err(error) = watcher.watch(&path, RecursiveMode::NonRecursive) {
-                        eprintln!("discovery watch failed {}: {error}", path.display());
-                    }
-                }
-                // A batch may advance a missing clone's ancestor probe. The
-                // clone can finish before that new probe is installed; resolve
-                // ownership afterward so it cannot fall between the two.
-                let live_workspaces = self.workspaces()?;
+                let (live_workspaces, extra_dirs) =
+                    self.prepare_watch_inputs(workspaces, |path| {
+                        if let Err(error) = watcher.watch(path, RecursiveMode::NonRecursive) {
+                            eprintln!("discovery watch failed {}: {error}", path.display());
+                        }
+                        // A failed probe cannot suppress healthy index updates.
+                        Ok(())
+                    })?;
                 let workspaces = live_workspaces.as_slice();
                 let mut changed = changed.to_vec();
                 let roots: HashSet<_> = workspaces.iter().map(|w| w.root.clone()).collect();
@@ -1010,12 +1003,6 @@ impl Runtime {
                 previous_roots = roots;
                 changed.sort();
                 changed.dedup();
-                extra_dirs = self.watch_input_directories(workspaces);
-                for path in &extra_dirs {
-                    if let Err(error) = watcher.watch(path, RecursiveMode::NonRecursive) {
-                        eprintln!("ignore-file watch failed {}: {error}", path.display());
-                    }
-                }
                 // A failed discovery pass cannot discard a healthy repo's index
                 // update. Successful passes also remove newly excluded watches.
                 #[cfg(target_os = "linux")]
@@ -2722,6 +2709,30 @@ impl Runtime {
                 .filter_map(|root| existing_watch_parent(root)),
         );
         inputs
+    }
+
+    fn prepare_watch_inputs(
+        &self,
+        workspaces: &[Workspace],
+        mut register: impl FnMut(&Path) -> notify::Result<()>,
+    ) -> Result<(Vec<Workspace>, HashSet<PathBuf>)> {
+        let mut workspaces = workspaces.to_vec();
+        loop {
+            let inputs = self.watch_input_directories(&workspaces);
+            for path in &inputs {
+                register(path)
+                    .with_context(|| format!("failed to watch input {}", path.display()))?;
+            }
+            let live = self.workspaces()?;
+            // A missing intermediate directory can arrive between selecting
+            // its nearest parent and installing that parent's probe. Recompute
+            // until the parent frontier is stable, then return fresh ownership:
+            // later arrivals either exist already or notify an installed probe.
+            if inputs == self.watch_input_directories(&live) {
+                return Ok((live, inputs));
+            }
+            workspaces = live;
+        }
     }
 
     /// Names of every repo in the loaded config, whether or not its clone is
@@ -6419,6 +6430,43 @@ mod tests {
             vec![outer.join("src/new"), outer.join("src/new/deep")]
         );
         assert_eq!(count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn watch_input_probes_follow_ancestors_created_during_installation() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let existing = root.join("existing");
+        let arriving_parent = existing.join("new-parent");
+        let clone = arriving_parent.join("clone");
+        fs::create_dir(&existing)?;
+        let mut runtime = python_runtime(&root);
+        runtime.config.repos = vec![RepoConfig {
+            name: "missing".to_string(),
+            path: clone.to_string_lossy().into_owned(),
+            languages: vec!["python".to_string()],
+            ignore: Vec::new(),
+        }];
+        let mut registered = HashSet::new();
+        let (workspaces, inputs) = runtime.prepare_watch_inputs(&[], |path| {
+            // Reproduce creation after selecting the nearest existing parent,
+            // but before its watch exists: a single snapshot misses this step.
+            if path == existing && !arriving_parent.exists() {
+                fs::create_dir(&arriving_parent).unwrap();
+            }
+            registered.insert(path.to_path_buf());
+            Ok(())
+        })?;
+        assert!(
+            workspaces.is_empty(),
+            "the clone itself has not arrived yet"
+        );
+        assert!(
+            registered.contains(&arriving_parent),
+            "the newly existing parent must receive its own probe"
+        );
+        assert_eq!(inputs, HashSet::from([arriving_parent]));
         Ok(())
     }
 

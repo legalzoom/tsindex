@@ -1,8 +1,8 @@
 #![cfg(target_os = "linux")]
 
 use std::fs;
-use std::io::{BufRead, BufReader};
-use std::os::unix::fs::MetadataExt;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -122,12 +122,14 @@ fn nested_clone_arriving_during_startup_registration_receives_source_watches() -
     let inner = outer.join("ignored/existing/inner");
     fixture(&outer, "outer_startup")?;
     fs::create_dir_all(outer.join("ignored/existing"))?;
-    fs::write(outer.join(".gitignore"), "ignored/\n")?;
-    // Leave enough real registration work to clone after startup has begun,
-    // without timing a sleep against the speed of the CI runner.
-    for i in 0..15_000 {
-        fs::create_dir(outer.join(format!("eligible_{i}")))?;
-    }
+    // The registration walk reads root ignore rules before yielding its root.
+    // Hold that read on a FIFO so clone arrival is synchronized with startup
+    // rather than relying on runner speed or a large artificial directory tree.
+    let rules = outer.join(".gitignore");
+    ensure!(
+        Command::new("mkfifo").arg(&rules).status()?.success(),
+        "cannot create startup barrier"
+    );
     fs::create_dir_all(catalog.join(".tsindex"))?;
     fs::write(
         catalog.join(".tsindex/config.toml"),
@@ -138,14 +140,33 @@ fn nested_clone_arriving_during_startup_registration_receives_source_watches() -
         ),
     )?;
     let (server, ready) = Server::spawn(&catalog)?;
-    server.wait("outer registration never began", || {
-        server.watches(&outer).unwrap_or(false)
-    })?;
-    ensure!(
-        matches!(ready.try_recv(), Err(mpsc::TryRecvError::Empty)),
-        "startup completed before the arrival regression could run"
+    let mut writer = None;
+    server.wait(
+        "registration did not open its ignore rules",
+        || match fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&rules)
+        {
+            Ok(file) => {
+                writer = Some(file);
+                true
+            }
+            Err(_) => false,
+        },
+    )?;
+    assert!(
+        !server.watches(&outer)?,
+        "barrier must precede source registration"
     );
     fixture(&inner, "during_startup")?;
+    writer.as_mut().unwrap().write_all(b"ignored/\n")?;
+    // Subsequent build/update walks need a regular rule file. The open reader
+    // still sees the FIFO's rules and EOF when its writer is dropped.
+    let replacement = rules.with_extension("ready");
+    fs::write(&replacement, "ignored/\n")?;
+    fs::rename(&replacement, &rules)?;
+    drop(writer);
     ready
         .recv_timeout(Duration::from_secs(10))
         .context("startup registration did not finish")?;

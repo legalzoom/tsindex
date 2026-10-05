@@ -274,4 +274,35 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn ancestor_invalidation_removes_children_without_downgrading_recursive_probes()
+    -> notify::Result<()> {
+        let mut registry =
+            WatchRegistry::new(CountingWatcher::new(|_| {}, notify::Config::default())?);
+        registry.watch(Path::new("repo"), RecursiveMode::Recursive)?;
+        registry.watch(Path::new("repo"), RecursiveMode::NonRecursive)?;
+        assert_eq!(
+            registry.watcher.adds, 1,
+            "a probe must not downgrade the recursive root"
+        );
+        registry.watch(Path::new("repo/rules"), RecursiveMode::NonRecursive)?;
+        registry.watch(Path::new("other"), RecursiveMode::Recursive)?;
+        registry.invalidate(&HashSet::from(["repo".into()]));
+        assert_eq!(
+            registry.watcher.removes, 2,
+            "a lost root invalidates all registered descendants"
+        );
+        registry.watch(Path::new("other"), RecursiveMode::Recursive)?;
+        assert_eq!(
+            registry.watcher.adds, 3,
+            "an unrelated root retains its live watch"
+        );
+        registry.watch(Path::new("repo"), RecursiveMode::Recursive)?;
+        assert_eq!(
+            registry.watcher.adds, 4,
+            "a recreated root must be registered again"
+        );
+        Ok(())
+    }
 }

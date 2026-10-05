@@ -33,6 +33,13 @@ impl Drop for Server {
 
 impl Server {
     fn start(root: &Path) -> Result<Self> {
+        let (server, rx) = Self::spawn(root)?;
+        rx.recv_timeout(Duration::from_secs(10))
+            .context("watcher did not start")?;
+        Ok(server)
+    }
+
+    fn spawn(root: &Path) -> Result<(Self, mpsc::Receiver<()>)> {
         let mut child = Command::new(BIN)
             .arg("--root")
             .arg(root)
@@ -57,9 +64,7 @@ impl Server {
             db: root.join(".tsindex/index.db"),
             reader: Some(reader),
         };
-        rx.recv_timeout(Duration::from_secs(10))
-            .context("watcher did not start")?;
-        Ok(server)
+        Ok((server, rx))
     }
 
     fn has_symbol(&self, name: &str) -> bool {
@@ -107,6 +112,58 @@ impl Server {
         }
         Ok(())
     }
+}
+
+#[test]
+fn nested_clone_arriving_during_startup_registration_receives_source_watches() -> Result<()> {
+    let dir = tempdir()?;
+    let catalog = dir.path().canonicalize()?.join("catalog");
+    let outer = dir.path().canonicalize()?.join("outer");
+    let inner = outer.join("ignored/existing/inner");
+    fixture(&outer, "outer_startup")?;
+    fs::create_dir_all(outer.join("ignored/existing"))?;
+    fs::write(outer.join(".gitignore"), "ignored/\n")?;
+    // Leave enough real registration work to clone after startup has begun,
+    // without timing a sleep against the speed of the CI runner.
+    for i in 0..15_000 {
+        fs::create_dir(outer.join(format!("eligible_{i}")))?;
+    }
+    fs::create_dir_all(catalog.join(".tsindex"))?;
+    fs::write(
+        catalog.join(".tsindex/config.toml"),
+        format!(
+            "[[repos]]\nname = 'outer'\npath = {}\nlanguages = ['python']\n\n[[repos]]\nname = 'inner'\npath = {}\nlanguages = ['python']\n",
+            serde_json::to_string(&outer)?,
+            serde_json::to_string(&inner)?,
+        ),
+    )?;
+    let (server, ready) = Server::spawn(&catalog)?;
+    server.wait("outer registration never began", || {
+        server.watches(&outer).unwrap_or(false)
+    })?;
+    ensure!(
+        matches!(ready.try_recv(), Err(mpsc::TryRecvError::Empty)),
+        "startup completed before the arrival regression could run"
+    );
+    fixture(&inner, "during_startup")?;
+    ready
+        .recv_timeout(Duration::from_secs(10))
+        .context("startup registration did not finish")?;
+    server.wait("startup did not index arriving clone", || {
+        server.has_symbol("during_startup")
+    })?;
+    server.wait(
+        "startup indexed clone without installing source watches",
+        || server.watches(&inner.join("src")).unwrap_or(false),
+    )?;
+    fs::write(
+        inner.join("src/a.py"),
+        "def after_startup_edit():\n    return 2\n",
+    )?;
+    server.wait("startup clone's follow-up edit stayed stale", || {
+        server.has_symbol("after_startup_edit")
+    })?;
+    Ok(())
 }
 
 fn fixture(root: &Path, symbol: &str) -> Result<()> {

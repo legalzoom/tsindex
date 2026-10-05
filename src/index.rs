@@ -915,6 +915,20 @@ impl Runtime {
             .context("failed to start filesystem watcher")?,
         );
 
+        // Probes must precede source registration: a clone arriving below an
+        // ignored ancestor during a long startup walk otherwise has no event
+        // route. Recheck ownership after probe installation to catch arrivals
+        // between the initial workspace lookup and that installation as well.
+        let mut extra_dirs = self.watch_input_directories(&workspaces);
+        for path in &extra_dirs {
+            watcher.watch(path, RecursiveMode::NonRecursive)?;
+        }
+        let workspaces = self.workspaces()?;
+        extra_dirs = self.watch_input_directories(&workspaces);
+        for path in &extra_dirs {
+            watcher.watch(path, RecursiveMode::NonRecursive)?;
+        }
+
         for workspace in &workspaces {
             // Linux registers every recursive inotify path eagerly, including
             // ignored dependencies and worktrees. Prune before registration;
@@ -941,12 +955,6 @@ impl Runtime {
                     .map_err(|error| watch_failure(workspace, error.into()))?;
                 eprintln!("watching {} ({})", workspace.name, workspace.root.display());
             }
-        }
-        // Install discovery/ignore probes before the startup build, so clones
-        // or rule files arriving during that build still enqueue a refresh.
-        let mut extra_dirs = self.watch_input_directories(&workspaces);
-        for path in &extra_dirs {
-            watcher.watch(path, RecursiveMode::NonRecursive)?;
         }
         eprintln!("watching {} repos for changes", workspaces.len());
 
@@ -983,6 +991,16 @@ impl Runtime {
                 } else {
                     watcher.invalidate(&batch.invalidated);
                 }
+                for path in self.watch_input_directories(workspaces) {
+                    if let Err(error) = watcher.watch(&path, RecursiveMode::NonRecursive) {
+                        eprintln!("discovery watch failed {}: {error}", path.display());
+                    }
+                }
+                // A batch may advance a missing clone's ancestor probe. The
+                // clone can finish before that new probe is installed; resolve
+                // ownership afterward so it cannot fall between the two.
+                let live_workspaces = self.workspaces()?;
+                let workspaces = live_workspaces.as_slice();
                 let mut changed = changed.to_vec();
                 let roots: HashSet<_> = workspaces.iter().map(|w| w.root.clone()).collect();
                 // Resolve live ownership before registration: a newly cloned nested

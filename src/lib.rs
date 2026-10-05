@@ -5,3 +5,4 @@ pub mod index;
 pub mod lang;
 pub mod mcp;
 pub mod model;
+mod watch;

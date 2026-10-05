@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use globset::{Glob, GlobMatcher};
 use ignore::WalkBuilder;
-use notify_debouncer_full::DebounceEventResult;
 use rayon::prelude::*;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Deserialize;
@@ -27,6 +26,9 @@ use crate::model::{
     ReferenceMatch, ReferenceRow, ReplaceSymbolResponse, RepoInfo, RepoLanguageReport, SourceRange,
     SymbolMatch,
 };
+#[cfg(target_os = "linux")]
+use crate::watch::under_any;
+use crate::watch::{ChangeReceiver, WatchRegistry, changes};
 
 #[derive(Debug, Clone)]
 pub struct Runtime {
@@ -563,6 +565,14 @@ impl Runtime {
             } else {
                 self.root.join(path)
             };
+            for (idx, workspace) in workspaces.iter().enumerate() {
+                if configured_ignore_file(workspace, &absolute) {
+                    by_workspace
+                        .entry(idx)
+                        .or_default()
+                        .push(workspace.root.clone());
+                }
+            }
             // An edited ignore file changes which of its siblings/descendants
             // are indexable; re-evaluate the whole directory it governs.
             if is_ignore_file(&absolute)
@@ -866,9 +876,7 @@ impl Runtime {
     /// `build` already skips unchanged files via mtime+sha, so triggering a
     /// rebuild on any event in a watched tree stays cheap and correct.
     pub fn watch(&self) -> Result<()> {
-        use notify::{RecommendedWatcher, RecursiveMode};
-        use notify_debouncer_full::{NoCache, new_debouncer_opt};
-        use std::sync::mpsc;
+        use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
         self.initialize()?;
         let workspaces = self.workspaces()?;
@@ -887,7 +895,6 @@ impl Runtime {
                 )
             })?;
 
-        let (tx, rx) = mpsc::channel::<DebounceEventResult>();
         // 2s debounce window coalesces bursts of events into one rebuild. The
         // real-binary watcher test shortens it so its steps do not idle for
         // seconds each; nothing else should set it.
@@ -895,28 +902,18 @@ impl Runtime {
             .ok()
             .and_then(|millis| millis.parse().ok())
             .map_or(Duration::from_secs(2), Duration::from_millis);
-        // Pass `NoCache` explicitly instead of the default `RecommendedCache`.
-        // On non-Linux platforms `RecommendedCache` is `FileIdMap`, which
-        // recursively scans the watched tree and stores a `FileId` per path to
-        // correlate renames. Over a large repo, including dependency and Git
-        // directories, that cache can consume substantial memory.
-        // We never rely on rename correlation —
-        // `update_paths` re-resolves each changed path independently — so the
-        // cache is pure overhead. Linux already uses `NoCache`; this makes
-        // every platform match.
-        let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
-            debounce,
-            None,
-            tx,
-            NoCache::new(),
-            // Defense in depth only: this flag is read solely by recursive
-            // inotify/kqueue registrations, Linux registers non-recursive
-            // watches below, and FSEvents ignores it. The boundary that keeps
-            // pnpm dependency links from expanding into duplicate watched
-            // trees is the pruning walk in `register_watch_directories`.
-            notify::Config::default().with_follow_symlinks(false),
-        )
-        .context("failed to start filesystem watcher")?;
+        // The full debouncer keeps a Vec of watched roots and linearly scans
+        // it on each registration. Linux needs one watch per eligible directory,
+        // so use an O(1) hash registry and coalesce only the changed paths the
+        // indexer needs; rename pairing/file-ID caches provide no benefit here.
+        let (handler, rx) = changes(debounce);
+        let mut watcher = WatchRegistry::new(
+            RecommendedWatcher::new(
+                handler,
+                notify::Config::default().with_follow_symlinks(false),
+            )
+            .context("failed to start filesystem watcher")?,
+        );
 
         for workspace in &workspaces {
             // Linux registers every recursive inotify path eagerly, including
@@ -929,7 +926,7 @@ impl Runtime {
                     &db_dir,
                     &workspaces,
                     std::slice::from_ref(&workspace.root),
-                    |path| debouncer.watch(path, RecursiveMode::NonRecursive),
+                    |path| watcher.watch(path, RecursiveMode::NonRecursive),
                 )?;
                 eprintln!(
                     "watching {} ({}): {registered} directories",
@@ -939,11 +936,17 @@ impl Runtime {
             }
             #[cfg(not(target_os = "linux"))]
             {
-                debouncer
+                watcher
                     .watch(&workspace.root, RecursiveMode::Recursive)
                     .map_err(|error| watch_failure(workspace, error.into()))?;
                 eprintln!("watching {} ({})", workspace.name, workspace.root.display());
             }
+        }
+        // Install discovery/ignore probes before the startup build, so clones
+        // or rule files arriving during that build still enqueue a refresh.
+        let mut extra_dirs = self.watch_input_directories(&workspaces);
+        for path in &extra_dirs {
+            watcher.watch(path, RecursiveMode::NonRecursive)?;
         }
         eprintln!("watching {} repos for changes", workspaces.len());
 
@@ -967,27 +970,95 @@ impl Runtime {
         // inputs; the incremental update still applies the full ignore rules when
         // it walks, so repos can intentionally index paths such as `build/` or
         // `dist/`.
-        run_watch_event_loop(rx, &db_dir, &workspaces, |changed| {
-            // Nonrecursive watches cover only the directories registered so
-            // far: new, moved or recreated directories (deletion drops the
-            // kernel watch even when the path comes back) and paths included
-            // by an ignore-rule edit each need a pass over their subtree. A
-            // failed pass is logged, not propagated: the next event can repair
-            // a missing watch, but a skipped index update is lost for good.
-            #[cfg(target_os = "linux")]
-            for (idx, targets) in registration_targets(&workspaces, changed) {
-                if let Err(error) = register_watch_directories(
-                    &workspaces[idx],
-                    &db_dir,
-                    &workspaces,
-                    &targets,
-                    |path| debouncer.watch(path, RecursiveMode::NonRecursive),
-                ) {
-                    eprintln!("watch registration failed: {error:#}");
+        let mut previous_roots: HashSet<_> = workspaces.iter().map(|w| w.root.clone()).collect();
+        run_watch_event_loop(
+            rx,
+            &db_dir,
+            || self.workspaces(),
+            |workspaces, batch, changed| {
+                if batch.rescan {
+                    // Lost delete/recreate events may leave pathname keys pointing
+                    // at removed kernel watches. Reinstall them during a rescan.
+                    watcher.retain(|_| false);
+                } else {
+                    watcher.invalidate(&batch.invalidated);
                 }
-            }
-            self.update_paths_cached(changed, &mut language_cache)
-        });
+                let mut changed = changed.to_vec();
+                let roots: HashSet<_> = workspaces.iter().map(|w| w.root.clone()).collect();
+                // Resolve live ownership before registration: a newly cloned nested
+                // repo must use its own rules even if its parent ignores that path.
+                changed.extend(roots.difference(&previous_roots).cloned());
+                let ownership_changed = roots != previous_roots;
+                previous_roots = roots;
+                changed.sort();
+                changed.dedup();
+                extra_dirs = self.watch_input_directories(workspaces);
+                for path in &extra_dirs {
+                    if let Err(error) = watcher.watch(path, RecursiveMode::NonRecursive) {
+                        eprintln!("ignore-file watch failed {}: {error}", path.display());
+                    }
+                }
+                // A failed discovery pass cannot discard a healthy repo's index
+                // update. Successful passes also remove newly excluded watches.
+                #[cfg(target_os = "linux")]
+                {
+                    let mut refreshed = HashMap::new();
+                    for (idx, targets) in registration_targets(workspaces, &changed) {
+                        let mut eligible = HashSet::new();
+                        let result = register_watch_directories(
+                            &workspaces[idx],
+                            &db_dir,
+                            workspaces,
+                            &targets,
+                            |path| {
+                                eligible.insert(path.to_path_buf());
+                                watcher.watch(path, RecursiveMode::NonRecursive)
+                            },
+                        );
+                        match result {
+                            Ok(_) => {
+                                refreshed.insert(
+                                    idx,
+                                    (targets.into_iter().collect::<HashSet<_>>(), eligible),
+                                );
+                            }
+                            Err(error) => eprintln!("watch registration failed: {error:#}"),
+                        }
+                    }
+                    if ownership_changed || !refreshed.is_empty() {
+                        watcher.retain(|path| {
+                            if extra_dirs.contains(path) {
+                                return true;
+                            }
+                            let Some(idx) = best_workspace_for_path(workspaces, path) else {
+                                return false;
+                            };
+                            refreshed.get(&idx).is_none_or(|(targets, eligible)| {
+                                !under_any(path, targets) || eligible.contains(path)
+                            })
+                        });
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    for workspace in workspaces {
+                        if let Err(error) = watcher.watch(&workspace.root, RecursiveMode::Recursive)
+                        {
+                            eprintln!("watch registration failed: {error}");
+                        }
+                    }
+                    if ownership_changed {
+                        watcher.retain(|path| {
+                            extra_dirs.contains(path) || previous_roots.contains(path)
+                        });
+                    }
+                }
+                if changed.is_empty() {
+                    return Ok(BuildStats::default());
+                }
+                self.update_paths_cached(&changed, &mut language_cache)
+            },
+        );
 
         Ok(())
     }
@@ -2610,6 +2681,29 @@ impl Runtime {
             }
         }
         Ok(workspaces)
+    }
+
+    fn watch_input_directories(&self, workspaces: &[Workspace]) -> HashSet<PathBuf> {
+        let mut inputs = ignore_watch_directories(workspaces);
+        let configured_roots = if self.config.repos.is_empty() {
+            vec![self.root.clone()]
+        } else {
+            self.config
+                .repos
+                .iter()
+                .map(|repo| self.root.join(&repo.path))
+                .collect()
+        };
+        // A missing clone, including one below an ignored directory, still
+        // needs a notification route. Watch only its closest existing parent;
+        // advance the probe when new ancestors arrive and retain it after a
+        // root is deleted so a later clone can restore its own source watches.
+        inputs.extend(
+            configured_roots
+                .iter()
+                .filter_map(|root| existing_watch_parent(root)),
+        );
+        inputs
     }
 
     /// Names of every repo in the loaded config, whether or not its clone is
@@ -4891,6 +4985,39 @@ fn is_ignore_file(path: &Path) -> bool {
         .is_some_and(|name| IGNORE_FILE_NAMES.contains(&name))
 }
 
+/// Preserve WalkBuilder::add_ignore's existing file-path semantics, including
+/// relative paths being resolved against the process working directory.
+fn configured_ignore_paths(workspace: &Workspace) -> impl Iterator<Item = PathBuf> + '_ {
+    workspace
+        .ignore
+        .iter()
+        .filter_map(|path| std::path::absolute(path).ok())
+        .map(|path| {
+            path.parent()
+                .and_then(|parent| parent.canonicalize().ok())
+                .zip(path.file_name())
+                .map_or_else(|| path.clone(), |(parent, name)| parent.join(name))
+        })
+}
+
+fn configured_ignore_file(workspace: &Workspace, path: &Path) -> bool {
+    configured_ignore_paths(workspace).any(|rule| rule.starts_with(path))
+}
+
+fn existing_watch_parent(path: &Path) -> Option<PathBuf> {
+    path.parent()?
+        .ancestors()
+        .find_map(|parent| parent.canonicalize().ok())
+}
+
+fn ignore_watch_directories(workspaces: &[Workspace]) -> HashSet<PathBuf> {
+    workspaces
+        .iter()
+        .flat_map(configured_ignore_paths)
+        .filter_map(|path| existing_watch_parent(&path))
+        .collect()
+}
+
 /// The one ignore configuration shared by every walk over a workspace, so the
 /// full build, the incremental update and the Linux watch registration agree
 /// on which paths exist. Callers add their own `filter_entry` pruning.
@@ -4945,11 +5072,6 @@ fn watch_failure(workspace: &Workspace, error: anyhow::Error) -> anyhow::Error {
     error.context(format!("failed to watch {}", workspace.root.display()))
 }
 
-#[cfg(target_os = "linux")]
-fn is_under_any(path: &Path, dirs: &[PathBuf]) -> bool {
-    dirs.iter().any(|dir| path.starts_with(dir))
-}
-
 /// The registration passes a batch of changed paths calls for: per workspace
 /// index, the directories whose subtrees must be (re)walked. An ignore-rule
 /// edit governs its directory's subtree; a directory event (created, moved in
@@ -4963,6 +5085,11 @@ fn registration_targets(
 ) -> Vec<(usize, Vec<PathBuf>)> {
     let mut targets: Vec<Vec<PathBuf>> = vec![Vec::new(); workspaces.len()];
     for path in changed {
+        for (idx, workspace) in workspaces.iter().enumerate() {
+            if configured_ignore_file(workspace, path) {
+                targets[idx].push(workspace.root.clone());
+            }
+        }
         let target = if is_ignore_file(path) {
             path.parent().map(Path::to_path_buf)
         } else if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
@@ -5028,7 +5155,8 @@ fn register_watch_directories(
     let db_dir = db_dir.to_path_buf();
     let foreign_roots = foreign_workspace_roots(workspace, workspaces);
     let workspaces = workspaces.to_vec();
-    let subtrees = targets.to_vec();
+    let targets: HashSet<_> = targets.iter().cloned().collect();
+    let subtrees = targets.clone();
     builder.filter_entry(move |entry| {
         // Directories only (files are never registered), owned by this
         // workspace, passing the same control-directory filter as events, and
@@ -5036,7 +5164,7 @@ fn register_watch_directories(
         entry.file_type().is_some_and(|kind| kind.is_dir())
             && !foreign_roots.contains(entry.path())
             && watch_path_is_relevant(entry.path(), &db_dir, &workspaces)
-            && (ancestors.contains(entry.path()) || is_under_any(entry.path(), &subtrees))
+            && (ancestors.contains(entry.path()) || under_any(entry.path(), &subtrees))
     });
     // The walk reports a missing or unreadable root as a depth-less error
     // indistinguishable from an unreadable ignore file, so check it up front:
@@ -5058,7 +5186,7 @@ fn register_watch_directories(
         };
         // The root is yielded unfiltered; register it only when it is a target.
         if !entry.file_type().is_some_and(|kind| kind.is_dir())
-            || !is_under_any(entry.path(), targets)
+            || !under_any(entry.path(), &targets)
         {
             continue;
         }
@@ -5134,63 +5262,43 @@ fn watch_path_is_relevant(path: &Path, db_dir: &Path, workspaces: &[Workspace]) 
         .any(|name| WATCH_IGNORED_DIR_COMPONENTS.contains(name))
 }
 
-/// Access events the watcher itself causes while indexing (opening directories
-/// and reading files). `Close(Write)` is not one of them: a writer that edits
-/// a file in place through a shared mapping emits no `Modify`, so the close is
-/// its only notification.
-fn is_read_only_access(kind: &notify::EventKind) -> bool {
-    use notify::event::{AccessKind, AccessMode};
-    matches!(
-        kind,
-        notify::EventKind::Access(access) if !matches!(access, AccessKind::Close(AccessMode::Write))
-    )
-}
-
 fn run_watch_event_loop(
-    rx: std::sync::mpsc::Receiver<DebounceEventResult>,
+    rx: ChangeReceiver,
     db_dir: &Path,
-    workspaces: &[Workspace],
-    mut update: impl FnMut(&[PathBuf]) -> Result<BuildStats>,
+    mut live_workspaces: impl FnMut() -> Result<Vec<Workspace>>,
+    mut update: impl FnMut(&[Workspace], &crate::watch::ChangeBatch, &[PathBuf]) -> Result<BuildStats>,
 ) {
-    for result in rx {
-        match result {
-            Ok(events) => {
-                // Collect the distinct changed paths, dropping those under
-                // high-churn ignored directories. We then update only those
-                // paths instead of re-walking every repo.
-                let mut changed: Vec<PathBuf> = events
-                    .iter()
-                    // Reads from our own index walk must not feed another
-                    // registration/update cycle; source changes arrive as
-                    // create, modify, remove or close-after-write events.
-                    .filter(|event| !is_read_only_access(&event.kind))
-                    .flat_map(|event| event.paths.iter())
-                    .filter(|path| watch_path_is_relevant(path, db_dir, workspaces))
-                    .cloned()
-                    .collect();
-                // A queue overflow (inotify IN_Q_OVERFLOW, FSEvents
-                // kFSEventStreamEventFlagMustScanSubDirs) arrives as a
-                // path-less event flagged for rescan: the kernel dropped
-                // notifications, so treat every workspace root as changed. The
-                // root path re-registers the tree's watches and the update
-                // walks it, fast-pathing unchanged files on mtime and size.
-                if events.iter().any(|event| event.need_rescan()) {
-                    eprintln!("watch: event queue overflowed; rescanning every workspace");
-                    changed.extend(workspaces.iter().map(|workspace| workspace.root.clone()));
-                }
-                changed.sort();
-                changed.dedup();
-                if !changed.is_empty()
-                    && let Err(error) = update(&changed)
-                {
-                    eprintln!("watch update failed: {error:#}");
-                }
+    while let Some(batch) = rx.recv() {
+        let workspaces = match live_workspaces() {
+            Ok(workspaces) => workspaces,
+            Err(error) => {
+                eprintln!("watch workspace lookup failed: {error:#}");
+                continue;
             }
-            Err(errors) => {
-                for error in errors {
-                    eprintln!("watch error: {error}");
-                }
-            }
+        };
+        let mut changed: Vec<_> = batch
+            .paths
+            .iter()
+            .filter(|path| {
+                (best_workspace_for_path(&workspaces, path).is_some()
+                    && watch_path_is_relevant(path, db_dir, &workspaces))
+                    || workspaces.iter().any(|w| configured_ignore_file(w, path))
+            })
+            .cloned()
+            .collect();
+        // Overflow has no paths: notifications were lost, so repair watches
+        // and update every currently available workspace, including new clones.
+        if batch.rescan {
+            eprintln!("watch: event queue overflowed; rescanning every workspace");
+            changed.extend(workspaces.iter().map(|w| w.root.clone()));
+        }
+        changed.sort();
+        changed.dedup();
+        // Even an ancestor probe outside live workspaces can reveal a new
+        // configured clone. The callback refreshes discovery watches first and
+        // skips the index update when there are still no source paths.
+        if let Err(error) = update(&workspaces, &batch, &changed) {
+            eprintln!("watch update failed: {error:#}");
         }
     }
 }
@@ -5300,11 +5408,9 @@ pub fn print_language_reports(reports: &[RepoLanguageReport], min_share: f64) {
 mod tests {
     use super::*;
     use notify::{Event, EventKind};
-    use notify_debouncer_full::DebouncedEvent;
     use std::sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicUsize, Ordering},
-        mpsc,
     };
     use std::thread;
     use tempfile::tempdir;
@@ -6305,14 +6411,19 @@ mod tests {
         // an OS-specific CPU percentage that would be flaky in CI.
         let dir = tempdir()?;
         let db_dir = dir.path().join("db");
-        let (tx, rx) = mpsc::channel();
+        let (handler, rx) = changes(Duration::ZERO);
         let update_count = Arc::new(AtomicUsize::new(0));
         let loop_update_count = Arc::clone(&update_count);
         let handle = thread::spawn(move || {
-            run_watch_event_loop(rx, &db_dir, &[], |_| {
-                loop_update_count.fetch_add(1, Ordering::SeqCst);
-                Ok(BuildStats::default())
-            });
+            run_watch_event_loop(
+                rx,
+                &db_dir,
+                || Ok(Vec::new()),
+                |_, _, _| {
+                    loop_update_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(BuildStats::default())
+                },
+            );
         });
 
         thread::sleep(Duration::from_millis(50));
@@ -6326,7 +6437,7 @@ mod tests {
             "idle watcher loop must not call update without filesystem events"
         );
 
-        drop(tx);
+        drop(handler);
         handle.join().expect("watch loop exits when channel closes");
         Ok(())
     }
@@ -6336,67 +6447,70 @@ mod tests {
         use notify::event::{AccessKind, AccessMode};
 
         let dir = tempdir()?;
-        // Canonicalize for the same reason as
-        // watch_filter_skips_internal_metadata_and_keeps_source: macOS
-        // tempdirs live under the /tmp symlink.
         let repo = dir.path().canonicalize()?.join("repo");
         let db_dir = repo.join(".tsindex");
         let source = repo.join("src/main.rs");
-        let ignored_db = db_dir.join("index.db-wal");
         let workspaces = vec![Workspace {
             name: "repo".to_string(),
             root: repo.clone(),
             languages: Vec::new(),
             ignore: Vec::new(),
         }];
-        let (tx, rx) = mpsc::channel();
-        let updates = Arc::new(Mutex::new(Vec::<Vec<PathBuf>>::new()));
-        let loop_updates = Arc::clone(&updates);
-        let handle = thread::spawn(move || {
-            run_watch_event_loop(rx, &db_dir, &workspaces, |changed| {
-                loop_updates
-                    .lock()
-                    .expect("updates lock")
-                    .push(changed.to_vec());
+        let (mut handler, rx) = changes(Duration::ZERO);
+        handler(Ok(Event::new(EventKind::Access(AccessKind::Open(
+            AccessMode::Read,
+        )))
+        .add_path(repo.join("src"))));
+        handler(Ok(Event::new(EventKind::Access(AccessKind::Close(
+            AccessMode::Write,
+        )))
+        .add_path(source.clone())));
+        handler(Ok(Event::new(EventKind::Any)
+            .add_path(source.clone())
+            .add_path(source.clone())
+            .add_path(db_dir.join("index.db-wal"))));
+        drop(handler);
+        let mut updates = Vec::new();
+        run_watch_event_loop(
+            rx,
+            &db_dir,
+            || Ok(workspaces.clone()),
+            |_, _, changed| {
+                updates.push(changed.to_vec());
                 Ok(BuildStats::default())
-            });
-        });
-
-        // Walking directories and reading source during indexing must not
-        // schedule another registration/update cycle on their own.
-        tx.send(Ok(vec![DebouncedEvent::new(
-            Event::new(EventKind::Access(AccessKind::Open(AccessMode::Read)))
-                .add_path(repo.join("src"))
-                .add_path(source.clone()),
-            Instant::now(),
-        )]))?;
-        // A close-after-write is the only notification an in-place mmap writer
-        // produces, so it must still trigger an update.
-        tx.send(Ok(vec![DebouncedEvent::new(
-            Event::new(EventKind::Access(AccessKind::Close(AccessMode::Write)))
-                .add_path(source.clone()),
-            Instant::now(),
-        )]))?;
-        tx.send(Ok(vec![DebouncedEvent::new(
-            Event::new(EventKind::Any)
-                .add_path(source.clone())
-                .add_path(source.clone())
-                .add_path(ignored_db),
-            Instant::now(),
-        )]))?;
-        // A queue overflow carries no paths; every workspace root is rescanned.
-        tx.send(Ok(vec![DebouncedEvent::new(
-            Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan),
-            Instant::now(),
-        )]))?;
-        drop(tx);
-        handle.join().expect("watch loop exits when channel closes");
-
-        let updates = updates.lock().expect("updates lock");
-        assert_eq!(
-            updates.as_slice(),
-            &[vec![source.clone()], vec![source], vec![repo]]
+            },
         );
+        assert_eq!(updates, vec![vec![source]]);
+        Ok(())
+    }
+
+    #[test]
+    fn watch_event_loop_rescans_live_workspace_roots_on_overflow() -> Result<()> {
+        let dir = tempdir()?;
+        let repo = dir.path().canonicalize()?.join("new-repo");
+        let workspaces = vec![Workspace {
+            name: "new-repo".to_string(),
+            root: repo.clone(),
+            languages: Vec::new(),
+            ignore: Vec::new(),
+        }];
+        let (mut handler, rx) = changes(Duration::ZERO);
+        handler(Ok(
+            Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan)
+        ));
+        drop(handler);
+        let mut updates = Vec::new();
+        run_watch_event_loop(
+            rx,
+            &dir.path().join("db"),
+            || Ok(workspaces.clone()),
+            |_, batch, changed| {
+                assert!(batch.rescan);
+                updates.push(changed.to_vec());
+                Ok(BuildStats::default())
+            },
+        );
+        assert_eq!(updates, vec![vec![repo]]);
         Ok(())
     }
 

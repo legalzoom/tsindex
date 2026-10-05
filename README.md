@@ -117,12 +117,20 @@ the watcher walks each workspace with the indexer's ignore rules (`.gitignore`,
 `.ignore`, `.tsindexignore`, nested workspace roots, and the control-directory
 filter) and registers one non-recursive inotify watch per eligible directory.
 Directories that are created, moved, or un-ignored later are registered when
-their parent reports the change. Unreadable or vanished directories are
+their parent reports the change. A hash registry skips unchanged registrations
+and removes watches for deleted or newly ignored directories. Workspace
+ownership is resolved again for each batch, so a newly cloned nested repo uses
+its own ignore rules. Non-recursive parent probes discover missing configured
+clones, including those below ignored paths, and observe replacement or removal
+of configured ignore files outside the source tree.
+
+Notifications are coalesced into distinct changed paths over bounded two-second
+windows, including while indexing is busy. Reads are discarded; writable closes
+and queue-overflow rescans are retained. Unreadable or vanished directories are
 skipped; a missing workspace root or an exhausted inotify watch limit is
 reported. Other platforms keep their native recursive watcher (FSEvents on
-macOS) and filter ignored events before updates. `--no-refresh serve --mcp`
-disables automatic refresh and watching when you need a server that only reads
-an existing index.
+macOS). `--no-refresh serve --mcp` disables automatic refresh and watching when
+you need a server that only reads an existing index.
 
 ---
 

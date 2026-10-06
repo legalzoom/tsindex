@@ -18,6 +18,7 @@ use tree_sitter::{Node, Parser, Query, QueryCapture, QueryCursor};
 
 use crate::config::{RepoConfig, ServerConfig, TsIndexConfig};
 use crate::detect::detect_languages;
+use crate::ignore_inputs::{IgnoreInputs, existing_parent as existing_watch_parent};
 use crate::lang::{LanguageSpec, detect_language_from_file, lookup_language};
 use crate::model::{
     EnclosingHit, EnclosingSymbolResponse, FileOutlineResponse, FileRefCount,
@@ -26,7 +27,6 @@ use crate::model::{
     ReferenceMatch, ReferenceRow, ReplaceSymbolResponse, RepoInfo, RepoLanguageReport, SourceRange,
     SymbolMatch,
 };
-#[cfg(target_os = "linux")]
 use crate::watch::under_any;
 use crate::watch::{ChangeReceiver, WatchRegistry, changes};
 
@@ -555,35 +555,22 @@ impl Runtime {
         // `bundled` SQLite default.
         conn.pragma_update(None, "foreign_keys", "ON")?;
 
-        // Group the changed paths by the workspace that contains them. A path
-        // can belong to at most one workspace (the deepest-rooted match wins, so
-        // nested catalogs behave sensibly).
-        let mut by_workspace: HashMap<usize, Vec<PathBuf>> = HashMap::new();
-        for path in changed {
-            let mut absolute = if path.is_absolute() {
-                path.clone()
-            } else {
-                self.root.join(path)
-            };
-            for (idx, workspace) in workspaces.iter().enumerate() {
-                if configured_ignore_file(workspace, &absolute) {
-                    by_workspace
-                        .entry(idx)
-                        .or_default()
-                        .push(workspace.root.clone());
+        let absolute: Vec<_> = changed
+            .iter()
+            .map(|path| {
+                if path.is_absolute() {
+                    path.clone()
+                } else {
+                    self.root.join(path)
                 }
-            }
-            // An edited ignore file changes which of its siblings/descendants
-            // are indexable; re-evaluate the whole directory it governs.
-            if is_ignore_file(&absolute)
-                && let Some(parent) = absolute.parent()
-            {
-                absolute = parent.to_path_buf();
-            }
-            if let Some(idx) = best_workspace_for_path(&workspaces, &absolute) {
-                by_workspace.entry(idx).or_default().push(absolute);
-            }
-        }
+            })
+            .collect();
+        let mut inputs = IgnoreInputs::default();
+        inputs.refresh(&workspaces);
+        // Index invalidation and watch registration share target expansion.
+        // Inherited rules must refresh nested indexes in the same batch that
+        // removes their excluded watches, without needing another source event.
+        let by_workspace = workspace_change_targets(&workspaces, &absolute, &inputs);
 
         let mut stats = BuildStats::default();
         let mut touched = 0usize;
@@ -919,9 +906,11 @@ impl Runtime {
         // ignored ancestor during a long startup walk otherwise has no event
         // route. Recheck ownership after probe installation to catch arrivals
         // between the initial workspace lookup and that installation as well.
-        let (workspaces, _) = self.prepare_watch_inputs(&workspaces, |path| {
-            watcher.watch(path, RecursiveMode::NonRecursive)
-        })?;
+        let mut ignore_inputs = IgnoreInputs::default();
+        let (workspaces, _) =
+            self.prepare_watch_inputs(&workspaces, &mut ignore_inputs, |path| {
+                watcher.watch(path, RecursiveMode::NonRecursive)
+            })?;
 
         for workspace in &workspaces {
             // Linux registers every recursive inotify path eagerly, including
@@ -934,7 +923,7 @@ impl Runtime {
                     &db_dir,
                     &workspaces,
                     std::slice::from_ref(&workspace.root),
-                    |path| watcher.watch(path, RecursiveMode::NonRecursive),
+                    |path| register_source_directory(path, &mut ignore_inputs, &mut watcher),
                 )?;
                 eprintln!(
                     "watching {} ({}): {registered} directories",
@@ -947,6 +936,16 @@ impl Runtime {
                 watcher
                     .watch(&workspace.root, RecursiveMode::Recursive)
                     .map_err(|error| watch_failure(workspace, error.into()))?;
+                // Native backends own recursive source watches. The eligible
+                // walk only discovers ignore inputs, including shared metadata
+                // for embedded worktrees outside those recursive source roots.
+                register_watch_directories(
+                    workspace,
+                    &db_dir,
+                    &workspaces,
+                    std::slice::from_ref(&workspace.root),
+                    |path| register_ignore_directory(path, &mut ignore_inputs, &mut watcher),
+                )?;
                 eprintln!("watching {} ({})", workspace.name, workspace.root.display());
             }
         }
@@ -978,6 +977,13 @@ impl Runtime {
             &db_dir,
             || self.workspaces(),
             |workspaces, batch, changed| {
+                let raw_changed: Vec<_> = batch.paths.iter().cloned().collect();
+                let mut changed = changed.to_vec();
+                // Capture old mappings before reloading .git/commondir or
+                // global config: removing an indirection still changes its
+                // former workspace's eligibility.
+                changed.extend(ignore_inputs.changed_targets(&raw_changed));
+                ignore_inputs.observe_repository_markers(&raw_changed);
                 if batch.rescan {
                     // Lost delete/recreate events may leave pathname keys pointing
                     // at removed kernel watches. Reinstall them during a rescan.
@@ -985,8 +991,8 @@ impl Runtime {
                 } else {
                     watcher.invalidate(&batch.invalidated);
                 }
-                let (live_workspaces, extra_dirs) =
-                    self.prepare_watch_inputs(workspaces, |path| {
+                let (live_workspaces, _) =
+                    self.prepare_watch_inputs(workspaces, &mut ignore_inputs, |path| {
                         if let Err(error) = watcher.watch(path, RecursiveMode::NonRecursive) {
                             eprintln!("discovery watch failed {}: {error}", path.display());
                         }
@@ -994,7 +1000,7 @@ impl Runtime {
                         Ok(())
                     })?;
                 let workspaces = live_workspaces.as_slice();
-                let mut changed = changed.to_vec();
+                changed.extend(ignore_inputs.changed_targets(&raw_changed));
                 let roots: HashSet<_> = workspaces.iter().map(|w| w.root.clone()).collect();
                 // Resolve live ownership before registration: a newly cloned nested
                 // repo must use its own rules even if its parent ignores that path.
@@ -1005,10 +1011,16 @@ impl Runtime {
                 changed.dedup();
                 // A failed discovery pass cannot discard a healthy repo's index
                 // update. Successful passes also remove newly excluded watches.
-                #[cfg(target_os = "linux")]
-                {
+                #[cfg(not(target_os = "linux"))]
+                for workspace in workspaces {
+                    if let Err(error) = watcher.watch(&workspace.root, RecursiveMode::Recursive) {
+                        eprintln!("watch registration failed: {error}");
+                    }
+                }
+                let refreshed = {
                     let mut refreshed = HashMap::new();
-                    for (idx, targets) in registration_targets(workspaces, &changed) {
+                    for (idx, targets) in registration_targets(workspaces, &changed, &ignore_inputs)
+                    {
                         let mut eligible = HashSet::new();
                         let result = register_watch_directories(
                             &workspaces[idx],
@@ -1017,7 +1029,22 @@ impl Runtime {
                             &targets,
                             |path| {
                                 eligible.insert(path.to_path_buf());
-                                watcher.watch(path, RecursiveMode::NonRecursive)
+                                #[cfg(target_os = "linux")]
+                                {
+                                    register_source_directory(
+                                        path,
+                                        &mut ignore_inputs,
+                                        &mut watcher,
+                                    )
+                                }
+                                #[cfg(not(target_os = "linux"))]
+                                {
+                                    register_ignore_directory(
+                                        path,
+                                        &mut ignore_inputs,
+                                        &mut watcher,
+                                    )
+                                }
                             },
                         );
                         match result {
@@ -1030,38 +1057,39 @@ impl Runtime {
                             Err(error) => eprintln!("watch registration failed: {error:#}"),
                         }
                     }
-                    if ownership_changed || !refreshed.is_empty() {
-                        watcher.retain(|path| {
-                            if extra_dirs.contains(path) {
-                                return true;
-                            }
-                            let Some(idx) = best_workspace_for_path(workspaces, path) else {
-                                return false;
-                            };
-                            refreshed.get(&idx).is_none_or(|(targets, eligible)| {
-                                !under_any(path, targets) || eligible.contains(path)
-                            })
-                        });
+                    refreshed
+                };
+                let stats = if changed.is_empty() {
+                    BuildStats::default()
+                } else {
+                    self.update_paths_cached(&changed, &mut language_cache)?
+                };
+                // Purge affected index rows before releasing their watches. If
+                // the update fails, retain the notification route for recovery.
+                if ownership_changed || !refreshed.is_empty() {
+                    let keep_source = |path: &Path| {
+                        let Some(idx) = best_workspace_for_path(workspaces, path) else {
+                            return false;
+                        };
+                        refreshed.get(&idx).is_none_or(|(targets, eligible)| {
+                            !under_any(path, targets) || eligible.contains(path)
+                        })
+                    };
+                    ignore_inputs.retain_repositories(|path| keep_source(path));
+                    ignore_inputs.refresh(workspaces);
+                    #[cfg(target_os = "linux")]
+                    {
+                        let extra_dirs = self.watch_input_directories(&ignore_inputs);
+                        watcher.retain(|path| extra_dirs.contains(path) || keep_source(path));
                     }
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    for workspace in workspaces {
-                        if let Err(error) = watcher.watch(&workspace.root, RecursiveMode::Recursive)
-                        {
-                            eprintln!("watch registration failed: {error}");
-                        }
-                    }
-                    if ownership_changed {
-                        watcher.retain(|path| {
-                            extra_dirs.contains(path) || previous_roots.contains(path)
-                        });
-                    }
+                    let extra_dirs = self.watch_input_directories(&ignore_inputs);
+                    watcher
+                        .retain(|path| extra_dirs.contains(path) || previous_roots.contains(path));
                 }
-                if changed.is_empty() {
-                    return Ok(BuildStats::default());
-                }
-                self.update_paths_cached(&changed, &mut language_cache)
+                Ok(stats)
             },
         );
 
@@ -2688,8 +2716,8 @@ impl Runtime {
         Ok(workspaces)
     }
 
-    fn watch_input_directories(&self, workspaces: &[Workspace]) -> HashSet<PathBuf> {
-        let mut inputs = ignore_watch_directories(workspaces);
+    fn watch_input_directories(&self, ignore_inputs: &IgnoreInputs) -> HashSet<PathBuf> {
+        let mut inputs = ignore_inputs.directories();
         let configured_roots = if self.config.repos.is_empty() {
             vec![self.root.clone()]
         } else {
@@ -2714,11 +2742,13 @@ impl Runtime {
     fn prepare_watch_inputs(
         &self,
         workspaces: &[Workspace],
+        ignore_inputs: &mut IgnoreInputs,
         mut register: impl FnMut(&Path) -> notify::Result<()>,
     ) -> Result<(Vec<Workspace>, HashSet<PathBuf>)> {
         let mut workspaces = workspaces.to_vec();
         loop {
-            let inputs = self.watch_input_directories(&workspaces);
+            ignore_inputs.refresh(&workspaces);
+            let inputs = self.watch_input_directories(ignore_inputs);
             for path in &inputs {
                 register(path)
                     .with_context(|| format!("failed to watch input {}", path.display()))?;
@@ -2728,7 +2758,8 @@ impl Runtime {
             // its nearest parent and installing that parent's probe. Recompute
             // until the parent frontier is stable, then return fresh ownership:
             // later arrivals either exist already or notify an installed probe.
-            if inputs == self.watch_input_directories(&live) {
+            ignore_inputs.refresh(&live);
+            if inputs == self.watch_input_directories(ignore_inputs) {
                 return Ok((live, inputs));
             }
             workspaces = live;
@@ -5002,49 +5033,14 @@ const WATCH_IGNORED_COMPONENT_PATHS: &[&[&str]] = &[&[".claude", "worktrees"]];
 /// The ignore file the indexer honors in addition to Git's.
 const CUSTOM_IGNORE_FILENAME: &str = ".tsindexignore";
 
-/// Files whose edits change which paths the walks yield. `.ignore` is honored
-/// by the `ignore` crate next to `.gitignore`; `.git/info/exclude` and the
-/// global excludes file are not listed because they live under the pruned
-/// `.git` directory or outside the tree, where no watch can observe them.
+/// Directory-scoped rules. Git metadata and external/configured rule files
+/// are observed separately through IgnoreInputs' nonrecursive parent probes.
 const IGNORE_FILE_NAMES: &[&str] = &[".gitignore", ".ignore", CUSTOM_IGNORE_FILENAME];
 
 fn is_ignore_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| IGNORE_FILE_NAMES.contains(&name))
-}
-
-/// Preserve WalkBuilder::add_ignore's existing file-path semantics, including
-/// relative paths being resolved against the process working directory.
-fn configured_ignore_paths(workspace: &Workspace) -> impl Iterator<Item = PathBuf> + '_ {
-    workspace
-        .ignore
-        .iter()
-        .filter_map(|path| std::path::absolute(path).ok())
-        .map(|path| {
-            path.parent()
-                .and_then(|parent| parent.canonicalize().ok())
-                .zip(path.file_name())
-                .map_or_else(|| path.clone(), |(parent, name)| parent.join(name))
-        })
-}
-
-fn configured_ignore_file(workspace: &Workspace, path: &Path) -> bool {
-    configured_ignore_paths(workspace).any(|rule| rule.starts_with(path))
-}
-
-fn existing_watch_parent(path: &Path) -> Option<PathBuf> {
-    path.parent()?
-        .ancestors()
-        .find_map(|parent| parent.canonicalize().ok())
-}
-
-fn ignore_watch_directories(workspaces: &[Workspace]) -> HashSet<PathBuf> {
-    workspaces
-        .iter()
-        .flat_map(configured_ignore_paths)
-        .filter_map(|path| existing_watch_parent(&path))
-        .collect()
 }
 
 /// The one ignore configuration shared by every walk over a workspace, so the
@@ -5101,34 +5097,27 @@ fn watch_failure(workspace: &Workspace, error: anyhow::Error) -> anyhow::Error {
     error.context(format!("failed to watch {}", workspace.root.display()))
 }
 
-/// The registration passes a batch of changed paths calls for: per workspace
-/// index, the directories whose subtrees must be (re)walked. An ignore-rule
-/// edit governs its directory's subtree; a directory event (created, moved in
-/// or recreated) governs that directory; plain file changes need no watch.
-/// Nested workspaces below a target are pruned from their parent's walk, so
-/// they take a pass of their own.
-#[cfg(target_os = "linux")]
-fn registration_targets(
+/// Expand source and ignore changes once for both index and watch refreshes.
+/// Nested roots need their own pass: their parent prunes them, but custom
+/// parent rules can still change their eligibility across that boundary.
+fn workspace_change_targets(
     workspaces: &[Workspace],
     changed: &[PathBuf],
+    inputs: &IgnoreInputs,
 ) -> Vec<(usize, Vec<PathBuf>)> {
     let mut targets: Vec<Vec<PathBuf>> = vec![Vec::new(); workspaces.len()];
-    for path in changed {
-        for (idx, workspace) in workspaces.iter().enumerate() {
-            if configured_ignore_file(workspace, path) {
-                targets[idx].push(workspace.root.clone());
+    let governed = inputs.changed_targets(changed);
+    let paths = changed
+        .iter()
+        .filter_map(|path| {
+            if is_ignore_file(path) {
+                path.parent().map(Path::to_path_buf)
+            } else {
+                Some(path.clone())
             }
-        }
-        let target = if is_ignore_file(path) {
-            path.parent().map(Path::to_path_buf)
-        } else if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
-            Some(path.clone())
-        } else {
-            None
-        };
-        let Some(target) = target else {
-            continue;
-        };
+        })
+        .chain(governed);
+    for target in paths {
         if let Some(idx) = best_workspace_for_path(workspaces, &target) {
             targets[idx].push(target.clone());
         }
@@ -5150,6 +5139,53 @@ fn registration_targets(
         .collect()
 }
 
+/// Ordinary file edits have no registration work. Directory and ignore-input
+/// targets use the same ownership expansion as incremental indexing.
+fn registration_targets(
+    workspaces: &[Workspace],
+    changed: &[PathBuf],
+    inputs: &IgnoreInputs,
+) -> Vec<(usize, Vec<PathBuf>)> {
+    workspace_change_targets(workspaces, changed, inputs)
+        .into_iter()
+        .filter_map(|(idx, paths)| {
+            let dirs: Vec<_> = paths
+                .into_iter()
+                .filter(|path| fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()))
+                .collect();
+            (!dirs.is_empty()).then_some((idx, dirs))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn register_source_directory<W: notify::Watcher>(
+    path: &Path,
+    inputs: &mut IgnoreInputs,
+    watcher: &mut WatchRegistry<W>,
+) -> notify::Result<()> {
+    register_ignore_directory(path, inputs, watcher)?;
+    watcher.watch(path, notify::RecursiveMode::NonRecursive)
+}
+
+fn register_ignore_directory<W: notify::Watcher>(
+    path: &Path,
+    inputs: &mut IgnoreInputs,
+    watcher: &mut WatchRegistry<W>,
+) -> notify::Result<()> {
+    for probe in inputs.discover_repository(path) {
+        if let Err(error) = watcher.watch(&probe, notify::RecursiveMode::NonRecursive) {
+            // An unreadable Git input cannot suppress healthy source watches.
+            // Resource exhaustion is systemic, so retain the fatal limit error.
+            if is_watch_limit(&error) {
+                return Err(error);
+            }
+            eprintln!("ignore watch failed {}: {error}", probe.display());
+        }
+    }
+    Ok(())
+}
+
 /// Register a non-recursive watch for every directory under `targets` that can
 /// contribute source files, returning how many were registered. Inotify's own
 /// recursive walk ignores the ignore rules and follows dependency symlink
@@ -5160,7 +5196,6 @@ fn registration_targets(
 /// the index must keep updating regardless. A failing root (the workspace is
 /// gone or unreadable) and the inotify watch limit (every later directory
 /// would fail the same way) are reported.
-#[cfg(target_os = "linux")]
 fn register_watch_directories(
     workspace: &Workspace,
     db_dir: &Path,
@@ -5309,12 +5344,14 @@ fn run_watch_event_loop(
             .paths
             .iter()
             .filter(|path| {
-                (best_workspace_for_path(&workspaces, path).is_some()
-                    && watch_path_is_relevant(path, db_dir, &workspaces))
-                    || workspaces.iter().any(|w| configured_ignore_file(w, path))
+                best_workspace_for_path(&workspaces, path).is_some()
+                    && watch_path_is_relevant(path, db_dir, &workspaces)
             })
             .cloned()
             .collect();
+        let mut inputs = IgnoreInputs::default();
+        inputs.refresh(&workspaces);
+        changed.extend(inputs.changed_targets(&batch.paths.iter().cloned().collect::<Vec<_>>()));
         // Overflow has no paths: notifications were lost, so repair watches
         // and update every currently available workspace, including new clones.
         if batch.rescan {
@@ -5631,6 +5668,36 @@ mod tests {
             file_paths(&runtime.db_path).contains(&("inner".to_string(), "i.py".to_string())),
             "{:?}",
             file_paths(&runtime.db_path)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inherited_ignore_edits_refresh_nested_workspace_indexes() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let outer = root.join("outer");
+        let inner = outer.join("inner");
+        fs::create_dir_all(inner.join("src"))?;
+        fs::write(outer.join("o.py"), "def outer():\n    return 1\n")?;
+        fs::write(inner.join("src/a.py"), "def inner():\n    return 2\n")?;
+        let runtime = catalog_runtime(&root, &[("outer", &outer), ("inner", &inner)]);
+        runtime.build(false, None)?;
+        let indexed = ("inner".to_string(), "src/a.py".to_string());
+        assert!(file_paths(&runtime.db_path).contains(&indexed));
+
+        let rules = outer.join(CUSTOM_IGNORE_FILENAME);
+        fs::write(&rules, "inner/src/\n")?;
+        runtime.update_paths(std::slice::from_ref(&rules))?;
+        assert!(
+            !file_paths(&runtime.db_path).contains(&indexed),
+            "inherited rules must purge nested rows without a later source event"
+        );
+        fs::remove_file(&rules)?;
+        runtime.update_paths(&[rules])?;
+        assert!(
+            file_paths(&runtime.db_path).contains(&indexed),
+            "removing inherited rules must restore nested rows"
         );
         Ok(())
     }
@@ -6391,15 +6458,19 @@ mod tests {
                 ignore: Vec::new(),
             })
             .collect();
+        let inputs = IgnoreInputs::default();
 
         // A file edit needs no pass; a new directory scopes its owner's pass to
         // that subtree; an ignore edit scopes it to the governed directory and
         // sends every nested workspace below it on a pass of its own.
-        assert!(registration_targets(&workspaces, &[outer.join("src/old/a.py")]).is_empty());
+        assert!(
+            registration_targets(&workspaces, &[outer.join("src/old/a.py")], &inputs).is_empty()
+        );
         assert_eq!(
             registration_targets(
                 &workspaces,
-                &[outer.join("src/new"), outer.join("vendor/inner/lib")]
+                &[outer.join("src/new"), outer.join("vendor/inner/lib")],
+                &inputs,
             ),
             vec![
                 (0, vec![outer.join("src/new")]),
@@ -6407,7 +6478,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            registration_targets(&workspaces, &[outer.join(".gitignore")]),
+            registration_targets(&workspaces, &[outer.join(".gitignore")], &inputs),
             vec![(0, vec![outer.clone()]), (1, vec![inner.clone()])]
         );
 
@@ -6449,15 +6520,16 @@ mod tests {
             ignore: Vec::new(),
         }];
         let mut registered = HashSet::new();
-        let (workspaces, inputs) = runtime.prepare_watch_inputs(&[], |path| {
-            // Reproduce creation after selecting the nearest existing parent,
-            // but before its watch exists: a single snapshot misses this step.
-            if path == existing && !arriving_parent.exists() {
-                fs::create_dir(&arriving_parent).unwrap();
-            }
-            registered.insert(path.to_path_buf());
-            Ok(())
-        })?;
+        let (workspaces, inputs) =
+            runtime.prepare_watch_inputs(&[], &mut IgnoreInputs::default(), |path| {
+                // Reproduce creation after selecting the nearest existing parent,
+                // but before its watch exists: a single snapshot misses this step.
+                if path == existing && !arriving_parent.exists() {
+                    fs::create_dir(&arriving_parent).unwrap();
+                }
+                registered.insert(path.to_path_buf());
+                Ok(())
+            })?;
         assert!(
             workspaces.is_empty(),
             "the clone itself has not arrived yet"
@@ -6466,7 +6538,11 @@ mod tests {
             registered.contains(&arriving_parent),
             "the newly existing parent must receive its own probe"
         );
-        assert_eq!(inputs, HashSet::from([arriving_parent]));
+        assert!(inputs.contains(&arriving_parent));
+        assert!(
+            !inputs.contains(&existing),
+            "the old probe frontier must advance"
+        );
         Ok(())
     }
 

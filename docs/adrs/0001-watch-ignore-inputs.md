@@ -12,8 +12,16 @@ can also affect separately configured nested workspaces.
 
 Track rule files and their indirections explicitly. Probe their nearest
 existing parents nonrecursively, advancing those probes as parents arrive.
-Discover embedded Git inputs during eligible-directory walks and metadata
-events; reload indirections when processing changes.
+Track directory-scoped rules above each workspace root, including absent rule
+paths so their creation is observed. Discover directory-scoped rule files and
+embedded Git inputs during eligible-directory walks, and Git inputs through
+metadata events; reload indirections when processing changes. Probe symlinked
+rule files through their file-link chain, including a missing target, without
+traversing directory symlink trees.
+When a walk discovers new probe parents, repeat its affected targets after
+installing the probes. Keep eligibility from the final pass so rule changes
+before discovery neither leave included sources unwatched nor retain newly
+excluded source watches.
 
 Use the pinned `ignore` crate's global-file resolver and match its repository
 metadata resolution. Preserve explicit `add_ignore` file-path semantics,

@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::symlink;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -256,6 +257,257 @@ fn configured_ignore_file_edits_refresh_watches_and_remove_excluded_watches() ->
 }
 
 #[test]
+fn ancestor_ignore_inputs_refresh_every_affected_workspace() -> Result<()> {
+    for filename in [".ignore", ".gitignore", ".tsindexignore"] {
+        let dir = tempdir()?;
+        let base = dir.path().canonicalize()?;
+        let catalog = base.join("catalog");
+        let parent = base.join("sources");
+        let roots = [parent.join("nested/first"), parent.join("nested/second")];
+        let rules = parent.join(filename);
+        let mut config = String::new();
+        for (i, root) in roots.iter().enumerate() {
+            fixture(root, &format!("ancestor_initial_{i}"))?;
+            // Git rules stop at repository boundaries; place the Git marker
+            // at the shared ancestor so its .gitignore governs both roots.
+            if filename == ".gitignore" {
+                fs::remove_dir_all(root.join(".git"))?;
+                fs::create_dir_all(parent.join(".git"))?;
+            }
+            fs::create_dir_all(root.join("later/deep"))?;
+            fs::write(
+                root.join("later/deep/a.py"),
+                format!("def ancestor_later_{i}():\n    return 2\n"),
+            )?;
+            config.push_str(&format!(
+                "[[repos]]\nname = 'repo{i}'\npath = {}\nlanguages = ['python']\n\n",
+                serde_json::to_string(root)?,
+            ));
+        }
+        fs::write(&rules, "later/\n")?;
+        fs::create_dir_all(catalog.join(".tsindex"))?;
+        fs::write(catalog.join(".tsindex/config.toml"), config)?;
+        let server = Server::start(&catalog)?;
+        server.wait("ancestor rule initial build", || {
+            server.has_symbol("ancestor_initial_1")
+        })?;
+        for (i, root) in roots.iter().enumerate() {
+            assert!(!server.has_symbol(&format!("ancestor_later_{i}")));
+            assert!(!server.watches(&root.join("later/deep"))?);
+        }
+
+        let replacement = rules.with_extension("new");
+        fs::write(&replacement, "")?;
+        fs::rename(&replacement, &rules)?;
+        for (i, root) in roots.iter().enumerate() {
+            server.wait("ancestor rule replacement did not restore source", || {
+                server.has_symbol(&format!("ancestor_later_{i}"))
+            })?;
+            server.wait("ancestor rule left restored source unwatched", || {
+                server.watches(&root.join("later/deep")).unwrap_or(false)
+            })?;
+            fs::write(
+                root.join("later/deep/a.py"),
+                format!("def ancestor_followup_{i}():\n    return 3\n"),
+            )?;
+            server.wait("ancestor rule left follow-up edits invisible", || {
+                server.has_symbol(&format!("ancestor_followup_{i}"))
+            })?;
+        }
+        fs::write(&rules, "later/\n")?;
+        for (i, root) in roots.iter().enumerate() {
+            server.wait("ancestor rule edit did not purge excluded source", || {
+                !server.has_symbol(&format!("ancestor_followup_{i}"))
+            })?;
+            server.wait("ancestor rule retained excluded source watches", || {
+                !server.watches(&root.join("later/deep")).unwrap_or(true)
+            })?;
+        }
+        fs::remove_file(&rules)?;
+        for i in 0..roots.len() {
+            server.wait("ancestor rule removal did not restore source", || {
+                server.has_symbol(&format!("ancestor_followup_{i}"))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn symlinked_directory_ignore_inputs_observe_external_targets() -> Result<()> {
+    for filename in [".ignore", ".gitignore", ".tsindexignore"] {
+        let dir = tempdir()?;
+        let base = dir.path().canonicalize()?;
+        let root = base.join("repo");
+        // Use a rule below the root as well: discovering only root-level
+        // symlinks would still leave ignored descendants without probes.
+        let governed = root.join("nested");
+        fixture(&root, "symlink_initial")?;
+        fs::create_dir_all(governed.join("later/deep"))?;
+        let source = governed.join("later/deep/a.py");
+        fs::write(&source, "def symlink_later():\n    return 2\n")?;
+        let external = base.join("external-rules");
+        fs::create_dir(&external)?;
+        let target = external.join("rules");
+        let rules = governed.join(filename);
+        fs::write(&target, "later/\n")?;
+        symlink(&target, &rules)?;
+        let server = Server::start(&root)?;
+        server.wait("symlink rule initial build", || {
+            server.has_symbol("symlink_initial")
+        })?;
+        assert!(!server.has_symbol("symlink_later"));
+        assert!(!server.watches(source.parent().unwrap())?);
+
+        fs::write(&target, "")?;
+        server.wait("symlink target edit did not restore source", || {
+            server.has_symbol("symlink_later")
+        })?;
+        server.wait("symlink target left restored source unwatched", || {
+            server.watches(source.parent().unwrap()).unwrap_or(false)
+        })?;
+        fs::write(&source, "def symlink_followup():\n    return 3\n")?;
+        server.wait("symlink target left follow-up edits invisible", || {
+            server.has_symbol("symlink_followup")
+        })?;
+        let replacement = target.with_extension("new");
+        fs::write(&replacement, "later/\n")?;
+        fs::rename(&replacement, &target)?;
+        server.wait("symlink target replacement did not purge source", || {
+            !server.has_symbol("symlink_followup")
+        })?;
+        server.wait("symlink target retained excluded source watches", || {
+            !server.watches(source.parent().unwrap()).unwrap_or(true)
+        })?;
+        fs::remove_file(&target)?;
+        server.wait("symlink target removal did not restore source", || {
+            server.has_symbol("symlink_followup")
+        })?;
+        // Removing the target makes the rule symlink dangling. Its target
+        // parent must remain probed so recreating the rules can exclude again.
+        fs::write(&target, "later/\n")?;
+        server.wait(
+            "dangling symlink target recreation did not purge source",
+            || !server.has_symbol("symlink_followup"),
+        )?;
+        fs::write(&target, "")?;
+        server.wait(
+            "recreated symlink target edit did not restore source",
+            || server.has_symbol("symlink_followup"),
+        )?;
+
+        let redirected = base.join("redirected-rules");
+        fs::create_dir(&redirected)?;
+        let new_target = redirected.join("rules");
+        fs::write(&new_target, "")?;
+        let replacement_link = rules.with_extension("new");
+        symlink(&new_target, &replacement_link)?;
+        fs::rename(&replacement_link, &rules)?;
+        server.wait("replacement symlink target was not probed", || {
+            server.watches(&redirected).unwrap_or(false)
+        })?;
+        fs::write(&new_target, "later/\n")?;
+        server.wait(
+            "replacement symlink target edit did not purge source",
+            || !server.has_symbol("symlink_followup"),
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn symlinked_ignore_targets_replaced_during_discovery_reconcile_source_watches() -> Result<()> {
+    for (startup, exclude_now) in [(true, false), (false, false), (true, true)] {
+        let dir = tempdir()?;
+        let base = dir.path().canonicalize()?;
+        let root = base.join("repo");
+        let prepared = base.join("prepared");
+        let governed = root.join("nested");
+        let external = base.join("external-rules");
+        let rules = external.join("rules");
+        fixture(&root, "discovery_initial")?;
+        fs::create_dir_all(prepared.join("later/deep"))?;
+        fs::write(
+            prepared.join("later/deep/a.py"),
+            "def discovery_later():\n    return 2\n",
+        )?;
+        fs::create_dir(&external)?;
+        ensure!(
+            Command::new("mkfifo").arg(&rules).status()?.success(),
+            "cannot create rule-discovery barrier"
+        );
+        symlink(&rules, prepared.join(".ignore"))?;
+        if startup {
+            fs::rename(&prepared, &governed)?;
+        }
+        let (server, ready) = Server::spawn(&root)?;
+        if !startup {
+            ready
+                .recv_timeout(Duration::from_secs(10))
+                .context("initial watcher registration did not finish")?;
+            server.wait("initial watcher build", || {
+                server.has_symbol("discovery_initial")
+            })?;
+            fs::rename(&prepared, &governed)?;
+        }
+        let mut writer = None;
+        server.wait("registration did not read external ignore rules", || {
+            match fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&rules)
+            {
+                Ok(file) => {
+                    writer = Some(file);
+                    true
+                }
+                Err(_) => false,
+            }
+        })?;
+        assert!(!server.watches(&external)?);
+        // Eligibility is already being read, but the external input's probe
+        // does not exist yet. Replace its pathname before unblocking the old
+        // read so discovery and indexing would otherwise see different rules.
+        writer
+            .as_mut()
+            .unwrap()
+            .write_all(if exclude_now { b"\n" } else { b"later/\n" })?;
+        let replacement = external.join("replacement");
+        fs::write(&replacement, if exclude_now { "later/\n" } else { "" })?;
+        fs::rename(&replacement, &rules)?;
+        drop(writer);
+        if startup {
+            ready
+                .recv_timeout(Duration::from_secs(10))
+                .context("startup rule discovery did not finish")?;
+        }
+        let source = governed.join("later/deep/a.py");
+        if exclude_now {
+            server.wait("initial build did not finish", || {
+                server.has_symbol("discovery_initial")
+            })?;
+            assert!(!server.has_symbol("discovery_later"));
+            server.wait("discovery retained newly excluded source watches", || {
+                !server.watches(source.parent().unwrap()).unwrap_or(true)
+            })?;
+            fs::write(&rules, "")?;
+        }
+        server.wait("new eligibility did not restore source", || {
+            server.has_symbol("discovery_later")
+        })?;
+        server.wait(
+            "discovery indexed source without installing watches",
+            || server.watches(source.parent().unwrap()).unwrap_or(false),
+        )?;
+        fs::write(&source, "def discovery_followup():\n    return 3\n")?;
+        server.wait("discovery left later source edits invisible", || {
+            server.has_symbol("discovery_followup")
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
 fn arriving_nested_repo_uses_its_own_rules_and_survives_recreation() -> Result<()> {
     let dir = tempdir()?;
     let catalog = dir.path().canonicalize()?.join("catalog");
@@ -360,7 +612,7 @@ fn missing_repo_below_an_ignored_parent_is_discovered_and_healthy_repo_keeps_upd
 }
 
 #[test]
-fn replacing_an_unwatched_ancestor_reinstalls_watches_on_new_inodes() -> Result<()> {
+fn replacing_an_ignored_ancestor_reinstalls_watches_on_new_inodes() -> Result<()> {
     let dir = tempdir()?;
     let root = dir.path().canonicalize()?;
     let catalog = root.join("catalog");
@@ -369,6 +621,12 @@ fn replacing_an_unwatched_ancestor_reinstalls_watches_on_new_inodes() -> Result<
     let inner = ignored.join("existing/inner");
     fixture(&outer, "outer_kept")?;
     fixture(&inner, "original_clone")?;
+    let unconfigured = ignored.join("unconfigured/deep");
+    fs::create_dir_all(&unconfigured)?;
+    fs::write(
+        unconfigured.join("a.py"),
+        "def ignored_source():\n    pass\n",
+    )?;
     fs::write(outer.join(".gitignore"), "ignored/\n")?;
     fs::create_dir_all(catalog.join(".tsindex"))?;
     fs::write(
@@ -383,7 +641,10 @@ fn replacing_an_unwatched_ancestor_reinstalls_watches_on_new_inodes() -> Result<
     server.wait("original clone was not indexed", || {
         server.has_symbol("original_clone")
     })?;
-    assert!(!server.watches(&ignored)?);
+    // Ancestor rule probes now watch ignored itself nonrecursively; they
+    // still must not allocate watches in its unconfigured ignored subtrees.
+    assert!(!server.watches(&unconfigured)?);
+    assert!(!server.has_symbol("ignored_source"));
     assert!(server.watches(&inner.join("src"))?);
 
     // The old directories stay alive elsewhere, so pathname membership cannot

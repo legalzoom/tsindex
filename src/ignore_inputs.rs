@@ -8,11 +8,11 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use crate::index::Workspace;
+use crate::index::{IGNORE_FILE_NAMES, Workspace};
 
 #[derive(Default)]
 pub(crate) struct IgnoreInputs {
-    repositories: HashSet<PathBuf>,
+    source_directories: HashSet<PathBuf>,
     files: HashMap<PathBuf, HashSet<PathBuf>>,
 }
 
@@ -20,7 +20,7 @@ impl IgnoreInputs {
     /// Reload indirections as well as rule paths: worktrees can share excludes,
     /// and global configuration can select a different file during a session.
     pub fn refresh(&mut self, workspaces: &[Workspace]) {
-        self.repositories.retain(|dir| {
+        self.source_directories.retain(|dir| {
             dir.is_dir()
                 && workspaces
                     .iter()
@@ -37,46 +37,55 @@ impl IgnoreInputs {
                 self.add(Path::new(file), &workspace.root);
             }
             for dir in workspace.root.ancestors() {
+                // The walker reads directory-scoped rules above its root too.
+                // Keep absent paths so creating/removing an inherited rule
+                // refreshes every governed workspace through parent probes.
+                for name in IGNORE_FILE_NAMES {
+                    self.add(&dir.join(name), &workspace.root);
+                }
                 for file in repository_inputs(dir) {
                     self.add(&file, &workspace.root);
                 }
             }
         }
-        for dir in self.repositories.clone() {
-            for file in repository_inputs(&dir) {
+        for dir in self.source_directories.clone() {
+            let files = directory_inputs(&dir);
+            // Ordinary source directories are already watched. Once their
+            // last special input disappears, a later rule creation there
+            // can rediscover its inputs without retaining a stale input set.
+            if files.is_empty() {
+                self.source_directories.remove(&dir);
+            }
+            for file in files {
                 self.add(&file, &dir);
             }
         }
     }
 
-    /// Called only for eligible source directories. This includes unconfigured
-    /// nested Git repositories without adding another full-tree discovery walk.
-    pub fn discover_repository(&mut self, dir: &Path) -> HashSet<PathBuf> {
-        if self.repositories.contains(dir) {
-            return HashSet::new();
-        }
-        let files = repository_inputs(dir);
+    /// Called only for eligible source directories. Discover Git metadata and
+    /// rule-file targets without traversing directory symlinks or another tree.
+    pub fn discover_directory(&mut self, dir: &Path) -> HashSet<PathBuf> {
+        // Reconciliation passes reload these local inputs: a rule link may
+        // have changed before this directory's first probe was installed.
+        // This avoids refreshing every workspace's metadata per directory.
+        let files = directory_inputs(dir);
         if files.is_empty() {
             return HashSet::new();
         }
-        self.repositories.insert(dir.to_path_buf());
+        self.source_directories.insert(dir.to_path_buf());
         let mut probes = HashSet::new();
         for file in files {
-            self.add(&file, dir);
-            if let Some(parent) = existing_parent(&file) {
-                probes.insert(parent);
-            }
-            if let Ok(real) = file.canonicalize()
-                && let Some(parent) = existing_parent(&real)
-            {
-                probes.insert(parent);
+            for input in self.add(&file, dir) {
+                if let Some(parent) = existing_parent(&input) {
+                    probes.insert(parent);
+                }
             }
         }
         probes
     }
 
-    pub fn retain_repositories(&mut self, keep: impl FnMut(&PathBuf) -> bool) {
-        self.repositories.retain(keep);
+    pub fn retain_directories(&mut self, keep: impl FnMut(&PathBuf) -> bool) {
+        self.source_directories.retain(keep);
     }
 
     pub fn directories(&self) -> HashSet<PathBuf> {
@@ -103,30 +112,44 @@ impl IgnoreInputs {
         // Creating Git metadata in an already-watched source directory does
         // not trigger a source registration pass: `.git` is normally filtered.
         // Remember its owner before refresh so its new rules acquire probes.
-        self.repositories.extend(changed.iter().filter_map(|path| {
-            path.ancestors()
-                .find(|path| path.file_name().is_some_and(|name| name == ".git"))
-                .and_then(Path::parent)
-                .map(Path::to_path_buf)
-        }));
+        self.source_directories
+            .extend(changed.iter().filter_map(|path| {
+                path.ancestors()
+                    .find(|path| path.file_name().is_some_and(|name| name == ".git"))
+                    .and_then(Path::parent)
+                    .map(Path::to_path_buf)
+            }));
     }
 
-    fn add(&mut self, file: &Path, target: &Path) {
-        let Some(file) = normalized_path(file) else {
-            return;
+    fn add(&mut self, file: &Path, target: &Path) -> Vec<PathBuf> {
+        let Some(mut file) = normalized_path(file) else {
+            return Vec::new();
         };
-        // A symlinked rule file is read through its target. Observe both the
-        // target's edits and replacement of the original link itself.
-        if let Ok(real) = file.canonicalize() {
+        let mut paths = Vec::new();
+        // Observe each file-link indirection as well as its final target, even
+        // when the target is missing. Bound cycles without traversing trees;
+        // losing a dangling target would hide its later recreation.
+        // Include the final file after up to 40 links, the Linux hop limit.
+        for _ in 0..=40 {
             self.files
-                .entry(real)
+                .entry(file.clone())
                 .or_default()
                 .insert(target.to_path_buf());
+            paths.push(file.clone());
+            let Ok(link) = fs::read_link(&file) else {
+                break;
+            };
+            let next = if link.is_absolute() {
+                link
+            } else {
+                file.parent().unwrap().join(link)
+            };
+            let Some(next) = normalized_path(&next) else {
+                break;
+            };
+            file = next;
         }
-        self.files
-            .entry(file)
-            .or_default()
-            .insert(target.to_path_buf());
+        paths
     }
 }
 
@@ -182,6 +205,17 @@ fn repository_inputs(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+fn directory_inputs(dir: &Path) -> Vec<PathBuf> {
+    let mut files = repository_inputs(dir);
+    files.extend(
+        IGNORE_FILE_NAMES
+            .iter()
+            .map(|name| dir.join(name))
+            .filter(|file| fs::symlink_metadata(file).is_ok()),
+    );
+    files
+}
+
 #[allow(deprecated)] // Match the pinned ignore crate's home-directory lookup.
 fn global_inputs() -> Vec<PathBuf> {
     let home = std::env::home_dir();
@@ -200,4 +234,103 @@ fn global_inputs() -> Vec<PathBuf> {
         files.push(excludes);
     }
     files
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn directory_rule_symlinks_track_targets_and_link_replacements() -> anyhow::Result<()> {
+        for filename in IGNORE_FILE_NAMES {
+            let dir = tempfile::tempdir()?;
+            let base = dir.path().canonicalize()?;
+            let root = base.join("repo");
+            let governed = root.join("nested");
+            let external = base.join("rules");
+            fs::create_dir_all(&governed)?;
+            fs::create_dir_all(&external)?;
+            let target = external.join("first");
+            fs::write(&target, "later/\n")?;
+            let rules = governed.join(filename);
+            symlink("../../rules/first", &rules)?;
+            let workspace = Workspace {
+                name: "repo".to_string(),
+                root,
+                languages: Vec::new(),
+                ignore: Vec::new(),
+            };
+            let mut inputs = IgnoreInputs::default();
+            inputs.refresh(std::slice::from_ref(&workspace));
+            assert!(inputs.discover_directory(&governed).contains(&external));
+            assert_eq!(
+                inputs.changed_targets(std::slice::from_ref(&target)),
+                HashSet::from([governed.clone()])
+            );
+            // Refresh reloads link indirections rather than keeping a startup
+            // snapshot, and retains a missing target's future creation route.
+            fs::remove_file(&target)?;
+            inputs.refresh(std::slice::from_ref(&workspace));
+            assert!(inputs.directories().contains(&external));
+            assert_eq!(
+                inputs.changed_targets(std::slice::from_ref(&target)),
+                HashSet::from([governed.clone()])
+            );
+            fs::remove_file(&rules)?;
+            let new_target = external.join("second");
+            symlink("../../rules/second", &rules)?;
+            inputs.refresh(std::slice::from_ref(&workspace));
+            assert!(inputs.changed_targets(&[target]).is_empty());
+            assert_eq!(
+                inputs.changed_targets(&[new_target]),
+                HashSet::from([governed])
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn symlink_rule_chains_track_indirections_without_looping() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let base = dir.path().canonicalize()?;
+        let root = base.join("repo");
+        let links = base.join("links");
+        let targets = base.join("targets");
+        for path in [&root, &links, &targets] {
+            fs::create_dir(path)?;
+        }
+        let rules = root.join(".ignore");
+        let intermediate = links.join("first");
+        let missing = targets.join("rules");
+        symlink("../links/first", &rules)?;
+        symlink("../targets/rules", &intermediate)?;
+        let workspace = Workspace {
+            name: "repo".to_string(),
+            root: root.clone(),
+            languages: Vec::new(),
+            ignore: Vec::new(),
+        };
+        let mut inputs = IgnoreInputs::default();
+        inputs.refresh(std::slice::from_ref(&workspace));
+        assert!(inputs.directories().contains(&links));
+        assert!(inputs.directories().contains(&targets));
+        for path in [&intermediate, &missing] {
+            assert_eq!(
+                inputs.changed_targets(std::slice::from_ref(path)),
+                HashSet::from([root.clone()])
+            );
+        }
+        // A cyclic rule file must not hang input discovery or retain a target
+        // that its link chain no longer reaches.
+        fs::remove_file(&intermediate)?;
+        symlink("first", &intermediate)?;
+        inputs.refresh(std::slice::from_ref(&workspace));
+        assert!(inputs.changed_targets(&[missing]).is_empty());
+        assert_eq!(
+            inputs.changed_targets(&[intermediate]),
+            HashSet::from([root])
+        );
+        Ok(())
+    }
 }

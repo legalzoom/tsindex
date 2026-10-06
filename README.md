@@ -122,9 +122,11 @@ and removes watches for deleted or newly ignored directories. Workspace
 ownership is resolved again for each batch, so a newly cloned nested repo uses
 its own ignore rules. Non-recursive parent probes discover missing configured
 clones, including those below ignored paths. The probes also observe Git's
-repository and global excludes, shared worktree metadata, and configured ignore
-files outside the source tree. Rule edits, replacement, and removal refresh
-every affected workspace's index before newly excluded watches are removed.
+repository and global excludes, shared worktree metadata, inherited ignore
+files above workspace roots, and external rule-file targets. Symlinked
+`.gitignore`, `.ignore`, and `.tsindexignore` files retain probes on their
+targets even while dangling. Rule edits, replacement, and removal refresh every
+affected workspace's index before newly excluded watches are removed.
 Other platforms walk eligible directories to discover these input probes while
 retaining native recursive source watches. See
 [architecture](docs/ARCHITECTURE.md).

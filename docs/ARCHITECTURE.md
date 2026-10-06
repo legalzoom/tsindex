@@ -31,10 +31,17 @@ the eligible-directory walk to discover ignore inputs only.
 
 `src/ignore_inputs.rs` maps rule and indirection files to the directories they
 govern. Nonrecursive parent probes observe file edits, replacement, and
-removal, including external configured/global files and shared Git metadata.
-Embedded Git repositories are discovered during eligible walks and through
-metadata events. Input resolution follows the pinned `ignore` dependency's
-semantics rather than invoking Git with potentially different configuration.
+removal, including inherited rules above workspace roots, external
+configured/global files, and shared Git metadata.
+Embedded Git repositories and directory-scoped rule files are discovered
+during eligible walks; metadata events also discover newly created Git inputs.
+File symlinks retain probes on their indirections and targets, including
+missing targets, so replacement and recreation remain observable. Directory
+symlink trees remain pruned. Input resolution follows the pinned `ignore`
+dependency's semantics rather than invoking Git with different configuration.
+If a walk discovers new input parents, registration repeats the affected walk
+after those probes exist. This reconciles eligibility read before a newly
+discovered external rule could be observed, both at startup and during updates.
 
 Indexing and watch refresh share target expansion, including nested workspaces
 affected by inherited rules. Successful index updates precede removal of

@@ -3,7 +3,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::symlink;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -20,6 +20,7 @@ struct Server {
     child: Child,
     db: PathBuf,
     reader: Option<thread::JoinHandle<()>>,
+    updates: mpsc::Receiver<()>,
 }
 
 impl Drop for Server {
@@ -64,10 +65,14 @@ impl Server {
             .spawn()?;
         let stderr = child.stderr.take().unwrap();
         let (tx, rx) = mpsc::channel();
+        let (update_tx, updates) = mpsc::channel();
         let reader = thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                 if line.contains("repos for changes") {
                     let _ = tx.send(());
+                }
+                if line.contains("update complete") {
+                    let _ = update_tx.send(());
                 }
             }
         });
@@ -76,6 +81,7 @@ impl Server {
             child,
             db: root.join(".tsindex/index.db"),
             reader: Some(reader),
+            updates,
         };
         Ok((server, rx))
     }
@@ -125,6 +131,171 @@ impl Server {
         }
         Ok(())
     }
+}
+
+#[test]
+fn optional_input_probe_denial_preserves_readable_workspace_updates() -> Result<()> {
+    // Root bypasses DAC permissions, so this regression needs a normal Linux
+    // user, as used by CI and the actual MCP server.
+    if unsafe { libc::geteuid() } == 0 {
+        return Ok(());
+    }
+    let dir = tempdir()?;
+    let base = dir.path().canonicalize()?;
+    let parent = base.join("execute-only");
+    let restricted = parent.join("repo");
+    let healthy = base.join("healthy");
+    let catalog = base.join("catalog");
+    fixture(&restricted, "restricted_initial")?;
+    fixture(&healthy, "healthy_initial")?;
+    fs::create_dir_all(catalog.join(".tsindex"))?;
+    fs::write(
+        catalog.join(".tsindex/config.toml"),
+        format!(
+            "[[repos]]\nname = 'restricted'\npath = {}\nlanguages = ['python']\n\n[[repos]]\nname = 'healthy'\npath = {}\nlanguages = ['python']\n",
+            serde_json::to_string(&restricted)?,
+            serde_json::to_string(&healthy)?,
+        ),
+    )?;
+    struct RestorePermissions(PathBuf, fs::Permissions);
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, self.1.clone());
+        }
+    }
+    let _restore = RestorePermissions(parent.clone(), fs::metadata(&parent)?.permissions());
+    // 0711 is readable by its owner; 0111 exercises execute-only traversal
+    // without privileged ownership changes or touching anyone else's files.
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o111))?;
+    assert!(fs::read_dir(&parent).is_err());
+    assert!(fs::read_dir(&restricted).is_ok());
+    let server = Server::start(&catalog)?;
+    for symbol in ["restricted_initial", "healthy_initial"] {
+        server.wait("optional probe blocked initial build", || {
+            server.has_symbol(symbol)
+        })?;
+    }
+    for (root, symbol) in [
+        (&restricted, "restricted_followup"),
+        (&healthy, "healthy_followup"),
+    ] {
+        assert!(server.watches(&root.join("src"))?);
+        fs::write(
+            root.join("src/a.py"),
+            format!("def {symbol}():\n    return 2\n"),
+        )?;
+        server.wait("optional probe blocked source refresh", || {
+            server.has_symbol(symbol)
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn ignore_rule_directory_symlink_repoint_restores_source_watches() -> Result<()> {
+    for tail in ["rules", "../current/rules"] {
+        let dir = tempdir()?;
+        let base = dir.path().canonicalize()?;
+        let root = base.join("repo");
+        fixture(&root, "route_initial")?;
+        let source = root.join("later/deep/a.py");
+        fs::create_dir_all(source.parent().unwrap())?;
+        fs::write(&source, "def route_later():\n    return 1\n")?;
+        let external = base.join("external");
+        let old = external.join("old");
+        let new = external.join("new");
+        fs::create_dir_all(&old)?;
+        fs::create_dir(&new)?;
+        fs::write(old.join("rules"), "later/\n")?;
+        fs::write(new.join("rules"), "")?;
+        let route = external.join("current");
+        symlink("old", &route)?;
+        symlink(route.join(tail), root.join(".ignore"))?;
+        let server = Server::start(&root)?;
+        server.wait("initial rule route build", || {
+            server.has_symbol("route_initial")
+        })?;
+        assert!(!server.has_symbol("route_later"));
+        assert!(!server.watches(source.parent().unwrap())?);
+        let replacement = external.join("replacement");
+        symlink("new", &replacement)?;
+        fs::rename(&replacement, &route)?;
+        server.wait("directory-link replacement did not restore source", || {
+            server.has_symbol("route_later")
+        })?;
+        server.wait("directory-link replacement left source unwatched", || {
+            server.watches(source.parent().unwrap()).unwrap_or(false)
+        })?;
+        fs::write(&source, "def route_followup():\n    return 2\n")?;
+        server.wait("repointed rule route lost later source edits", || {
+            server.has_symbol("route_followup")
+        })?;
+        assert!(server.watches(&external)?);
+        assert!(server.watches(&new)?);
+        server.wait("old rule route watch was retained", || {
+            !server.watches(&old).unwrap_or(true)
+        })?;
+        fs::write(new.join("rules"), "later/\n")?;
+        server.wait("repointed route lost final rule-file edits", || {
+            !server.has_symbol("route_followup")
+        })?;
+        fs::write(new.join("rules"), "")?;
+        server.wait("repointed route did not restore source again", || {
+            server.has_symbol("route_followup")
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn deleted_ignore_owner_retires_external_probe_without_directory_refresh() -> Result<()> {
+    let dir = tempdir()?;
+    let base = dir.path().canonicalize()?;
+    let root = base.join("repo");
+    fixture(&root, "delete_initial")?;
+    let nested = root.join("nested");
+    fs::create_dir(&nested)?;
+    fs::write(
+        nested.join("a.py"),
+        "def deleted_rule_owner():\n    return 1\n",
+    )?;
+    let external = base.join("external");
+    fs::create_dir(&external)?;
+    let rules = external.join("rules");
+    fs::write(&rules, "")?;
+    symlink(&rules, nested.join(".ignore"))?;
+    let server = Server::start(&root)?;
+    server.wait("nested ignore owner initial build", || {
+        server.has_symbol("deleted_rule_owner")
+    })?;
+    assert!(server.watches(&external)?);
+    // Wait for an ordinary update to reach the event loop: deleting during
+    // the initial build's final retention can accidentally hide the leak.
+    fs::write(
+        root.join("src/a.py"),
+        "def delete_settled():\n    return 2\n",
+    )?;
+    server.updates.recv_timeout(Duration::from_secs(5))?;
+    server.wait("startup did not settle", || {
+        server.has_symbol("delete_settled")
+    })?;
+    fs::remove_dir_all(&nested)?;
+    server.wait("deleted ignore owner rows remained indexed", || {
+        !server.has_symbol("deleted_rule_owner")
+    })?;
+    server.wait(
+        "deleted ignore owner left external probe registered",
+        || !server.watches(&external).unwrap_or(true),
+    )?;
+    fs::write(
+        root.join("src/a.py"),
+        "def delete_followup():\n    return 3\n",
+    )?;
+    server.wait("healthy source edit stopped after owner deletion", || {
+        server.has_symbol("delete_followup")
+    })?;
+    assert!(!server.watches(&external)?);
+    Ok(())
 }
 
 #[test]

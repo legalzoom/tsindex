@@ -122,32 +122,12 @@ impl IgnoreInputs {
     }
 
     fn add(&mut self, file: &Path, target: &Path) -> Vec<PathBuf> {
-        let Some(mut file) = normalized_path(file) else {
-            return Vec::new();
-        };
-        let mut paths = Vec::new();
-        // Observe each file-link indirection as well as its final target, even
-        // when the target is missing. Bound cycles without traversing trees;
-        // losing a dangling target would hide its later recreation.
-        // Include the final file after up to 40 links, the Linux hop limit.
-        for _ in 0..=40 {
+        let paths = input_paths(file);
+        for file in &paths {
             self.files
                 .entry(file.clone())
                 .or_default()
                 .insert(target.to_path_buf());
-            paths.push(file.clone());
-            let Ok(link) = fs::read_link(&file) else {
-                break;
-            };
-            let next = if link.is_absolute() {
-                link
-            } else {
-                file.parent().unwrap().join(link)
-            };
-            let Some(next) = normalized_path(&next) else {
-                break;
-            };
-            file = next;
         }
         paths
     }
@@ -159,14 +139,53 @@ pub(crate) fn existing_parent(path: &Path) -> Option<PathBuf> {
         .find_map(|parent| parent.canonicalize().ok())
 }
 
-fn normalized_path(path: &Path) -> Option<PathBuf> {
-    let path = std::path::absolute(path).ok()?;
-    Some(
-        path.parent()
-            .and_then(|parent| parent.canonicalize().ok())
-            .zip(path.file_name())
-            .map_or_else(|| path.clone(), |(parent, name)| parent.join(name)),
-    )
+fn input_paths(path: &Path) -> Vec<PathBuf> {
+    let Ok(mut path) = std::path::absolute(path) else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    // Resolve one link at a time, including directory components. A single
+    // parent canonicalization would erase routes such as current/rules, so
+    // repointing current would never refresh its governed sources. Inspect
+    // only path components, never recurse through a symlinked directory tree.
+    // Include the final file after at most 40 links, the Linux hop limit.
+    for _ in 0..=40 {
+        // The same link can appear twice in a finite route with different
+        // remaining components. Only a repeated complete resolution state is
+        // a cycle; the hop bound also covers cycles whose paths keep growing.
+        if !seen.insert(path.clone()) {
+            break;
+        }
+        let mut resolved = PathBuf::new();
+        let mut components = path.components();
+        let mut indirection = None;
+        while let Some(component) = components.next() {
+            resolved.push(component);
+            if component == std::path::Component::ParentDir {
+                // Resolve '..' only when its prefix exists. A dangling route
+                // must retain its missing ancestor's recreation notification.
+                if let Ok(parent) = resolved.canonicalize() {
+                    resolved = parent;
+                }
+            }
+            if let Ok(link) = fs::read_link(&resolved) {
+                let next = if link.is_absolute() {
+                    link
+                } else {
+                    resolved.parent().unwrap().join(link)
+                };
+                indirection = Some(next.join(components.as_path()));
+                break;
+            }
+        }
+        paths.push(resolved);
+        let Some(next) = indirection else {
+            break;
+        };
+        path = next;
+    }
+    paths
 }
 
 fn first_line(path: &Path) -> Option<String> {
@@ -331,6 +350,90 @@ mod tests {
             inputs.changed_targets(&[intermediate]),
             HashSet::from([root])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rule_directory_components_preserve_nested_links_and_dangling_routes() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let base = dir.path().canonicalize()?;
+        let root = base.join("repo");
+        let external = base.join("external");
+        let middle = external.join("middle");
+        let old = external.join("old");
+        let new = external.join("new");
+        for path in [&root, &middle, &old.join("sub"), &new.join("sub")] {
+            fs::create_dir_all(path)?;
+        }
+        fs::write(old.join("rules"), "later/\n")?;
+        let route = external.join("current");
+        let intermediate = middle.join("current");
+        symlink("middle/current", &route)?;
+        symlink("../old", &intermediate)?;
+        let rules = root.join(".ignore");
+        symlink(route.join("sub/../rules"), &rules)?;
+        let workspace = Workspace {
+            name: "repo".to_string(),
+            root: root.clone(),
+            languages: Vec::new(),
+            ignore: Vec::new(),
+        };
+        let mut inputs = IgnoreInputs::default();
+        inputs.refresh(std::slice::from_ref(&workspace));
+        for path in [&route, &intermediate, &old.join("rules")] {
+            assert_eq!(
+                inputs.changed_targets(std::slice::from_ref(path)),
+                HashSet::from([root.clone()])
+            );
+        }
+        for path in [&external, &middle, &old] {
+            assert!(inputs.directories().contains(path));
+        }
+        fs::remove_file(&intermediate)?;
+        symlink("../new", &intermediate)?;
+        inputs.refresh(std::slice::from_ref(&workspace));
+        assert!(inputs.changed_targets(&[old.join("rules")]).is_empty());
+        assert_eq!(
+            inputs.changed_targets(&[new.join("rules")]),
+            HashSet::from([root.clone()])
+        );
+        assert!(inputs.directories().contains(&new));
+
+        // Cyclic directory routes retain the replaceable link's parent, but
+        // must not hang discovery or keep a target they no longer reach.
+        fs::remove_file(&route)?;
+        symlink("current", &route)?;
+        inputs.refresh(std::slice::from_ref(&workspace));
+        assert!(inputs.changed_targets(&[new.join("rules")]).is_empty());
+        assert_eq!(inputs.changed_targets(&[route]), HashSet::from([root]));
+        assert!(inputs.directories().contains(&external));
+        Ok(())
+    }
+
+    #[test]
+    fn rule_route_can_visit_the_same_directory_link_with_different_tails() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let base = dir.path().canonicalize()?;
+        let root = base.join("repo");
+        let external = base.join("external");
+        let old = external.join("old");
+        fs::create_dir(&root)?;
+        fs::create_dir_all(&old)?;
+        let route = external.join("current");
+        let target = old.join("rules");
+        fs::write(&target, "later/\n")?;
+        symlink("old", &route)?;
+        symlink(route.join("../current/rules"), root.join(".ignore"))?;
+        let workspace = Workspace {
+            name: "repo".to_string(),
+            root: root.clone(),
+            languages: Vec::new(),
+            ignore: Vec::new(),
+        };
+        let mut inputs = IgnoreInputs::default();
+        inputs.refresh(&[workspace]);
+        assert!(inputs.directories().contains(&old));
+        assert_eq!(inputs.changed_targets(&[target]), HashSet::from([root]));
         Ok(())
     }
 }

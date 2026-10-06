@@ -909,7 +909,7 @@ impl Runtime {
         let mut ignore_inputs = IgnoreInputs::default();
         let (workspaces, _) =
             self.prepare_watch_inputs(&workspaces, &mut ignore_inputs, |path| {
-                watcher.watch(path, RecursiveMode::NonRecursive)
+                register_ignore_probes(std::iter::once(path.to_path_buf()), &mut watcher)
             })?;
 
         let mut startup_eligible = HashSet::new();
@@ -955,7 +955,8 @@ impl Runtime {
         watcher.retain(|path| input_dirs.contains(path) || previous_roots.contains(path));
         // The long-running loop needs the registry and input mappings, so
         // release the temporary startup sets before waiting for notifications.
-        drop((startup_eligible, input_dirs));
+        drop(startup_eligible);
+        let mut previous_inputs = input_dirs;
 
         // Memoize each workspace's language allowlist for the lifetime of the
         // watch session. When no explicit language filter is configured this
@@ -1049,9 +1050,15 @@ impl Runtime {
                 } else {
                     self.update_paths_cached(&changed, &mut language_cache)?
                 };
-                // Purge affected index rows before releasing their watches. If
-                // the update fails, retain the notification route for recovery.
-                if ownership_changed || !refreshed.is_empty() {
+                // A deleted rule owner has no live registration target, but
+                // its external probes still need retirement. Compare input
+                // parents so ordinary file edits avoid scanning source watches.
+                // Only advance this snapshot after a successful index update;
+                // failures must retain the notification route for recovery.
+                let current_inputs = self.watch_input_directories(&ignore_inputs);
+                let inputs_removed = !previous_inputs.is_subset(&current_inputs);
+                previous_inputs = current_inputs;
+                if ownership_changed || !refreshed.is_empty() || inputs_removed {
                     let keep_source = |path: &Path| {
                         let Some(idx) = best_workspace_for_path(workspaces, path) else {
                             return false;
@@ -1062,17 +1069,17 @@ impl Runtime {
                     };
                     ignore_inputs.retain_directories(|path| keep_source(path));
                     ignore_inputs.refresh(workspaces);
+                    previous_inputs = self.watch_input_directories(&ignore_inputs);
                     #[cfg(target_os = "linux")]
                     {
-                        let extra_dirs = self.watch_input_directories(&ignore_inputs);
-                        watcher.retain(|path| extra_dirs.contains(path) || keep_source(path));
+                        watcher.retain(|path| previous_inputs.contains(path) || keep_source(path));
                     }
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    let extra_dirs = self.watch_input_directories(&ignore_inputs);
-                    watcher
-                        .retain(|path| extra_dirs.contains(path) || previous_roots.contains(path));
+                    watcher.retain(|path| {
+                        previous_inputs.contains(path) || previous_roots.contains(path)
+                    });
                 }
                 Ok(stats)
             },

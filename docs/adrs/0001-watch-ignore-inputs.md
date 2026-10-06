@@ -16,8 +16,8 @@ Track directory-scoped rules above each workspace root, including absent rule
 paths so their creation is observed. Discover directory-scoped rule files and
 embedded Git inputs during eligible-directory walks, and Git inputs through
 metadata events; reload indirections when processing changes. Probe symlinked
-rule files through their file-link chain, including a missing target, without
-traversing directory symlink trees.
+rule files through their file-link chain and directory-component links,
+including a missing target, without traversing directory symlink trees.
 When a walk discovers new probe parents, repeat its affected targets after
 installing the probes. Keep eligibility from the final pass so rule changes
 before discovery neither leave included sources unwatched nor retain newly
@@ -30,7 +30,10 @@ dependency and could select inputs the actual walker does not honor.
 
 Share affected-target expansion between registration and incremental indexing.
 Refresh nested indexes before releasing newly excluded watches. Keep watches
-when indexing fails so subsequent notifications can recover the index.
+when indexing fails so subsequent notifications can recover the index. Retire
+removed input parents even when their governing subtree has vanished and no
+live source registration pass runs. Skip non-systemic optional probe errors
+at startup; keep source-root and watch-limit failures fatal.
 
 ## Consequences
 

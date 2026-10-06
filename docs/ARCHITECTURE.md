@@ -35,10 +35,11 @@ removal, including inherited rules above workspace roots, external
 configured/global files, and shared Git metadata.
 Embedded Git repositories and directory-scoped rule files are discovered
 during eligible walks; metadata events also discover newly created Git inputs.
-File symlinks retain probes on their indirections and targets, including
-missing targets, so replacement and recreation remain observable. Directory
-symlink trees remain pruned. Input resolution follows the pinned `ignore`
-dependency's semantics rather than invoking Git with different configuration.
+Rule-file symlinks retain probes on their indirections and targets, including
+directory links within the input path and missing targets, so replacement and
+recreation remain observable. Source directory symlink trees remain pruned.
+Input resolution follows the pinned `ignore` dependency's semantics rather
+than invoking Git with different configuration.
 If a walk discovers new input parents, registration repeats the affected walk
 after those probes exist. This reconciles eligibility read before a newly
 discovered external rule could be observed, both at startup and during updates.
@@ -46,6 +47,10 @@ discovered external rule could be observed, both at startup and during updates.
 Indexing and watch refresh share target expansion, including nested workspaces
 affected by inherited rules. Successful index updates precede removal of
 obsolete watches, preserving a notification route if indexing fails.
+Removing an input parent also triggers retention when its governing source
+directory has vanished and no live source registration pass is needed.
+Optional probe failures are logged at startup and during discovery; source-root
+registration failures and watch-limit exhaustion still stop startup.
 
 ## Validation
 

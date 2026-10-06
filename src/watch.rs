@@ -107,6 +107,7 @@ pub(crate) fn under_any(path: &Path, roots: &HashSet<PathBuf>) -> bool {
 pub(crate) struct WatchRegistry<W> {
     watcher: W,
     paths: HashMap<PathBuf, RecursiveMode>,
+    ancestors: HashMap<PathBuf, usize>,
 }
 
 impl<W: Watcher> WatchRegistry<W> {
@@ -114,6 +115,7 @@ impl<W: Watcher> WatchRegistry<W> {
         Self {
             watcher,
             paths: HashMap::new(),
+            ancestors: HashMap::new(),
         }
     }
 
@@ -136,19 +138,23 @@ impl<W: Watcher> WatchRegistry<W> {
             {
                 return Err(error);
             }
-            self.paths.remove(path);
+            self.forget(path);
         }
         self.watcher.watch(path, mode)?;
         self.paths.insert(path.to_path_buf(), mode);
+        for ancestor in path.ancestors() {
+            *self.ancestors.entry(ancestor.to_path_buf()).or_default() += 1;
+        }
         Ok(())
     }
 
     pub fn invalidate(&mut self, changed: &HashSet<PathBuf>) {
-        // File removals need no registry walk; every registered directory has
-        // its own key, so only a removed/moved watched root invalidates a subtree.
+        // An ignored ancestor can move without having a watch of its own.
+        // Track ancestor membership so those moves invalidate descendant inode
+        // registrations, while ordinary file removals still avoid a full scan.
         let roots: HashSet<_> = changed
             .iter()
-            .filter(|path| self.paths.contains_key(*path))
+            .filter(|path| self.ancestors.contains_key(*path))
             .cloned()
             .collect();
         if !roots.is_empty() {
@@ -173,7 +179,19 @@ impl<W: Watcher> WatchRegistry<W> {
                     continue;
                 }
             }
-            self.paths.remove(&path);
+            self.forget(&path);
+        }
+    }
+
+    fn forget(&mut self, path: &Path) {
+        self.paths.remove(path);
+        for ancestor in path.ancestors() {
+            if let Some(count) = self.ancestors.get_mut(ancestor) {
+                *count -= 1;
+                if *count == 0 {
+                    self.ancestors.remove(ancestor);
+                }
+            }
         }
     }
 }
@@ -321,6 +339,34 @@ mod tests {
         assert_eq!(
             registry.watcher.adds, 5,
             "a recreated root must be registered again"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unregistered_ancestor_invalidation_releases_registered_descendants() -> notify::Result<()> {
+        let mut registry =
+            WatchRegistry::new(CountingWatcher::new(|_| {}, notify::Config::default())?);
+        let probe = Path::new("outer/ignored/existing");
+        let source = probe.join("inner/src");
+        registry.watch(probe, RecursiveMode::NonRecursive)?;
+        registry.watch(&source, RecursiveMode::NonRecursive)?;
+        registry.watch(Path::new("healthy/src"), RecursiveMode::NonRecursive)?;
+
+        // An ignored ancestor has no watch of its own. Moving it still leaves
+        // descendant watches bound to the old inodes until they are released.
+        registry.invalidate(&HashSet::from(["outer/ignored".into()]));
+        assert_eq!(registry.watcher.removes, 2);
+        registry.watch(probe, RecursiveMode::NonRecursive)?;
+        registry.watch(&source, RecursiveMode::NonRecursive)?;
+        registry.watch(Path::new("healthy/src"), RecursiveMode::NonRecursive)?;
+        assert_eq!(registry.watcher.adds, 5);
+        assert_eq!(registry.paths.len(), 3);
+
+        registry.invalidate(&HashSet::from([source.join("removed.py")]));
+        assert_eq!(
+            registry.watcher.removes, 2,
+            "file removals keep directory watches"
         );
         Ok(())
     }

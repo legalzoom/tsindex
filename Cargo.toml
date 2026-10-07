@@ -1,6 +1,6 @@
 [package]
 name = "tsindex"
-version = "1.7.1"
+version = "1.8.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Local tree-sitter code navigation for CLI and MCP clients"

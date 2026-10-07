@@ -38,6 +38,9 @@ during eligible walks; metadata events also discover newly created Git inputs.
 Rule-file symlinks retain probes on their indirections and targets, including
 directory links within the input path and missing targets, so replacement and
 recreation remain observable. Source directory symlink trees remain pruned.
+Inputs keep both their original routes and canonical probe-path aliases so
+macOS casing changes and Windows verbatim prefixes still match notifications.
+Missing targets retain the canonical alias of their nearest existing ancestor.
 Input resolution follows the pinned `ignore` dependency's semantics rather
 than invoking Git with different configuration.
 If a walk discovers new input parents, registration repeats the affected walk

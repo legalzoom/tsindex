@@ -122,7 +122,7 @@ impl IgnoreInputs {
     }
 
     fn add(&mut self, file: &Path, target: &Path) -> Vec<PathBuf> {
-        let paths = input_paths(file);
+        let paths = input_paths(file, |parent| parent.canonicalize().ok());
         for file in &paths {
             self.files
                 .entry(file.clone())
@@ -139,7 +139,10 @@ pub(crate) fn existing_parent(path: &Path) -> Option<PathBuf> {
         .find_map(|parent| parent.canonicalize().ok())
 }
 
-fn input_paths(path: &Path) -> Vec<PathBuf> {
+fn input_paths(
+    path: &Path,
+    mut canonicalize: impl FnMut(&Path) -> Option<PathBuf>,
+) -> Vec<PathBuf> {
     let Ok(mut path) = std::path::absolute(path) else {
         return Vec::new();
     };
@@ -179,13 +182,139 @@ fn input_paths(path: &Path) -> Vec<PathBuf> {
                 break;
             }
         }
-        paths.push(resolved);
+        paths.push(resolved.clone());
+        // Probes use canonical parents. macOS can change their casing and
+        // Windows adds a verbatim prefix, so retain that event namespace as
+        // well as the replaceable link route. For dangling paths, normalize
+        // the nearest existing ancestor to observe intermediate creation.
+        if let Some(alias) = resolved.parent().and_then(|parent| {
+            parent.ancestors().find_map(|ancestor| {
+                canonicalize(ancestor)
+                    .map(|canonical| canonical.join(resolved.strip_prefix(ancestor).unwrap()))
+            })
+        }) && alias != resolved
+        {
+            paths.push(alias);
+        }
         let Some(next) = indirection else {
             break;
         };
         path = next;
     }
     paths
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::*;
+
+    #[test]
+    fn input_paths_keep_canonical_event_aliases_and_original_routes() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let base = dir.path().canonicalize()?;
+        let parent = base.join("caserules");
+        let canonical_parent = base.join("CaseRules");
+        fs::create_dir(&parent)?;
+        let file = parent.join("rules");
+        fs::write(&file, "later/\n")?;
+        // Linux's case-sensitive filesystem cannot supply the macOS spelling
+        // or Windows verbatim prefix. Inject only that filesystem operation;
+        // the actual resolver and input/event matching remain under test.
+        let paths = input_paths(&file, |path| {
+            if path == parent {
+                Some(canonical_parent.clone())
+            } else {
+                path.canonicalize().ok()
+            }
+        });
+        let workspace = base.join("repo");
+        let inputs = IgnoreInputs {
+            files: paths
+                .into_iter()
+                .map(|path| (path, HashSet::from([workspace.clone()])))
+                .collect(),
+            ..Default::default()
+        };
+        for event in [file, canonical_parent.join("rules")] {
+            assert_eq!(
+                inputs.changed_targets(&[event]),
+                HashSet::from([workspace.clone()])
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn missing_input_routes_keep_canonical_existing_ancestor_aliases() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let base = dir.path().canonicalize()?;
+        let parent = base.join("caserules");
+        let canonical_parent = base.join("CaseRules");
+        fs::create_dir(&parent)?;
+        let file = parent.join("missing/deep/rules");
+        let paths = input_paths(&file, |path| {
+            if path == parent {
+                Some(canonical_parent.clone())
+            } else {
+                path.canonicalize().ok()
+            }
+        });
+        let workspace = base.join("repo");
+        let inputs = IgnoreInputs {
+            files: paths
+                .into_iter()
+                .map(|path| (path, HashSet::from([workspace.clone()])))
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            inputs.changed_targets(&[canonical_parent.join("missing")]),
+            HashSet::from([workspace])
+        );
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn configured_rule_aliases_match_native_canonical_probe_events() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("repo");
+        let parent = dir.path().join("CaseRules");
+        fs::create_dir(&root)?;
+        fs::create_dir(&parent)?;
+        let rules = parent.join("rules");
+        fs::write(&rules, "later/\n")?;
+        let alias = dir.path().join("caserules/rules");
+        // A case-sensitive macOS volume has no casing alias. On Windows the
+        // ordinary spelling still exercises canonical verbatim-path events.
+        let input = if alias.exists() { alias } else { rules.clone() };
+        let root = root.canonicalize()?;
+        let workspace = Workspace {
+            name: "repo".to_string(),
+            root: root.clone(),
+            languages: Vec::new(),
+            ignore: vec![input.to_string_lossy().into_owned()],
+        };
+        let mut inputs = IgnoreInputs::default();
+        inputs.refresh(std::slice::from_ref(&workspace));
+        let canonical_event = parent.canonicalize()?.join("rules");
+        assert!(
+            inputs
+                .directories()
+                .contains(canonical_event.parent().unwrap())
+        );
+        assert_eq!(
+            inputs.changed_targets(std::slice::from_ref(&canonical_event)),
+            HashSet::from([root.clone()])
+        );
+        fs::remove_file(&rules)?;
+        inputs.refresh(std::slice::from_ref(&workspace));
+        assert_eq!(
+            inputs.changed_targets(&[canonical_event]),
+            HashSet::from([root])
+        );
+        Ok(())
+    }
 }
 
 fn first_line(path: &Path) -> Option<String> {

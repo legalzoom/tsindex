@@ -18,6 +18,10 @@ embedded Git inputs during eligible-directory walks, and Git inputs through
 metadata events; reload indirections when processing changes. Probe symlinked
 rule files through their file-link chain and directory-component links,
 including a missing target, without traversing directory symlink trees.
+Keep canonical event-path aliases alongside those indirections: probes use
+canonical parents, which can change casing on macOS or add Windows verbatim
+prefixes. For missing paths, canonicalize the nearest existing ancestor and
+retain the remaining path so intermediate creation still refreshes its owner.
 When a walk discovers new probe parents, repeat its affected targets after
 installing the probes. Keep eligibility from the final pass so rule changes
 before discovery neither leave included sources unwatched nor retain newly

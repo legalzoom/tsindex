@@ -110,6 +110,38 @@ sessions stay fresh without an external `watch`. Use `TSINDEX_START_MODE=watch`
 only when you want a foreground watcher for CLI-only sessions that never start
 `serve --mcp`.
 
+Source registration never follows directory symlinks, matching the index walk,
+so linked dependency graphs such as pnpm's `node_modules` cannot expand
+into duplicate watched paths. On Linux the registration itself enforces this:
+the watcher walks each workspace with the indexer's ignore rules (`.gitignore`,
+`.ignore`, `.tsindexignore`, nested workspace roots, and the control-directory
+filter) and registers one non-recursive inotify watch per eligible directory.
+Directories that are created, moved, or un-ignored later are registered when
+their parent reports the change. A hash registry skips unchanged registrations
+and removes watches for deleted or newly ignored directories. Workspace
+ownership is resolved again for each batch, so a newly cloned nested repo uses
+its own ignore rules. Non-recursive parent probes discover missing configured
+clones, including those below ignored paths. The probes also observe Git's
+repository and global excludes, shared worktree metadata, inherited ignore
+files above workspace roots, and external rule-file targets. Symlinked
+`.gitignore`, `.ignore`, and `.tsindexignore` files retain probes on their
+targets even while dangling, including directory links along the rule-file
+path. Rule edits, replacement, and removal refresh every affected workspace's
+index before newly excluded watches are removed. Deleting a rule's governing
+subtree also releases its external probes after the index update succeeds.
+Other platforms walk eligible directories to discover these input probes while
+retaining native recursive source watches. See
+[architecture](docs/ARCHITECTURE.md).
+
+Notifications are coalesced into distinct changed paths over bounded two-second
+windows, including while indexing is busy. Reads are discarded; writable closes
+and queue-overflow rescans are retained. Unreadable or vanished child directories
+and optional input probes are skipped; a source-root registration failure or an
+exhausted inotify watch limit stops startup. Other platforms keep their native
+recursive watcher (FSEvents on macOS). `--no-refresh serve --mcp` disables
+automatic refresh and watching when you need a server that only reads an
+existing index.
+
 ---
 
 ## Quick start

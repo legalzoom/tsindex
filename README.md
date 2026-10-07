@@ -85,6 +85,10 @@ multi-repo catalog. Set `TSINDEX_DEV_ROOT` if your multi-repo root lives
 somewhere other than `~/dev`. The skills expect the `tsindex` binary on `PATH`;
 set `TSINDEX_BIN` if you keep the binary somewhere else.
 
+An opt-in host-aware cleanup design is under discussion in the
+[session-scoped MCP cleanup proposal](docs/proposals/session-scoped-mcp-cleanup.md).
+It is not implemented in the current release.
+
 ### RTK alongside tsindex
 
 RTK (`https://github.com/rtk-ai/rtk`) and tsindex solve complementary context

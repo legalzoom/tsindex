@@ -3,7 +3,8 @@ use std::fs;
 #[cfg(test)]
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -45,6 +46,7 @@ pub struct Runtime {
     /// filesystem). Reads then project `0 AS partial` instead of `f.partial`
     /// so a v3 index stays readable; `partial` simply reports `false`.
     legacy_partial: std::cell::Cell<bool>,
+    shutdown: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Debug, Clone)]
@@ -336,12 +338,31 @@ impl Runtime {
             jobs: 1,
             prune_repos: true,
             legacy_partial: std::cell::Cell::new(false),
+            shutdown: None,
         }
     }
 
     pub fn with_jobs(mut self, jobs: usize) -> Self {
         self.jobs = jobs;
         self
+    }
+
+    pub fn with_shutdown(mut self, shutdown: Arc<AtomicBool>) -> Self {
+        self.shutdown = Some(shutdown);
+        self
+    }
+
+    pub fn shutdown_requested(&self) -> bool {
+        self.shutdown
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
+
+    fn check_shutdown(&self) -> Result<()> {
+        if self.shutdown_requested() {
+            bail!("index maintenance cancelled");
+        }
+        Ok(())
     }
 
     pub fn with_repo_pruning(mut self, prune: bool) -> Self {
@@ -363,6 +384,7 @@ impl Runtime {
     }
 
     pub fn build(&self, incremental: bool, only_repo: Option<&str>) -> Result<BuildStats> {
+        self.check_shutdown()?;
         self.initialize()?;
         let mut conn = Connection::open(&self.db_path)
             .with_context(|| format!("failed to open {}", self.db_path.display()))?;
@@ -426,6 +448,7 @@ impl Runtime {
         // helpers group by repo where it matters.
         let mut batch: Vec<FileJob> = Vec::with_capacity(BUILD_CHUNK_SIZE);
         for workspace in &workspaces {
+            self.check_shutdown()?;
             let repo_id = repo_id_by_name(conn, &workspace.name)?
                 .ok_or_else(|| anyhow!("repo {} is not registered", workspace.name))?;
             let allowed = self.allowed_languages(workspace)?;
@@ -439,6 +462,7 @@ impl Runtime {
             // Consuming the walker's Vec by value frees each PathBuf as it is
             // turned into a job rather than holding the whole repo's paths.
             for path in self.walk_source_files(workspace)? {
+                self.check_shutdown()?;
                 let Some(language_id) = detect_language_from_file(&workspace.root, &path)? else {
                     continue;
                 };
@@ -491,6 +515,7 @@ impl Runtime {
             );
         }
 
+        self.check_shutdown()?;
         purge_stale_files(conn, &active_paths, &purge_languages, &repo_roots)?;
         mark_index_ready(conn)?;
         if only_repo.is_none() && !has_cli_language_filter {
@@ -880,6 +905,7 @@ impl Runtime {
         use notify_debouncer_full::{NoCache, new_debouncer_opt};
         use std::sync::mpsc;
 
+        self.check_shutdown()?;
         self.initialize()?;
         let workspaces = self.workspaces()?;
         if workspaces.is_empty() {
@@ -956,9 +982,13 @@ impl Runtime {
         // inputs; the incremental update still applies the full ignore rules when
         // it walks, so repos can intentionally index paths such as `build/` or
         // `dist/`.
-        run_watch_event_loop(rx, &db_dir, &workspaces, |changed| {
-            self.update_paths_cached(changed, &mut language_cache)
-        });
+        run_watch_event_loop(
+            rx,
+            &db_dir,
+            &workspaces,
+            self.shutdown.as_deref(),
+            |changed| self.update_paths_cached(changed, &mut language_cache),
+        );
 
         Ok(())
     }
@@ -2662,6 +2692,7 @@ impl Runtime {
         });
         let mut files = Vec::new();
         for result in builder.build() {
+            self.check_shutdown()?;
             let entry = match result {
                 Ok(entry) => entry,
                 Err(_) => continue,
@@ -4917,9 +4948,25 @@ fn run_watch_event_loop(
     rx: std::sync::mpsc::Receiver<DebounceEventResult>,
     db_dir: &Path,
     workspaces: &[Workspace],
+    shutdown: Option<&AtomicBool>,
     mut update: impl FnMut(&[PathBuf]) -> Result<BuildStats>,
 ) {
-    for result in rx {
+    loop {
+        let result = if let Some(shutdown) = shutdown {
+            if shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            match rx.recv_timeout(Duration::from_millis(25)) {
+                Ok(result) => result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match rx.recv() {
+                Ok(result) => result,
+                Err(_) => break,
+            }
+        };
         match result {
             Ok(events) => {
                 // Collect the distinct changed paths, dropping those under
@@ -5786,6 +5833,26 @@ mod tests {
     }
 
     #[test]
+    fn scoped_watch_loop_cancels_while_idle() -> Result<()> {
+        let dir = tempdir()?;
+        let db_dir = dir.path().join("db");
+        let (_tx, rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop = shutdown.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            run_watch_event_loop(rx, &db_dir, &[], Some(&stop), |_| {
+                panic!("no updates while idle")
+            });
+            done_tx.send(()).unwrap();
+        });
+        shutdown.store(true, Ordering::Release);
+        done_rx.recv_timeout(Duration::from_secs(1))?;
+        handle.join().unwrap();
+        Ok(())
+    }
+
+    #[test]
     fn watch_event_loop_does_not_update_while_idle() -> Result<()> {
         // CPU regression guard: the event-driven watcher must block while idle.
         // We assert the direct cause of idle CPU use (spurious update calls), not
@@ -5796,7 +5863,7 @@ mod tests {
         let update_count = Arc::new(AtomicUsize::new(0));
         let loop_update_count = Arc::clone(&update_count);
         let handle = thread::spawn(move || {
-            run_watch_event_loop(rx, &db_dir, &[], |_| {
+            run_watch_event_loop(rx, &db_dir, &[], None, |_| {
                 loop_update_count.fetch_add(1, Ordering::SeqCst);
                 Ok(BuildStats::default())
             });
@@ -5838,7 +5905,7 @@ mod tests {
         let updates = Arc::new(Mutex::new(Vec::<Vec<PathBuf>>::new()));
         let loop_updates = Arc::clone(&updates);
         let handle = thread::spawn(move || {
-            run_watch_event_loop(rx, &db_dir, &workspaces, |changed| {
+            run_watch_event_loop(rx, &db_dir, &workspaces, None, |changed| {
                 loop_updates
                     .lock()
                     .expect("updates lock")

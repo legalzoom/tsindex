@@ -10,7 +10,7 @@ use crate::index::{
     BuildStats, EnclosingSymbolArgs, FindReferencesArgs, GetSymbolArgs, OutlineArgs, QueryArgs,
     Runtime, print_json, print_language_reports,
 };
-use crate::mcp::{serve_http, serve_mcp, spawn_parent_watchdog};
+use crate::mcp::{serve_http, serve_mcp, serve_mcp_scoped, spawn_parent_watchdog};
 
 #[derive(Debug, Parser)]
 #[command(name = "tsindex")]
@@ -92,6 +92,25 @@ pub enum Command {
     Repos(ReposCommand),
     #[command(about = "Start the MCP server or the HTTP JSON server.")]
     Serve(ServeCommand),
+    #[command(about = "Release explicitly registered stdio connections for a session.")]
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SessionAction {
+    End {
+        #[arg(
+            long,
+            required_unless_present = "session_id",
+            conflicts_with = "session_id"
+        )]
+        from_stdin: bool,
+        #[arg(long, required_unless_present = "from_stdin")]
+        session_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -376,6 +395,13 @@ pub struct ServeCommand {
         help = "Serve the four retrieval primitives over MCP on stdin/stdout."
     )]
     mcp: bool,
+    #[arg(
+        long,
+        requires = "mcp",
+        conflicts_with = "http",
+        help = "Enable opt-in session ownership and authenticated local cleanup (Linux/macOS)."
+    )]
+    session_lifecycle: bool,
     #[arg(long, help = "Serve the same primitives over a small HTTP JSON API.")]
     http: bool,
     #[arg(long, help = "Port for --http. Defaults to the configured HTTP port.")]
@@ -575,9 +601,22 @@ pub fn run() -> Result<()> {
             print_json(&response)
         }),
         Command::Repos(ref command) => manage_repos(&cli, command),
+        Command::Session { ref action } => match action {
+            SessionAction::End {
+                from_stdin,
+                session_id,
+            } => crate::session::end(*from_stdin, session_id.as_deref()),
+        },
         Command::Serve(ref command) => with_runtime(&cli, |runtime| {
             let runtime = runtime.with_jobs(0);
             if command.mcp {
+                if command.session_lifecycle {
+                    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let session = crate::session::SessionLifecycle::start(shutdown.clone())?;
+                    let runtime = runtime.with_shutdown(shutdown.clone());
+                    spawn_background_watch(&cli, &runtime)?;
+                    return serve_mcp_scoped(runtime, &session, shutdown);
+                }
                 spawn_background_watch(&cli, &runtime)?;
                 return serve_mcp(runtime);
             }
@@ -741,8 +780,12 @@ fn spawn_background_watch(cli: &Cli, runtime: &Runtime) -> Result<()> {
         // index for its whole lifetime. Retry a few times before giving up.
         const ATTEMPTS: u32 = 5;
         for attempt in 1..=ATTEMPTS {
+            if runtime.shutdown_requested() {
+                return;
+            }
             match runtime.watch() {
                 Ok(()) => return,
+                Err(_) if runtime.shutdown_requested() => return,
                 Err(e) if attempt < ATTEMPTS => {
                     eprintln!(
                         "warning: background index watch failed (attempt {attempt}/{ATTEMPTS}): {e:#}"

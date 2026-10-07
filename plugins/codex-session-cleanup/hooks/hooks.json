@@ -1,0 +1,30 @@
+{
+  "description": "Opt-in tsindex cleanup. Requires an existing tsindex MCP server with --session-lifecycle. Review and trust before use.",
+  "hooks": {
+    "PreToolUse": [{
+      "hooks": [{
+        "type": "mcp_tool",
+        "server": "tsindex",
+        "tool": "register_session",
+        "input": { "session_id": "${session_id}" },
+        "timeout": 2
+      }]
+    }],
+    "Stop": [{
+      "hooks": [{
+        "type": "mcp_tool",
+        "server": "tsindex",
+        "tool": "register_session",
+        "input": { "session_id": "${session_id}" },
+        "timeout": 2
+      }]
+    }],
+    "SessionEnd": [{
+      "hooks": [{
+        "type": "command",
+        "command": "tsindex session end --from-stdin",
+        "timeout": 3
+      }]
+    }]
+  }
+}

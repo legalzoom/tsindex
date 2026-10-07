@@ -1,0 +1,6 @@
+{
+  "name": "tsindex-session-cleanup",
+  "version": "0.1.0",
+  "description": "Experimental opt-in session ownership for an existing tsindex MCP connection.",
+  "hooks": "./hooks/hooks.json"
+}

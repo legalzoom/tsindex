@@ -19,6 +19,7 @@ use crate::index::{
     EnclosingSymbolArgs, FindReferencesArgs, GetSymbolArgs, OutlineArgs, QueryArgs,
     ReplaceSymbolArgs, Runtime,
 };
+use crate::session::SessionLifecycle;
 
 static PARENT_WATCHDOG_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -27,6 +28,80 @@ pub fn serve_mcp(runtime: Runtime) -> Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     serve_mcp_io(&runtime, stdin.lock(), stdout.lock())
+}
+
+/// The scoped loop waits on a bounded reader channel, not directly on stdin.
+/// Last-owner release can therefore wake an idle connection without another
+/// JSON-RPC request. Process teardown also cancels the detached stdin reader.
+pub fn serve_mcp_scoped(
+    runtime: Runtime,
+    session: &SessionLifecycle,
+    shutdown: Arc<AtomicBool>,
+) -> Result<()> {
+    spawn_parent_watchdog();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut input = stdin.lock();
+        loop {
+            let mut bytes = Vec::new();
+            // Bound hook requests too, even if the client omits a newline.
+            let read = input
+                .by_ref()
+                .take((MAX_HTTP_BODY_BYTES + 1) as u64)
+                .read_until(b'\n', &mut bytes);
+            match read {
+                Ok(0) => break,
+                Ok(_) if bytes.len() > MAX_HTTP_BODY_BYTES => {
+                    let _ = tx.send(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "MCP message exceeds 1 MiB",
+                    )));
+                    break;
+                }
+                Ok(_) => {
+                    if tx.send(Ok(bytes)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(Err(error));
+                    break;
+                }
+            }
+        }
+    });
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    while !shutdown.load(Ordering::Acquire) {
+        let bytes = match rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(bytes) => bytes?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        let response = match String::from_utf8(bytes) {
+            Ok(line) if line.trim().is_empty() => continue,
+            Ok(line) => match serde_json::from_str(&line) {
+                Ok(request) => handle_request_with_session(&runtime, request, Some(session))?,
+                Err(error) => Some(json_rpc_error(
+                    None,
+                    -32700,
+                    format!("invalid JSON-RPC message: {error}"),
+                )),
+            },
+            Err(_) => Some(json_rpc_error(
+                None,
+                -32700,
+                "invalid JSON-RPC message: request is not valid UTF-8",
+            )),
+        };
+        if let Some(response) = response {
+            writeln!(output, "{}", serde_json::to_string(&response)?)?;
+            output.flush()?;
+        }
+    }
+    shutdown.store(true, Ordering::Release);
+    Ok(())
 }
 
 /// The stdio JSON-RPC loop, split from `serve_mcp` so tests can drive it with
@@ -541,6 +616,14 @@ fn write_http_bytes_response(
 /// Public so integration tests can assert on the exact wire payload the
 /// MCP client receives (e.g. the dropped `structuredContent` duplicate).
 pub fn handle_request(runtime: &Runtime, request: Value) -> Result<Option<Value>> {
+    handle_request_with_session(runtime, request, None)
+}
+
+fn handle_request_with_session(
+    runtime: &Runtime,
+    request: Value,
+    session: Option<&SessionLifecycle>,
+) -> Result<Option<Value>> {
     let id = request.get("id").cloned();
     let Some(method) = request.get("method").and_then(Value::as_str) else {
         return Ok(Some(json_rpc_error(id, -32600, "missing method")));
@@ -567,11 +650,17 @@ pub fn handle_request(runtime: &Runtime, request: Value) -> Result<Option<Value>
             "id": id,
             "result": {}
         })),
-        "tools/list" => Some(json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": tool_list(true)
-        })),
+        "tools/list" => {
+            let mut list = tool_list(true);
+            if session.is_some() {
+                list["tools"].as_array_mut().unwrap().push(json!({
+                    "name": "register_session",
+                    "description": "Lifecycle hook only: register this connection to a host session for scoped cleanup. Do not call manually.",
+                    "inputSchema": tool_schema("register_session", include_str!("../schemas/register_session.json"))
+                }));
+            }
+            Some(json!({ "jsonrpc": "2.0", "id": id, "result": list }))
+        }
         "tools/call" => {
             let Some(name) = params.get("name").and_then(Value::as_str) else {
                 return Ok(Some(json_rpc_error(id, -32602, "missing tool name")));
@@ -580,7 +669,24 @@ pub fn handle_request(runtime: &Runtime, request: Value) -> Result<Option<Value>
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            match call_tool(runtime, name, arguments, true) {
+            let result = if name == "register_session" && session.is_some() {
+                (|| -> Result<Value> {
+                    #[derive(Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct RegisterArgs {
+                        session_id: String,
+                    }
+                    let args: RegisterArgs = tool_args(arguments)?;
+                    crate::session::validate_session_id(&args.session_id)
+                        .map_err(|_| InvalidParams("invalid session_id".into()))?;
+                    session.unwrap().register(&args.session_id)?;
+                    // Valid non-blocking output for both PreToolUse and Stop.
+                    Ok(json!({}))
+                })()
+            } else {
+                call_tool(runtime, name, arguments, true)
+            };
+            match result {
                 // Return the payload once, as the MCP-mandatory `content[].text`
                 // string. We deliberately omit `structuredContent`: it would be a
                 // byte-for-byte duplicate of `text` (the payload serialized twice),

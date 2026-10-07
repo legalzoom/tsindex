@@ -85,9 +85,11 @@ multi-repo catalog. Set `TSINDEX_DEV_ROOT` if your multi-repo root lives
 somewhere other than `~/dev`. The skills expect the `tsindex` binary on `PATH`;
 set `TSINDEX_BIN` if you keep the binary somewhere else.
 
-An opt-in host-aware cleanup design is under discussion in the
-[session-scoped MCP cleanup proposal](docs/proposals/session-scoped-mcp-cleanup.md).
-It is not implemented in the current release.
+Experimental, opt-in [session-scoped cleanup](docs/session-lifecycle.md) adds
+explicit ownership to `serve --mcp --session-lifecycle` on Linux/macOS. A
+reviewable [Codex hook adapter](plugins/codex-session-cleanup/README.md) is
+packaged separately; real-host validation remains a rollout requirement.
+Ordinary MCP startup and the skills' existing commands are unchanged.
 
 ### RTK alongside tsindex
 

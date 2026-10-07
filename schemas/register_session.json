@@ -1,0 +1,8 @@
+{
+  "type": "object",
+  "properties": {
+    "session_id": { "type": "string", "minLength": 1, "maxLength": 256 }
+  },
+  "required": ["session_id"],
+  "additionalProperties": false
+}

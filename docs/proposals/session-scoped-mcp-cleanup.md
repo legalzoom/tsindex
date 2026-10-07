@@ -1,7 +1,9 @@
 # Proposal: session-scoped MCP cleanup
 
-Status: proposed. This document changes no runtime behavior. API names below
-are illustrative, not commands or tools available in the current release.
+Status: native implementation added, experimental opt-in. The
+[implemented contract](../session-lifecycle.md) documents the actual API and
+private state layout. The separately packaged Codex adapter still requires
+real-host validation before advertised support; no host leak is established.
 
 ## Problem and existing behavior
 
@@ -25,7 +27,7 @@ Keep ordinary `serve --mcp` unchanged. An explicit lifecycle option would enable
 a small local control endpoint and a hook-facing registration tool in the Rust
 server, replacing the need for a separate stdio proxy.
 
-1. A hook invokes a proposed `register_session` MCP tool with the host's
+1. A hook invokes the `register_session` MCP tool with the host's
    `session_id` on that session's existing tsindex connection. Registration is
    idempotent and does not alter the index. The server records that session as
    an owner of its own connection.
@@ -33,7 +35,7 @@ server, replacing the need for a separate stdio proxy.
    random connection instance and its local endpoint, authenticated by a
    per-instance nonce. They do not authorize a PID-based signal. One session
    may own several connections; a shared connection may have several owners.
-3. A proposed `tsindex session end --from-stdin` command reads the hook event,
+3. The `tsindex session end --from-stdin` command reads the hook event,
    validates it, and releases that session through its registered endpoints.
    The server verifies the nonce and owner, then exits only after the last
    registered owner releases the connection.
@@ -53,8 +55,9 @@ permissions model, and tests are implemented.
 
 Codex is an adapter, not an assumption embedded in the indexing runtime. Ship
 reviewable hook configuration and setup instructions alongside the existing
-[Codex skills](../../skills/tsindex/SKILL.md). This repository currently does
-not ship a Codex plugin hook package; packaging is part of the proposed work.
+[Codex skills](../../skills/tsindex/SKILL.md). The hook-only package is now at
+[`plugins/codex-session-cleanup`](../../plugins/codex-session-cleanup/README.md).
+It neither installs nor replaces an MCP command automatically.
 
 - Register through an MCP-tool `PreToolUse` hook before work and a `Stop` hook
   when a turn finishes. The latter covers conversations that use no tools.

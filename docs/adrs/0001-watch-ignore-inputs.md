@@ -18,6 +18,8 @@ embedded Git inputs during eligible-directory walks, and Git inputs through
 metadata events; reload indirections when processing changes. Probe symlinked
 rule files through their file-link chain and directory-component links,
 including a missing target, without traversing directory symlink trees.
+Discard cached source-rule owners when their directory or an ancestor becomes
+a symlink, while preserving explicitly configured rule-file routes.
 Keep canonical event-path aliases alongside those indirections: probes use
 canonical parents, which can change casing on macOS or add Windows verbatim
 prefixes. For missing paths, canonicalize the nearest existing ancestor and
@@ -34,7 +36,9 @@ dependency and could select inputs the actual walker does not honor.
 
 Share affected-target expansion between registration and incremental indexing.
 Refresh nested indexes before releasing newly excluded watches. Keep watches
-when indexing fails so subsequent notifications can recover the index. Retire
+when indexing fails so subsequent notifications can recover the index. Advance
+the live-root snapshot only after success, keeping new clones pending for a
+whole-root retry after a failed first update. Retire
 removed input parents even when their governing subtree has vanished and no
 live source registration pass runs. Skip non-systemic optional probe errors
 at startup; keep source-root and watch-limit failures fatal.
@@ -45,6 +49,15 @@ Source walks remain pruned, and metadata/home directories receive only parent
 probes. Native platforms perform an eligible-directory discovery walk while
 retaining recursive source registration. Ignore-input matching uses changed
 path hash membership to avoid a rule-input-by-event cross-product.
+
+The reconciliation loops wait for a stable frontier rather than impose a pass
+cap that could return rule eligibility without notification coverage. Ongoing
+input-topology churn may delay completion; a future bound needs explicit
+pending-target recovery instead of a partial-success return.
+
+FSEvents filters nonrecursive roots in userspace, so probing broad ancestors
+can increase macOS event traffic. Keep inherited-rule creation observable
+until native measurements support a targeted polling or narrower-root design.
 
 The resolver follows pinned dependency semantics. Dependency upgrades that
 change Git input resolution require corresponding probe and regression-test

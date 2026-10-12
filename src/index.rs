@@ -543,12 +543,27 @@ impl Runtime {
         changed: &[PathBuf],
         language_cache: &mut Option<HashMap<String, HashMap<String, LanguageSpec>>>,
     ) -> Result<BuildStats> {
+        let workspaces = self.workspaces()?;
+        let mut inputs = IgnoreInputs::default();
+        inputs.refresh(&workspaces);
+        self.update_paths_with_inputs(changed, language_cache, &workspaces, &inputs)
+    }
+
+    /// The watcher already reconciled these inputs before registration. Reuse
+    /// that mapping so indexing does not resolve every ancestor's rule paths
+    /// again within the same notification batch.
+    fn update_paths_with_inputs(
+        &self,
+        changed: &[PathBuf],
+        language_cache: &mut Option<HashMap<String, HashMap<String, LanguageSpec>>>,
+        workspaces: &[Workspace],
+        inputs: &IgnoreInputs,
+    ) -> Result<BuildStats> {
         // Schema bootstrap happens once in `watch()`/`update_paths`, not per
         // batch: `create_schema` upserts repos and stamps pragmas, which would
         // take a write lock on every debounced event even when nothing changed.
         let mut conn = Connection::open(&self.db_path)
             .with_context(|| format!("failed to open {}", self.db_path.display()))?;
-        let workspaces = self.workspaces()?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         // `delete_file_rows_or_prefix` relies on `ON DELETE CASCADE`; the
         // pragma is per-connection, so set it here rather than trusting the
@@ -565,12 +580,10 @@ impl Runtime {
                 }
             })
             .collect();
-        let mut inputs = IgnoreInputs::default();
-        inputs.refresh(&workspaces);
         // Index invalidation and watch registration share target expansion.
         // Inherited rules must refresh nested indexes in the same batch that
         // removes their excluded watches, without needing another source event.
-        let by_workspace = workspace_change_targets(&workspaces, &absolute, &inputs);
+        let by_workspace = workspace_change_targets(workspaces, &absolute, inputs);
 
         let mut stats = BuildStats::default();
         let mut touched = 0usize;
@@ -920,7 +933,8 @@ impl Runtime {
                 .map_err(|error| watch_failure(workspace, error.into()))?;
             // Linux must prune before allocating individual source watches;
             // native backends retain recursive roots and discover inputs only.
-            let (_registered, eligible) = register_workspace_directories(
+            #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+            let (registered, eligible) = register_workspace_directories(
                 workspace,
                 &db_dir,
                 &workspaces,
@@ -931,7 +945,7 @@ impl Runtime {
             startup_eligible.extend(eligible);
             #[cfg(target_os = "linux")]
             eprintln!(
-                "watching {} ({}): {_registered} directories",
+                "watching {} ({}): {registered} directories",
                 workspace.name,
                 workspace.root.display()
             );
@@ -1010,7 +1024,6 @@ impl Runtime {
                 // repo must use its own rules even if its parent ignores that path.
                 changed.extend(roots.difference(&previous_roots).cloned());
                 let ownership_changed = roots != previous_roots;
-                previous_roots = roots;
                 changed.sort();
                 changed.dedup();
                 // A failed discovery pass cannot discard a healthy repo's index
@@ -1048,13 +1061,22 @@ impl Runtime {
                 let stats = if changed.is_empty() {
                     BuildStats::default()
                 } else {
-                    self.update_paths_cached(&changed, &mut language_cache)?
+                    self.update_paths_with_inputs(
+                        &changed,
+                        &mut language_cache,
+                        workspaces,
+                        &ignore_inputs,
+                    )?
                 };
+                // A new clone remains pending until its whole-root update
+                // succeeds. Otherwise a transient write failure would make
+                // later file events skip its other, still-unindexed sources.
+                previous_roots = roots;
                 // A deleted rule owner has no live registration target, but
                 // its external probes still need retirement. Compare input
                 // parents so ordinary file edits avoid scanning source watches.
-                // Only advance this snapshot after a successful index update;
-                // failures must retain the notification route for recovery.
+                // Advance this snapshot only after successful indexing so
+                // failures retain the notification route for recovery.
                 let current_inputs = self.watch_input_directories(&ignore_inputs);
                 let inputs_removed = !previous_inputs.is_subset(&current_inputs);
                 previous_inputs = current_inputs;
@@ -2750,6 +2772,8 @@ impl Runtime {
             // its nearest parent and installing that parent's probe. Recompute
             // until the parent frontier is stable, then return fresh ownership:
             // later arrivals either exist already or notify an installed probe.
+            // A pass cap cannot report success here: a rule read before its
+            // final probe exists would have no notification route for recovery.
             ignore_inputs.refresh(&live);
             if inputs == self.watch_input_directories(ignore_inputs) {
                 return Ok((live, inputs));
@@ -5188,6 +5212,8 @@ fn register_ignore_probes<W: notify::Watcher>(
 /// Eligibility can be read before an external rule's parent is discovered.
 /// Once new probes exist, repeat the affected walk so no newly eligible source
 /// depends on a notification that happened before its rule input was watched.
+/// Deliberately wait for a stable frontier; a capped partial pass could report
+/// eligibility that was read before its inputs had notification coverage.
 fn register_workspace_directories<W: notify::Watcher>(
     workspace: &Workspace,
     db_dir: &Path,
@@ -5386,9 +5412,9 @@ fn run_watch_event_loop(
             })
             .cloned()
             .collect();
-        let mut inputs = IgnoreInputs::default();
-        inputs.refresh(&workspaces);
-        changed.extend(inputs.changed_targets(&batch.paths.iter().cloned().collect::<Vec<_>>()));
+        // The callback owns reconciled input routes, including their previous
+        // targets after link replacement. Rebuilding a partial mapping here
+        // repeats filesystem resolution for every wakeup, even unrelated probes.
         // Overflow has no paths: notifications were lost, so repair watches
         // and update every currently available workspace, including new clones.
         if batch.rescan {

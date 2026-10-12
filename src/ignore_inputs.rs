@@ -20,11 +20,19 @@ impl IgnoreInputs {
     /// Reload indirections as well as rule paths: worktrees can share excludes,
     /// and global configuration can select a different file during a session.
     pub fn refresh(&mut self, workspaces: &[Workspace]) {
+        // These owners came from eligible source walks. A replaced directory
+        // or ancestor may now be a symlink into a pruned tree; reloading its
+        // rules would allocate probes for sources the index cannot visit.
         self.source_directories.retain(|dir| {
-            dir.is_dir()
-                && workspaces
-                    .iter()
-                    .any(|workspace| dir.starts_with(&workspace.root))
+            workspaces.iter().any(|workspace| {
+                dir.starts_with(&workspace.root)
+                    && dir
+                        .ancestors()
+                        .take_while(|path| path.starts_with(&workspace.root))
+                        .all(|path| {
+                            fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+                        })
+            })
         });
         self.files.clear();
         let global = global_inputs();
@@ -563,6 +571,78 @@ mod tests {
         inputs.refresh(&[workspace]);
         assert!(inputs.directories().contains(&old));
         assert_eq!(inputs.changed_targets(&[target]), HashSet::from([root]));
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_drops_cached_rule_owners_below_source_directory_symlinks() -> anyhow::Result<()> {
+        for descendant in ["", "deep"] {
+            let dir = tempfile::tempdir()?;
+            let base = dir.path().canonicalize()?;
+            let root = base.join("repo");
+            let nested = root.join("nested");
+            let owner = if descendant.is_empty() {
+                nested.clone()
+            } else {
+                nested.join(descendant)
+            };
+            let replacement = base.join("replacement");
+            let new_owner = if descendant.is_empty() {
+                replacement.clone()
+            } else {
+                replacement.join(descendant)
+            };
+            let old_rules = base.join("old-rules/rules");
+            let new_rules = base.join("new-rules/rules");
+            for path in [
+                &owner,
+                &new_owner,
+                old_rules.parent().unwrap(),
+                new_rules.parent().unwrap(),
+            ] {
+                fs::create_dir_all(path)?;
+            }
+            fs::write(&old_rules, "")?;
+            fs::write(&new_rules, "")?;
+            symlink(&old_rules, owner.join(".ignore"))?;
+            symlink(&new_rules, new_owner.join(".ignore"))?;
+            let mut workspace = Workspace {
+                name: "repo".to_string(),
+                root: root.clone(),
+                languages: Vec::new(),
+                ignore: Vec::new(),
+            };
+            let mut inputs = IgnoreInputs::default();
+            inputs.refresh(std::slice::from_ref(&workspace));
+            inputs.discover_directory(&owner);
+            assert_eq!(
+                inputs.changed_targets(&[old_rules]),
+                HashSet::from([owner.clone()])
+            );
+
+            fs::rename(&nested, base.join("moved"))?;
+            symlink(&replacement, &nested)?;
+            inputs.refresh(std::slice::from_ref(&workspace));
+            assert!(
+                !inputs.source_directories.contains(&owner),
+                "cached owner survived through source link: {descendant}"
+            );
+            assert!(
+                inputs
+                    .changed_targets(std::slice::from_ref(&new_rules))
+                    .is_empty()
+            );
+            assert!(!inputs.directories().contains(&new_owner));
+            assert!(!inputs.directories().contains(new_rules.parent().unwrap()));
+
+            // Explicit rule routes may intentionally cross directory links;
+            // pruning cached source owners must not disable those inputs.
+            workspace
+                .ignore
+                .push(owner.join(".ignore").to_string_lossy().into_owned());
+            inputs.refresh(std::slice::from_ref(&workspace));
+            assert_eq!(inputs.changed_targets(&[new_rules]), HashSet::from([root]));
+        }
         Ok(())
     }
 }

@@ -38,6 +38,8 @@ during eligible walks; metadata events also discover newly created Git inputs.
 Rule-file symlinks retain probes on their indirections and targets, including
 directory links within the input path and missing targets, so replacement and
 recreation remain observable. Source directory symlink trees remain pruned.
+Cached rule owners are retired if their directory or a workspace-relative
+ancestor becomes a symlink; explicit rule-file routes may still cross links.
 Inputs keep both their original routes and canonical probe-path aliases so
 macOS casing changes and Windows verbatim prefixes still match notifications.
 Missing targets retain the canonical alias of their nearest existing ancestor.
@@ -46,14 +48,37 @@ than invoking Git with different configuration.
 If a walk discovers new input parents, registration repeats the affected walk
 after those probes exist. This reconciles eligibility read before a newly
 discovered external rule could be observed, both at startup and during updates.
+Index updates reuse that reconciled mapping and workspace snapshot rather than
+resolving another set of rule paths for the same notification batch.
 
 Indexing and watch refresh share target expansion, including nested workspaces
 affected by inherited rules. Successful index updates precede removal of
 obsolete watches, preserving a notification route if indexing fails.
+The live-root snapshot advances only after successful indexing, so a failed
+first update of an arriving clone retries its entire root on the next batch.
 Removing an input parent also triggers retention when its governing source
 directory has vanished and no live source registration pass is needed.
 Optional probe failures are logged at startup and during discovery; source-root
 registration failures and watch-limit exhaustion still stop startup.
+
+## Platform and concurrency limits
+
+Ancestor rule probes include absent rule paths through the filesystem root,
+so creating an inherited rule remains observable. Linux and Windows implement
+nonrecursive probes in their native backends. FSEvents uses recursive streams
+and filters nonrecursive roots after delivery; broad ancestor probes can
+therefore increase macOS event traffic. Native macOS measurements are needed
+before changing this policy. Dropping ancestors or probing only existing rules
+would lose creation notifications; a separate targeted polling backend would
+require its own latency, replacement, and recovery contract.
+
+Probe reconciliation waits for a stable input frontier. Continuous rule-link
+or parent-directory churn can delay completion. A fixed pass cap must retain
+unresolved targets and retry them, rather than report partial eligibility as a
+successful registration. Static input topology settles without such a cap.
+As with the underlying recursive watcher, creation between listing a source
+directory and installing its watch can be missed; later subtree reconciliation
+or a rebuild repairs that pre-existing gap.
 
 ## Validation
 

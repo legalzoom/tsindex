@@ -135,12 +135,12 @@ retaining native recursive source watches. See
 
 Notifications are coalesced into distinct changed paths over bounded two-second
 windows, including while indexing is busy. Reads are discarded; writable closes
-and queue-overflow rescans are retained. Unreadable or vanished child directories
-and optional input probes are skipped; a source-root registration failure or an
-exhausted inotify watch limit stops startup. Other platforms keep their native
-recursive watcher (FSEvents on macOS). `--no-refresh serve --mcp` disables
-automatic refresh and watching when you need a server that only reads an
-existing index.
+and queue-overflow rescans are retained. Unreadable or vanished child
+directories and optional input probes are skipped; a source-root registration
+failure or an exhausted inotify watch limit stops startup. Other platforms keep
+their native recursive watcher (FSEvents on macOS). `--no-refresh serve --mcp`
+disables automatic refresh and watching when you need a server that only reads
+an existing index.
 
 ---
 

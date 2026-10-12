@@ -21,6 +21,7 @@ struct Server {
     db: PathBuf,
     reader: Option<thread::JoinHandle<()>>,
     updates: mpsc::Receiver<()>,
+    errors: mpsc::Receiver<String>,
 }
 
 impl Drop for Server {
@@ -66,6 +67,7 @@ impl Server {
         let stderr = child.stderr.take().unwrap();
         let (tx, rx) = mpsc::channel();
         let (update_tx, updates) = mpsc::channel();
+        let (error_tx, errors) = mpsc::channel();
         let reader = thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                 if line.contains("repos for changes") {
@@ -73,6 +75,9 @@ impl Server {
                 }
                 if line.contains("update complete") {
                     let _ = update_tx.send(());
+                }
+                if line.contains("watch update failed") {
+                    let _ = error_tx.send(line);
                 }
             }
         });
@@ -82,6 +87,7 @@ impl Server {
             db: root.join(".tsindex/index.db"),
             reader: Some(reader),
             updates,
+            errors,
         };
         Ok((server, rx))
     }
@@ -295,6 +301,151 @@ fn deleted_ignore_owner_retires_external_probe_without_directory_refresh() -> Re
         server.has_symbol("delete_followup")
     })?;
     assert!(!server.watches(&external)?);
+    Ok(())
+}
+
+#[test]
+fn source_directory_symlink_replacement_retires_cached_input_probes() -> Result<()> {
+    for descendant in ["", "deep"] {
+        let dir = tempdir()?;
+        let base = dir.path().canonicalize()?;
+        let root = base.join("repo");
+        fixture(&root, "source_link_initial")?;
+        let nested = root.join("nested");
+        let owner = if descendant.is_empty() {
+            nested.clone()
+        } else {
+            nested.join(descendant)
+        };
+        let replacement = base.join("replacement");
+        let new_owner = if descendant.is_empty() {
+            replacement.clone()
+        } else {
+            replacement.join(descendant)
+        };
+        let old_rules = base.join("old-rules/rules");
+        let new_rules = base.join("new-rules/rules");
+        for path in [
+            &owner,
+            &new_owner,
+            old_rules.parent().unwrap(),
+            new_rules.parent().unwrap(),
+        ] {
+            fs::create_dir_all(path)?;
+        }
+        fs::write(
+            owner.join("a.py"),
+            "def source_link_old_owner():\n    return 1\n",
+        )?;
+        fs::write(
+            new_owner.join("a.py"),
+            "def source_link_foreign():\n    return 1\n",
+        )?;
+        fs::write(&old_rules, "")?;
+        fs::write(&new_rules, "")?;
+        symlink(&old_rules, owner.join(".ignore"))?;
+        symlink(&new_rules, new_owner.join(".ignore"))?;
+        let server = Server::start(&root)?;
+        server.wait("original rule owner was not indexed", || {
+            server.has_symbol("source_link_old_owner")
+        })?;
+        assert!(server.watches(old_rules.parent().unwrap())?);
+        fs::write(
+            root.join("src/a.py"),
+            "def source_link_settled():\n    return 2\n",
+        )?;
+        server.updates.recv_timeout(Duration::from_secs(5))?;
+        server.wait("startup did not settle", || {
+            server.has_symbol("source_link_settled")
+        })?;
+
+        fs::rename(&nested, base.join("moved"))?;
+        symlink(&replacement, &nested)?;
+        server.wait("replaced source rows survived", || {
+            !server.has_symbol("source_link_old_owner")
+        })?;
+        fs::write(
+            root.join("src/a.py"),
+            "def source_link_followup():\n    return 3\n",
+        )?;
+        server.wait("healthy edit stopped after source-link replacement", || {
+            server.has_symbol("source_link_followup")
+        })?;
+        server.wait(
+            "replacement source link retained an external rule probe",
+            || !server.watches(new_rules.parent().unwrap()).unwrap_or(true),
+        )?;
+        server.wait(
+            "replacement source link retained its directory probe",
+            || !server.watches(&new_owner).unwrap_or(true),
+        )?;
+        server.wait("replaced owner retained its old external probe", || {
+            !server.watches(old_rules.parent().unwrap()).unwrap_or(true)
+        })?;
+        assert!(!server.has_symbol("source_link_foreign"));
+    }
+    Ok(())
+}
+
+#[test]
+fn arriving_workspace_retries_full_index_after_a_failed_update() -> Result<()> {
+    let dir = tempdir()?;
+    let base = dir.path().canonicalize()?;
+    let catalog = base.join("catalog");
+    let healthy = base.join("healthy");
+    let arriving = base.join("late");
+    fixture(&healthy, "retry_healthy_initial")?;
+    fs::create_dir_all(catalog.join(".tsindex"))?;
+    fs::write(
+        catalog.join(".tsindex/config.toml"),
+        format!(
+            "[[repos]]\nname = 'healthy'\npath = {}\nlanguages = ['python']\n\n[[repos]]\nname = 'late'\npath = {}\nlanguages = ['python']\n",
+            serde_json::to_string(&healthy)?,
+            serde_json::to_string(&arriving)?,
+        ),
+    )?;
+    let server = Server::start(&catalog)?;
+    server.wait("healthy initial build did not finish", || {
+        server.has_symbol("retry_healthy_initial")
+    })?;
+    fs::write(
+        healthy.join("src/a.py"),
+        "def retry_healthy_settled():\n    return 2\n",
+    )?;
+    server.updates.recv_timeout(Duration::from_secs(5))?;
+    server.wait("watcher did not reach its update loop", || {
+        server.has_symbol("retry_healthy_settled")
+    })?;
+
+    let prepared = base.join("prepared");
+    fixture(&prepared, "retry_late_a")?;
+    fs::write(
+        prepared.join("src/b.py"),
+        "def retry_late_untouched_b():\n    return 1\n",
+    )?;
+    let writer = Connection::open(&server.db)?;
+    // Force a real SQLite write failure, not a simulated callback result.
+    // A later file event must retry the pending clone's whole initial scope.
+    writer.execute_batch("BEGIN IMMEDIATE")?;
+    fs::rename(&prepared, &arriving)?;
+    let error = server.errors.recv_timeout(Duration::from_secs(10))?;
+    ensure!(
+        error.contains("database is locked"),
+        "unexpected update error: {error}"
+    );
+    assert!(!server.has_symbol("retry_late_untouched_b"));
+    writer.execute_batch("ROLLBACK")?;
+    drop(writer);
+    fs::write(
+        arriving.join("src/a.py"),
+        "def retry_late_edited_a():\n    return 3\n",
+    )?;
+    server.wait("edited clone file did not recover", || {
+        server.has_symbol("retry_late_edited_a")
+    })?;
+    server.wait("failed clone update lost untouched files", || {
+        server.has_symbol("retry_late_untouched_b")
+    })?;
     Ok(())
 }
 

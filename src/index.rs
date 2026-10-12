@@ -878,6 +878,10 @@ impl Runtime {
     pub fn watch(&self) -> Result<()> {
         use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
+        // A missing configured clone may arrive long after startup. Reject
+        // persistent filter errors now so its pending-root retry cannot block
+        // later healthy workspaces on every subsequent notification batch.
+        self.validate_watch_languages()?;
         self.initialize()?;
         let workspaces = self.workspaces()?;
         if workspaces.is_empty() {
@@ -2810,6 +2814,35 @@ impl Runtime {
             .find(|workspace| workspace.name == repo)
             .ok_or_else(|| anyhow!("repo {} is not configured", repo))?;
         Ok(workspace.root.join(file))
+    }
+
+    fn validate_watch_languages(&self) -> Result<()> {
+        let validate = |languages: &[String]| -> Result<()> {
+            for language in languages {
+                if lookup_language(language).is_none() {
+                    return Err(anyhow!("unsupported language {}", language));
+                }
+            }
+            Ok(())
+        };
+        // CLI filters override every configured filter. Validate only effective
+        // values, matching allowed_languages and workspace_from_config exactly.
+        if !self.languages.is_empty() {
+            return validate(&self.languages);
+        }
+        if self.config.repos.is_empty() {
+            return validate(&self.config.languages.include);
+        }
+        for repo in &self.config.repos {
+            let languages = if repo.languages.is_empty() {
+                &self.config.languages.include
+            } else {
+                &repo.languages
+            };
+            validate(languages)
+                .with_context(|| format!("invalid language filter for repo {}", repo.name))?;
+        }
+        Ok(())
     }
 
     fn allowed_languages(&self, workspace: &Workspace) -> Result<HashMap<String, LanguageSpec>> {
@@ -5992,6 +6025,34 @@ mod tests {
             .map(|(r, _)| r)
             .collect();
         assert_eq!(repos, vec!["a".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn watch_language_validation_honors_effective_filter_precedence() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let mut runtime = unfiltered_runtime(&root);
+        runtime.config.languages.include = vec!["invalid-global-language".to_string()];
+        assert!(runtime.validate_watch_languages().is_err());
+        runtime.config.repos = vec![RepoConfig {
+            name: "missing".to_string(),
+            path: "missing".to_string(),
+            languages: vec!["python".to_string()],
+            ignore: Vec::new(),
+        }];
+        // A repo's explicit filter overrides an unused invalid global filter.
+        runtime.validate_watch_languages()?;
+        runtime.config.repos[0].languages.clear();
+        assert!(runtime.validate_watch_languages().is_err());
+        runtime.config.languages.include.clear();
+        runtime.validate_watch_languages()?;
+        runtime.config.repos[0].languages = vec!["invalid-repo-language".to_string()];
+        assert!(runtime.validate_watch_languages().is_err());
+        runtime.languages = vec!["python".to_string()];
+        runtime.validate_watch_languages()?;
+        runtime.languages = vec!["invalid-cli-language".to_string()];
+        assert!(runtime.validate_watch_languages().is_err());
         Ok(())
     }
 

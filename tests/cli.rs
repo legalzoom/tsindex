@@ -45,6 +45,72 @@ fn ok_json(root: &Path, args: &[&str]) -> Result<Value> {
 }
 
 #[test]
+fn watch_rejects_invalid_languages_for_missing_configured_clones() -> Result<()> {
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    struct Watch(std::process::Child);
+    impl Drop for Watch {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let dir = tempdir()?;
+    let root = dir.path().canonicalize()?;
+    fixture(&root.join("healthy"))?;
+    fs::create_dir(root.join(".tsindex"))?;
+    fs::write(
+        root.join(".tsindex/config.toml"),
+        "[[repos]]\nname = 'missing'\npath = 'missing'\nlanguages = ['invalid-test-language']\n\n[[repos]]\nname = 'healthy'\npath = 'healthy'\nlanguages = ['python']\n",
+    )?;
+    let mut watch = Watch(
+        Command::new(BIN)
+            .arg("--root")
+            .arg(&root)
+            .arg("watch")
+            .env("HOME", &root)
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = watch.0.try_wait()? {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    if status.is_none() {
+        watch.0.kill()?;
+        watch.0.wait()?;
+    }
+    let mut stderr = String::new();
+    watch.0.stderr.take().unwrap().read_to_string(&mut stderr)?;
+    assert!(
+        status.is_some(),
+        "watch accepted an invalid filter for a missing clone: {stderr}"
+    );
+    assert!(
+        !status.unwrap().success(),
+        "invalid configuration succeeded"
+    );
+    assert!(stderr.contains("invalid language filter for repo missing"));
+    assert!(stderr.contains("unsupported language invalid-test-language"));
+    assert!(!stderr.contains("repos for changes"));
+    assert!(
+        !root.join(".tsindex/index.db").exists(),
+        "invalid watcher configuration allocated an index"
+    );
+    Ok(())
+}
+
+#[test]
 fn cli_init_build_symbol_round_trip() -> Result<()> {
     let dir = tempdir()?;
     fixture(dir.path())?;

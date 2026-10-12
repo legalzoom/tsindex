@@ -110,6 +110,10 @@ sessions stay fresh without an external `watch`. Use `TSINDEX_START_MODE=watch`
 only when you want a foreground watcher for CLI-only sessions that never start
 `serve --mcp`.
 
+Watch startup rejects unsupported language filters even for configured clones
+that are still missing. Fix the reported filter and restart the watcher; CLI
+language overrides and repository/global fallback retain their precedence.
+
 Source registration never follows directory symlinks, matching the index walk,
 so linked dependency graphs such as pnpm's `node_modules` cannot expand
 into duplicate watched paths. On Linux the registration itself enforces this:

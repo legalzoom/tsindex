@@ -15,7 +15,12 @@ separate indexes or source-discovery rules.
 
 ## Filesystem updates
 
-The MCP server owns a watcher for its lifetime. Incremental updates resolve
+The MCP server owns a watcher for its lifetime. Watch startup validates the
+selected language filters for all configured repositories, including absent
+clones. CLI overrides and repository/global fallback retain their precedence;
+unsupported IDs fail before the watcher initializes the index or allocates
+watches, so an arriving clone cannot introduce a permanent retry error.
+Incremental updates resolve
 changed paths through the same ignore-aware walker used by full indexing.
 Parsing and file I/O precede the database write transaction.
 

@@ -1,6 +1,7 @@
 /target
 .tsindex/
 .worktrees/
+.test-tmp/
 dist/
 .claude/
 .codex/

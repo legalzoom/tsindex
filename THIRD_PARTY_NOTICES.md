@@ -49,7 +49,6 @@ and trailing whitespace are normalized.
 | fallible-iterator | 0.3.0 | MIT/Apache-2.0 | [6](#license-text-6), [23](#license-text-23) |
 | fallible-streaming-iterator | 0.1.9 | MIT/Apache-2.0 | [6](#license-text-6), [24](#license-text-24) |
 | fastrand | 2.4.1 | Apache-2.0 OR MIT | [1](#license-text-1), [9](#license-text-9) |
-| file-id | 0.2.3 | MIT OR Apache-2.0 | [25](#license-text-25), [26](#license-text-26) |
 | find-msvc-tools | 0.1.9 | MIT OR Apache-2.0 | [1](#license-text-1), [15](#license-text-15) |
 | foldhash | 0.1.5 | Zlib | [27](#license-text-27) |
 | fsevent-sys | 4.1.0 | MIT | [28](#license-text-28) |
@@ -78,7 +77,6 @@ and trailing whitespace are normalized.
 | memchr | 2.8.0 | Unlicense OR MIT | [3](#license-text-3), [4](#license-text-4), [5](#license-text-5) |
 | mio | 1.2.1 | MIT | [44](#license-text-44) |
 | notify | 8.2.0 | CC0-1.0 | [45](#license-text-45) |
-| notify-debouncer-full | 0.7.0 | MIT OR Apache-2.0 | [25](#license-text-25), [26](#license-text-26) |
 | notify-types | 2.1.0 | MIT OR Apache-2.0 | [25](#license-text-25), [26](#license-text-26) |
 | once_cell | 1.21.4 | MIT OR Apache-2.0 | [1](#license-text-1), [9](#license-text-9) |
 | once_cell_polyfill | 1.70.2 | MIT OR Apache-2.0 | [6](#license-text-6), [7](#license-text-7) |
@@ -1709,8 +1707,6 @@ SOFTWARE.
 
 ## License text 25
 
-- [file-id 0.2.3](https://docs.rs/crate/file-id/0.2.3/source/LICENSE-APACHE)
-- [notify-debouncer-full 0.7.0](https://docs.rs/crate/notify-debouncer-full/0.7.0/source/LICENSE-APACHE)
 - [notify-types 2.1.0](https://docs.rs/crate/notify-types/2.1.0/source/LICENSE-APACHE)
 
 ````text
@@ -1919,8 +1915,6 @@ limitations under the License.
 
 ## License text 26
 
-- [file-id 0.2.3](https://docs.rs/crate/file-id/0.2.3/source/LICENSE-MIT)
-- [notify-debouncer-full 0.7.0](https://docs.rs/crate/notify-debouncer-full/0.7.0/source/LICENSE-MIT)
 - [notify-types 2.1.0](https://docs.rs/crate/notify-types/2.1.0/source/LICENSE-MIT)
 
 ````text

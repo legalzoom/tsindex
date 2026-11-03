@@ -20,37 +20,58 @@ struct SessionLifecycle {
 
 impl SessionLifecycle {
     fn capture(session_pid: Option<u32>) -> Result<Option<Self>> {
-        let parent = unsafe { libc::getppid() };
+        Self::capture_with(
+            session_pid,
+            unsafe { libc::getppid() },
+            std::process::id(),
+            process_start_time,
+        )
+    }
+
+    fn capture_with(
+        session_pid: Option<u32>,
+        parent: libc::pid_t,
+        tsindex_pid: u32,
+        inspect: impl FnOnce(libc::pid_t) -> io::Result<Option<(u64, u64)>>,
+    ) -> Result<Option<Self>> {
         // Preserve init/launchd and container launches. An explicit PID 1 is
         // still a valid owner; guessing ownership after reparenting is not.
         if session_pid.is_none() && parent <= 1 {
             return Ok(None);
         }
         let pid = session_pid.unwrap_or(parent as u32);
-        if pid == 0 || pid > i32::MAX as u32 || pid == std::process::id() {
+        if pid == 0 || pid > i32::MAX as u32 || pid == tsindex_pid {
             bail!(
                 "session PID must identify another process (1..={})",
                 i32::MAX
             );
         }
-        let started_at = process_start_time(pid as libc::pid_t)
+        let started_at = inspect(pid as libc::pid_t)
             .with_context(|| format!("cannot inspect session PID {pid}"))?
             .with_context(|| format!("session PID {pid} has already exited"))?;
         Ok(Some(Self {
             session_pid: pid as libc::pid_t,
-            tsindex_pid: std::process::id(),
+            tsindex_pid,
             started_at,
             track_parent: session_pid.is_none(),
         }))
     }
 
     fn has_ended(&self) -> bool {
-        if self.track_parent && unsafe { libc::getppid() } != self.session_pid {
+        self.has_ended_with(unsafe { libc::getppid() }, process_start_time)
+    }
+
+    fn has_ended_with(
+        &self,
+        parent: libc::pid_t,
+        inspect: impl FnOnce(libc::pid_t) -> io::Result<Option<(u64, u64)>>,
+    ) -> bool {
+        if self.track_parent && parent != self.session_pid {
             return true;
         }
         // Permission or transient inspection errors are not evidence of death.
         // A missing/zombie process or a changed start time is conclusive.
-        matches!(process_start_time(self.session_pid), Ok(current) if current != Some(self.started_at))
+        matches!(inspect(self.session_pid), Ok(current) if current != Some(self.started_at))
     }
 
     fn shutdown(&self) -> ! {
@@ -171,23 +192,142 @@ mod tests {
     use super::*;
 
     #[test]
-    fn live_session_and_reused_pid_have_different_lifetimes() -> Result<()> {
-        let mut session = SessionLifecycle::capture(Some(unsafe { libc::getppid() } as u32))?
-            .expect("test parent should be alive");
-        assert!(!session.has_ended());
-        session.started_at.0 += 1;
-        assert!(
-            session.has_ended(),
-            "a reused PID must not keep tsindex alive"
-        );
+    fn captures_both_pids_and_parent_identity() -> Result<()> {
+        let session = SessionLifecycle::capture_with(None, 42, 99, |pid| {
+            assert_eq!(pid, 42);
+            Ok(Some((123, 456)))
+        })?
+        .unwrap();
+        assert_eq!(session.session_pid, 42);
+        assert_eq!(session.tsindex_pid, 99);
+        assert_eq!(session.started_at, (123, 456));
+        assert!(session.track_parent);
         Ok(())
     }
 
     #[test]
-    fn rejects_invalid_and_self_owned_sessions() {
-        for pid in [0, u32::MAX, std::process::id()] {
-            assert!(SessionLifecycle::capture(Some(pid)).is_err());
+    fn init_launch_does_not_infer_an_owner() -> Result<()> {
+        for parent in [0, 1] {
+            assert!(
+                SessionLifecycle::capture_with(None, parent, 99, |_| {
+                    panic!("init must not be inspected without explicit ownership")
+                })?
+                .is_none()
+            );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_owner_overrides_parent_including_init() -> Result<()> {
+        for owner in [1, 7, i32::MAX as u32] {
+            let session = SessionLifecycle::capture_with(Some(owner), 42, 99, |pid| {
+                assert_eq!(pid, owner as i32);
+                Ok(Some((123, 456)))
+            })?
+            .unwrap();
+            assert_eq!(session.session_pid, owner as i32);
+            assert!(!session.track_parent);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_and_self_owned_sessions_are_rejected_before_inspection() {
+        for pid in [0, 99, i32::MAX as u32 + 1, u32::MAX] {
+            assert!(
+                SessionLifecycle::capture_with(Some(pid), 42, 99, |_| {
+                    panic!("invalid PID must not reach the process API")
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn capture_reports_missing_owner_and_inspection_failure() {
+        for requested in [None, Some(42)] {
+            let missing =
+                SessionLifecycle::capture_with(requested, 42, 99, |_| Ok(None)).unwrap_err();
+            assert!(
+                missing
+                    .to_string()
+                    .contains("session PID 42 has already exited")
+            );
+            let denied = SessionLifecycle::capture_with(requested, 42, 99, |_| {
+                Err(io::Error::from_raw_os_error(libc::EPERM))
+            })
+            .unwrap_err();
+            assert!(denied.to_string().contains("cannot inspect session PID 42"));
+            assert_eq!(
+                denied.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+                Some(libc::EPERM)
+            );
+        }
+    }
+
+    fn session(track_parent: bool) -> SessionLifecycle {
+        SessionLifecycle {
+            session_pid: 42,
+            tsindex_pid: 99,
+            started_at: (123, 456),
+            track_parent,
+        }
+    }
+
+    #[test]
+    fn living_owner_keeps_server_alive() {
+        for track_parent in [false, true] {
+            assert!(!session(track_parent).has_ended_with(42, |pid| {
+                assert_eq!(pid, 42);
+                Ok(Some((123, 456)))
+            }));
+        }
+    }
+
+    #[test]
+    fn missing_or_reused_owner_ends_session() {
+        for current in [None, Some((124, 456)), Some((123, 457))] {
+            for track_parent in [false, true] {
+                assert!(session(track_parent).has_ended_with(42, |_| Ok(current)));
+            }
+        }
+    }
+
+    #[test]
+    fn parent_change_ends_inferred_session_even_when_inspection_would_fail() {
+        for parent in [0, 1, 7] {
+            assert!(session(true).has_ended_with(parent, |_| {
+                panic!("reparenting is conclusive without another process lookup")
+            }));
+        }
+    }
+
+    #[test]
+    fn explicit_owner_survives_wrapper_exit() {
+        for parent in [0, 1, 7] {
+            assert!(!session(false).has_ended_with(parent, |_| Ok(Some((123, 456)))));
+        }
+    }
+
+    #[test]
+    fn inspection_failure_does_not_end_a_live_session() {
+        for error in [libc::EPERM, libc::EINTR, libc::EIO] {
+            for track_parent in [false, true] {
+                assert!(
+                    !session(track_parent)
+                        .has_ended_with(42, |_| { Err(io::Error::from_raw_os_error(error)) })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_process_identity_is_stable() -> Result<()> {
+        let pid = std::process::id() as libc::pid_t;
+        let first = process_start_time(pid)?.expect("test process is alive");
+        assert_eq!(process_start_time(pid)?, Some(first));
+        Ok(())
     }
 
     #[test]
@@ -204,6 +344,10 @@ mod tests {
         }
         assert!(parse_proc_stat("malformed").is_err());
         assert!(parse_proc_stat("123 (name) S 0").is_err());
+        for started_at in ["-1", "18446744073709551616", "unknown"] {
+            let invalid = stat("S").replace("98765", started_at);
+            assert!(parse_proc_stat(&invalid).is_err());
+        }
         Ok(())
     }
 }

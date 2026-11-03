@@ -3,7 +3,7 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -130,13 +130,18 @@ fn missing_owner_fails_before_index_initialization() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn mcp_exits_when_its_default_parent_dies_with_stdin_still_open() -> Result<()> {
+fn wrapper_exit(explicit_owner: bool) -> Result<()> {
     let dir = fixture()?;
     let log = dir.path().join("server.log");
+    let mut owner = if explicit_owner {
+        Some(Process(Command::new("sleep").arg("60").spawn()?))
+    } else {
+        None
+    };
     // A dedicated process group lets the test clean up both processes on
     // failure. fd 3 keeps the background server's stdin attached to our pipe.
-    let parent = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .args(["-c", "exec 3<&0; \"$@\" <&3 & wait", "session"])
         .arg(BIN)
         .arg("--root")
@@ -145,8 +150,11 @@ fn mcp_exits_when_its_default_parent_dies_with_stdin_still_open() -> Result<()> 
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(fs::File::create(&log)?)
-        .process_group(0)
-        .spawn()?;
+        .process_group(0);
+    if let Some(owner) = &owner {
+        command.arg("--session-pid").arg(owner.0.id().to_string());
+    }
+    let parent = command.spawn()?;
     struct Family(Process);
     impl Drop for Family {
         fn drop(&mut self) {
@@ -157,7 +165,8 @@ fn mcp_exits_when_its_default_parent_dies_with_stdin_still_open() -> Result<()> 
     // Child::wait closes its stdin handle; retain ours across parent reaping.
     let _stdin = family.0.0.stdin.take().context("session stdin")?;
     let parent_pid = family.0.0.id();
-    wait_until(|| read_log(&log).contains(&format!("tracking session PID {parent_pid}")));
+    let session_pid = owner.as_ref().map_or(parent_pid, |owner| owner.0.id());
+    wait_until(|| read_log(&log).contains(&format!("tracking session PID {session_pid}")));
     let mut stdout = family.0.0.stdout.take().context("server stdout")?;
     let (sent, received) = mpsc::channel();
     thread::spawn(move || {
@@ -166,12 +175,64 @@ fn mcp_exits_when_its_default_parent_dies_with_stdin_still_open() -> Result<()> 
     });
     family.0.0.kill()?;
     family.0.0.wait()?;
+    if let Some(owner) = &mut owner {
+        thread::sleep(Duration::from_millis(5200));
+        assert!(
+            matches!(received.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "server exited with wrapper despite its live explicit owner: {}",
+            read_log(&log)
+        );
+        owner.0.kill()?;
+        owner.0.wait()?;
+    }
     // EOF on stdout proves the server exited, independent of its log message.
     received.recv_timeout(Duration::from_secs(8))??;
     let log = read_log(&log);
     assert!(
-        log.contains(&format!("session PID {parent_pid} exited; shutting down")),
+        log.contains(&format!("session PID {session_pid} exited; shutting down")),
         "{log}"
     );
+    Ok(())
+}
+
+#[test]
+fn mcp_exits_when_its_default_parent_dies_with_stdin_still_open() -> Result<()> {
+    wrapper_exit(false)
+}
+
+#[test]
+fn explicit_owner_keeps_server_alive_after_wrapper_exit() -> Result<()> {
+    wrapper_exit(true)
+}
+
+#[test]
+fn disconnected_stderr_does_not_prevent_shutdown() -> Result<()> {
+    let dir = fixture()?;
+    let mut owner = Process(Command::new("sleep").arg("60").spawn()?);
+    let mut server = Process(
+        Command::new(BIN)
+            .arg("--root")
+            .arg(dir.path())
+            .args(["--no-refresh", "serve", "--mcp", "--session-pid"])
+            .arg(owner.0.id().to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
+    let mut stderr = BufReader::new(server.0.stderr.take().context("server stderr")?);
+    let (sent, received) = mpsc::channel();
+    thread::spawn(move || {
+        let mut tracking = String::new();
+        let result = stderr.read_line(&mut tracking).map(|_| tracking);
+        drop(stderr);
+        let _ = sent.send(result);
+    });
+    let tracking = received.recv_timeout(Duration::from_secs(8))??;
+    assert!(tracking.contains("tracking session PID"), "{tracking}");
+    owner.0.kill()?;
+    owner.0.wait()?;
+    wait_until(|| server.0.try_wait().unwrap().is_some());
+    assert!(server.0.wait()?.success());
     Ok(())
 }

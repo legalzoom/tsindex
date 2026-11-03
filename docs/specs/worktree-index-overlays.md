@@ -42,7 +42,8 @@ implementation.
 
 ## Data ownership
 
-The primary checkout retains its current materialized index and watcher. A
+The primary checkout retains its materialized index. Its watcher implementation
+can be reused, but per-server ownership and failure handling need changes. A
 consistent snapshot of a ready index becomes an immutable, repository-scoped
 base generation. Several worktrees may refer to the same generation.
 
@@ -70,6 +71,9 @@ receive request(id, repo, arguments)
 
   if selected checkout belongs to the primary catalog
     use its existing runtime and source root
+    if its watcher is unavailable
+      refresh on demand before serving an indexed read
+      if refresh fails, return an explicit freshness error
   else
     open existing overlay, or prepare its first generation
     if refresh is due
@@ -155,6 +159,31 @@ the live filesystem. A file changing during ingestion must schedule another
 observation; existing body verification still handles subsequent source drift.
 Primary index updates cannot mutate a base already pinned by a worktree.
 
+## Resource exhaustion is part of the correctness contract
+
+The unchanged parent implementation was reproduced serving an old symbol
+after watcher startup failed with `EMFILE`, while a live syntax query returned
+the newly edited symbol. The MCP process remained available. This is a failure
+of freshness, not merely an inconvenient test environment. Linux can report
+`EMFILE` when the user's inotify-instance quota is exhausted even when the
+starting process has few open file descriptors. See
+[Linux's inotify allocation errors][inotify-errors].
+
+Sharing index storage does not by itself bound watcher allocation. Multiple
+agent processes must coordinate watcher ownership or use a shared service;
+resource use must not grow unchecked with the number of clients. On-demand
+refresh must remain a correctness path when notification resources are
+unavailable, with explicit failure if that refresh cannot complete. Logging
+watcher failure only to stderr is insufficient for clients relying on results.
+
+Required regressions include watcher startup failure before the initial
+refresh, loss or incomplete registration after a successful refresh, edit
+visibility through every indexed read, recovery when resources become
+available, and cleanup after owner exit.
+An exhausted watcher budget must not prevent independent worktree ingestion.
+Use deterministic failure injection or a process-local resource limit in the
+test, rather than exhausting the host's shared quota.
+
 ## Publication and lifecycle rules
 
 - Store the base identifier and effective overlay changes coherently. A query
@@ -181,14 +210,19 @@ from the MCP contract suite.
 4. Add cross-process ingestion coordination and stale-observation rejection.
 5. Remove global request waits; prove B progresses while A is deliberately
    blocked. Test independent processes and multiple requests to one server.
-6. Add safe migration and lifecycle behavior, then measure storage, first-use
+6. Bound notification ownership across clients and add watcher-failure
+   freshness and recovery tests before retaining automatic watching.
+7. Add safe migration and lifecycle behavior, then measure storage, first-use
    latency, sustained ingestion, and query latency against the parent PR.
 
 Checkout discovery, names and aliases, configuration inheritance, source
-walking, language extraction, MCP tool schemas, timeout policy, and the
-primary watcher are candidates for reuse. The full database copy, direct
-storage queries, and global dispatch locks are the main replacement points.
+walking, language extraction, MCP tool schemas, timeout policy, and watcher
+registration logic are candidates for reuse. The full database copy, direct
+storage queries, global dispatch locks, and watcher ownership/failure policy
+are the main replacement points.
 
 Before opening the stacked PR, account for the test workflow's current
 `pull_request.branches: [main]` filter: a PR targeting the parent feature branch
 otherwise receives no runs from that workflow.
+
+[inotify-errors]: https://man7.org/linux/man-pages/man2/inotify_init.2.html

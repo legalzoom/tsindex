@@ -549,6 +549,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution and validation guidance.
 
 Research on a possible worktree storage alternative is collected in the
 [overlay research](docs/research/worktree-index-overlays-prior-art.md).
+The proposed execution and baseline tests are described in the
+[overlay trace](docs/specs/worktree-index-overlays.md).
 
 For iterative work, run the CLI through Cargo so you don't have to reinstall on every change:
 

@@ -133,7 +133,8 @@ pub struct WatchArgs {
     #[arg(
         long,
         value_parser = clap::value_parser!(u32).range(1..=i32::MAX as i64),
-        help = "Owning session PID. Exit when it ends; implies --exit-with-parent."
+        conflicts_with = "exit_with_parent",
+        help = "Inspectable owning session PID. Exit when it ends instead of monitoring the parent."
     )]
     session_pid: Option<u32>,
 }
@@ -405,7 +406,7 @@ pub struct ServeCommand {
     #[arg(
         long,
         value_parser = clap::value_parser!(u32).range(1..=i32::MAX as i64),
-        help = "Owning Codex/Claude/etc. session PID. Check every 5s and exit when it ends. MCP defaults to its parent PID; HTTP only monitors an explicit session PID."
+        help = "Owning Codex/Claude/etc. session PID (must be inspectable). Check every 5s and exit when it ends. MCP defaults to its parent PID; HTTP only monitors an explicit session PID."
     )]
     session_pid: Option<u32>,
 }
@@ -1116,6 +1117,29 @@ mod tests {
                 !should_start_parent_watchdog(&cli.command),
                 "watchdog should not start for {argv:?}"
             );
+        }
+    }
+
+    #[test]
+    fn watch_rejects_conflicting_lifetime_flags() {
+        for argv in [
+            [
+                "tsindex",
+                "watch",
+                "--exit-with-parent",
+                "--session-pid",
+                "42",
+            ],
+            [
+                "tsindex",
+                "watch",
+                "--session-pid",
+                "42",
+                "--exit-with-parent",
+            ],
+        ] {
+            let error = Cli::try_parse_from(argv).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
         }
     }
 

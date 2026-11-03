@@ -14,7 +14,7 @@ static HANDLER_STARTED: Mutex<bool> = Mutex::new(false);
 struct SessionLifecycle {
     session_pid: libc::pid_t,
     tsindex_pid: u32,
-    started_at: (u64, u64),
+    started_at: Option<(u64, u64)>,
     track_parent: bool,
 }
 
@@ -34,8 +34,8 @@ impl SessionLifecycle {
         tsindex_pid: u32,
         inspect: impl FnOnce(libc::pid_t) -> io::Result<Option<(u64, u64)>>,
     ) -> Result<Option<Self>> {
-        // Preserve init/launchd and container launches. An explicit PID 1 is
-        // still a valid owner; guessing ownership after reparenting is not.
+        // Preserve init/launchd and container launches. Explicit ownership
+        // requires inspection; guessing ownership after reparenting is not safe.
         if session_pid.is_none() && parent <= 1 {
             return Ok(None);
         }
@@ -46,9 +46,17 @@ impl SessionLifecycle {
                 i32::MAX
             );
         }
-        let started_at = inspect(pid as libc::pid_t)
-            .with_context(|| format!("cannot inspect session PID {pid}"))?
-            .with_context(|| format!("session PID {pid} has already exited"))?;
+        let started_at = if session_pid.is_none() {
+            // Cross-user permissions or hidden /proc entries must not break
+            // default launches. Fall back to the original getppid-only check.
+            inspect(pid as libc::pid_t).ok().flatten()
+        } else {
+            Some(
+                inspect(pid as libc::pid_t)
+                    .with_context(|| format!("cannot inspect session PID {pid}"))?
+                    .with_context(|| format!("session PID {pid} has already exited"))?,
+            )
+        };
         Ok(Some(Self {
             session_pid: pid as libc::pid_t,
             tsindex_pid,
@@ -69,9 +77,12 @@ impl SessionLifecycle {
         if self.track_parent && parent != self.session_pid {
             return true;
         }
+        let Some(started_at) = self.started_at else {
+            return false;
+        };
         // Permission or transient inspection errors are not evidence of death.
         // A missing/zombie process or a changed start time is conclusive.
-        matches!(inspect(self.session_pid), Ok(current) if current != Some(self.started_at))
+        matches!(inspect(self.session_pid), Ok(current) if current != Some(started_at))
     }
 
     fn shutdown(&self) -> ! {
@@ -200,7 +211,7 @@ mod tests {
         .unwrap();
         assert_eq!(session.session_pid, 42);
         assert_eq!(session.tsindex_pid, 99);
-        assert_eq!(session.started_at, (123, 456));
+        assert_eq!(session.started_at, Some((123, 456)));
         assert!(session.track_parent);
         Ok(())
     }
@@ -219,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_owner_overrides_parent_including_init() -> Result<()> {
+    fn explicit_owner_overrides_parent_when_inspectable() -> Result<()> {
         for owner in [1, 7, i32::MAX as u32] {
             let session = SessionLifecycle::capture_with(Some(owner), 42, 99, |pid| {
                 assert_eq!(pid, owner as i32);
@@ -245,24 +256,52 @@ mod tests {
     }
 
     #[test]
-    fn capture_reports_missing_owner_and_inspection_failure() {
-        for requested in [None, Some(42)] {
+    fn uninspectable_inferred_parent_uses_parent_only_tracking() -> Result<()> {
+        for inspection in [
+            Ok(None),
+            Err(io::Error::from_raw_os_error(libc::EPERM)),
+            Err(io::Error::from_raw_os_error(libc::EACCES)),
+            Err(io::Error::from_raw_os_error(libc::EINTR)),
+            Err(io::Error::from_raw_os_error(libc::EIO)),
+        ] {
+            let session = SessionLifecycle::capture_with(None, 42, 99, |_| inspection)?.unwrap();
+            assert!(!session.has_ended_with(42, |_| {
+                panic!("parent-only tracking must not inspect the owner")
+            }));
+            for parent in [1, 7] {
+                assert!(session.has_ended_with(parent, |_| {
+                    panic!("reparenting must end a parent-only session without inspection")
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_owner_requires_successful_inspection() {
+        for owner in [1, 42] {
             let missing =
-                SessionLifecycle::capture_with(requested, 42, 99, |_| Ok(None)).unwrap_err();
+                SessionLifecycle::capture_with(Some(owner), 42, 99, |_| Ok(None)).unwrap_err();
             assert!(
                 missing
                     .to_string()
-                    .contains("session PID 42 has already exited")
+                    .contains(&format!("session PID {owner} has already exited"))
             );
-            let denied = SessionLifecycle::capture_with(requested, 42, 99, |_| {
-                Err(io::Error::from_raw_os_error(libc::EPERM))
-            })
-            .unwrap_err();
-            assert!(denied.to_string().contains("cannot inspect session PID 42"));
-            assert_eq!(
-                denied.downcast_ref::<io::Error>().unwrap().raw_os_error(),
-                Some(libc::EPERM)
-            );
+            for error in [libc::EPERM, libc::EACCES, libc::EINTR, libc::EIO] {
+                let denied = SessionLifecycle::capture_with(Some(owner), 42, 99, |_| {
+                    Err(io::Error::from_raw_os_error(error))
+                })
+                .unwrap_err();
+                assert!(
+                    denied
+                        .to_string()
+                        .contains(&format!("cannot inspect session PID {owner}"))
+                );
+                assert_eq!(
+                    denied.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+                    Some(error)
+                );
+            }
         }
     }
 
@@ -270,7 +309,7 @@ mod tests {
         SessionLifecycle {
             session_pid: 42,
             tsindex_pid: 99,
-            started_at: (123, 456),
+            started_at: Some((123, 456)),
             track_parent,
         }
     }

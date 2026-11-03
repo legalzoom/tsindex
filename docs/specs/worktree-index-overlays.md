@@ -1,228 +1,260 @@
-# Proposed worktree index overlays
+# Worktree index overlays
 
-Status: proposed execution trace, with baseline behavior tests implemented.
-Parent: [PR #13](https://github.com/legalzoom/tsindex/pull/13), commit
+Status: implemented on the stack over
+[PR #13](https://github.com/legalzoom/tsindex/pull/13), parent commit
 `db9dc4d684521c0b9ae9e90f03be0cb331377599`.
 
-The overlay implementation has not been added. The current branch retains the
-parent PR's runtime unchanged. Its new tests capture behavior to preserve while
-replacing copied worktree databases. See the
-[prior-art research](../research/worktree-index-overlays-prior-art.md) for the
-established mechanisms and their limitations.
+The parent supplies checkout discovery, routing, configuration inheritance,
+content checks, extraction, and tool behavior. This stack replaces fresh linked
+checkout database copies with immutable shared extraction and private deltas.
+It also removes request serialization across checkouts and makes notification
+failure recoverable through on-demand maintenance. The
+[prior-art research](../research/worktree-index-overlays-prior-art.md) records
+related implementations and the constraints they expose.
 
-## Existing behavior under test
+## Behavior preserved from the parent
 
 `tests/worktree_contract.rs` drives real MCP processes and CLI fixture builds.
-It reads no index tables and asserts no storage layout. Git worktree metadata
-is constructed locally, as in the parent PR's tests. All fixtures and logs live
-under this worktree's `target/contract-fixtures/`; child processes are killed
-and reaped even when a request or assertion fails.
+It reads no index tables and asserts no storage layout. Its four contracts were
+first committed and passed against the unchanged parent runtime, then retained
+through this implementation:
 
-Run the contract against the parent implementation with:
+- All five read tools select the same checkout by name or absolute root;
+  omitted `repo` selects the primary. Bodies and edits use live selected source.
+- Emptying, deleting, renaming, excluding, and restoring files do not resurrect
+  old symbols or references after a server restart.
+- Counts and one-result pages reflect effective checkout visibility before
+  symbol, reference, and syntax-query filters and pagination.
+- Two independent agent processes ingest separate worktrees without changing
+  each other's results or the primary checkout.
+
+Run these contracts in either checkout with:
 
 ```sh
 cargo test --locked --test worktree_contract
 ```
 
-The new baseline checks cover:
-
-- All five read tools selecting the same checkout by name or absolute root,
-  default-primary behavior, live source bodies, and worktree-local edits.
-- Emptying, deleting, renaming, excluding, and restoring files, without old
-  symbols or references resurfacing after a server restart.
-- Filtering and one-result pages for symbols, references, and syntax queries
-  after checkout changes remove matches from the primary's original files.
-- Two independent agent processes ingesting edits in separate worktrees and
-  leaving each other's results and the primary checkout unchanged.
-
-The last check establishes concurrent process correctness. It does not prove
-that a stalled refresh cannot delay another checkout within one server; that
-is a new guarantee requiring a deterministic regression test during the
-implementation.
+Fixtures, logs, and test databases live under worktree-local `target/` paths.
+Child processes are killed and reaped on success and failure.
 
 ## Data ownership
 
-The primary checkout retains its materialized index. Its watcher implementation
-can be reused, but per-server ownership and failure handling need changes. A
-consistent snapshot of a ready index becomes an immutable, repository-scoped
-base generation. Several worktrees may refer to the same generation.
+The primary keeps its materialized index. One consistent snapshot of a ready
+main index becomes a fixed base under
+`<main>/.tsindex/bases/extraction-v<schema>.db`. It is an additional full copy,
+shared by all compatible fresh linked checkouts. Primary updates never mutate
+that artifact. The completed base records a SHA-derived snapshot identity;
+each overlay persists both the base path and that identity. Every attachment
+verifies the identity before returning rows. Recreating a same-schema file at
+the same path cannot silently rebase an existing overlay.
 
-Each linked worktree owns a writable SQLite overlay, its file metadata,
-replacement extractions, deletion or exclusion markers, and its base pin.
-Worktrees never share the mutable overlay database. An optional immutable
-content cache may later reuse extraction across changed-file versions.
+Each linked checkout owns a writable `.tsindex/index.db` containing its base
+pin, per-path observations, whole-file replacement extraction, and hidden
+markers. Unchanged files reuse base extraction only after local content and
+language match. A changed file replaces all base extraction for its path even
+when the new extraction is empty. Deleted or excluded paths disappear from the
+logical index. Base IDs and private IDs occupy separate namespaces.
 
-An unchanged file uses base extraction. A changed file replaces all base
-extraction for that relative path, including when its new extraction is empty.
-A deletion or exclusion hides the path completely. Base and overlay row IDs
-remain separate namespaces.
+Transient command language filters do not restrict overlay publication: its
+reconciliation includes every configured language so source validation checks
+a complete logical generation. Query/result filters still apply, and unknown
+repository or unsupported language selectors retain their existing errors.
+
+The overlay domain is one workspace rooted at that checkout. Multi-repo
+catalogs and outside source roots use materialized storage. Existing
+materialized worktree caches stay materialized; this stack does not silently
+convert them. A future content-addressed extraction cache, base rebase,
+compaction, and garbage collection remain separate work.
 
 ## Request pseudotrace
 
 ```text
 receive request(id, repo, arguments)
-  resolve checkout using the parent's discovery and naming rules
-    missing repo argument -> original primary catalog
-    unknown checkout -> existing invalid-parameters error
+  schedule within the transport's bounded worker pool
+  discover and resolve the checkout using the parent's naming rules
+    missing repo -> primary catalog
+    unknown checkout -> invalid-parameters error with known checkouts
 
-  acquire registry lock
-    find or create that checkout's coordinator handle
-  release registry lock
+  primary selection:
+    if automatic maintenance is enabled
+      ensure a watcher owner exists when this is an MCP server
+      reuse a configuration-matched full-refresh marker within the interval
+      otherwise coalesce and run a full on-demand reconciliation
+      failed reconciliation -> explicit freshness error
 
-  if selected checkout belongs to the primary catalog
-    use its existing runtime and source root
-    if its watcher is unavailable
-      refresh on demand before serving an indexed read
-      if refresh fails, return an explicit freshness error
-  else
-    open existing overlay, or prepare its first generation
-    if refresh is due
-      join or schedule that checkout's refresh job
-      wait under the existing timeout/retry policy
-      keep other checkout requests and ingestion runnable
+  linked checkout selection:
+    obtain its coordinator under the short registry lock, then release it
+    if a refresh is due
+      start or join that checkout's ingestion job
+      wait on its condition variable, releasing its entry lock while waiting
+      timeout after 30 seconds -> retryable busy result; ingestion may continue
+    another checkout's coordinator remains independent
 
-    begin a read transaction on the overlay
-      read its published generation and pinned base identifier
-      retain the immutable base for this read's lifetime
-      resolve effective files and extraction for this checkout
+  open the selected index's SQLite read transaction
+    read the committed base pin before attaching immutable base extraction
+    require the attached base's persisted identity to match that pin
+    expose effective files, symbols, and references through local views
+    hide replaced/deleted/excluded base paths before filters and pagination
 
-  dispatch the existing tool through that checkout's read view
-    suppress replaced/deleted/excluded base paths first
-    then apply predicates, counts, ordering, and pagination
-    bodies and edits always resolve against the selected source root
-  return response(id)
-  release the read view and base lifetime pin
+  dispatch the existing tool using the selected live source root
+  frame response(id) through the transport's serialized output writer
+  drop the read connection to release its snapshot
 ```
 
-The MCP input loop must remain able to receive and schedule another request
-while one request waits for ingestion. Responses retain request IDs. HTTP
-dispatch must similarly release its current global runtime lock. Changing the
-database layout alone does not remove either request-serialization point.
+MCP and HTTP use four workers and queues of 16 pending requests. Responses may
+complete out of arrival order and retain their request IDs. HTTP tool execution
+uses a runtime snapshot without retaining the configuration lock. A bounded
+pool can be occupied by several slow requests; independence is not an
+unbounded-worker guarantee.
 
 ## First use pseudotrace
 
 ```text
 prepare_checkout(checkout)
-  preserve its existing configuration and effective language/ignore rules
-  find a compatible immutable base from the same Git repository
-    if none exists
-      prepare a consistent base snapshot in a private temporary location
-      close/checkpoint it and publish only a complete immutable artifact
-      concurrent creators may produce equivalent bases safely
+  preserve existing configuration or inherit the parent's effective rules
+  acquire this database's cross-process writer lease
+  recheck existence under that lease
+    existing materialized index -> preserve its format
+    unsupported configuration or no ready main source -> ordinary standalone
 
-  create a private overlay with a persistent pin on that base
-  enumerate this checkout's eligible source files
-    stat/hash local files to establish identity across checkout roots
-    reuse base extraction only when language, content, and extractor match
-    parse only new or changed content
-    record paths missing or excluded here as hidden
-  publish the first complete checkout generation
+  find a compatible immutable base in the same Git repository
+    none exists:
+      copy the ready main database into a private scratch file using Backup
+      persist its SHA-derived snapshot identity before publication
+      close/checkpoint the copy and publish it with a create-only hard link
+      reuse the completed winner if another creator published first
+
+  initialize private overlay metadata and its persistent base pin
+  run the normal complete checkout reconciliation
+    walk local eligible source files
+    hash to establish identity across different checkout roots
+    reuse matching base extraction; parse changed or new content
+    hide missing and excluded base paths
+  publish the first ready generation
 ```
 
-This retains the parent's important content-identity check. Sharing a base
-removes the per-worktree database copy, not the initial reconciliation cost.
-If a base omits files eligible in this checkout, they become overlay additions.
-Dirty files in the primary do not define another worktree's contents.
+The hard link is to a completed immutable copy, never to a live mutable SQLite
+database. Sharing removes repeated full extraction storage and parsing, but
+first use still walks and checks local files. Dirty files in the main checkout
+cannot substitute for the selected checkout's bytes.
+
+If the main index is unready or unavailable on first use, the checkout builds
+a standalone materialized index. It stays materialized when the main index
+later becomes ready: availability does not depend on main-index preparation,
+and there is no automatic later conversion of existing caches.
 
 ## Concurrent ingestion pseudotrace
 
 ```text
 refresh(checkout_A)
-  acquire coordinator ownership scoped to checkout A
-    use cross-process coordination when multiple servers target A
-    coalesce duplicate refresh requests
-
-  capture the current published generation
-  discover eligible additions, changes, removals, and exclusions
-  parse distinct changed files in a bounded worker pool
-    perform file reads and parsing outside SQLite write transactions
-    associate each result with its observed source identity/version
-
-  revalidate candidates and the generation they were prepared against
-    discard/requeue stale observations
-    never publish an old result over a newer accepted observation
-
-  begin A's overlay write transaction
-    apply replacement extraction, including empty extraction
-    apply deletion/exclusion markers and local file metadata
-    publish the new complete generation
-  commit
-  release A's coordinator ownership
+  acquire A's database writer lease before reading or parsing
+  copy only A's thin overlay into a private stage
+  expose merged base/stage views to the reused extraction pipeline
+  reconcile additions, changes, deletions, exclusions, and restores
+    unchanged extraction stays in the immutable base
+    replacements have whole-file authority, including empty extraction
+  validate source timestamps, sizes, and hashes across the logical checkout
+    source changed during preparation -> discard stage and report retry
+    partial extraction failure -> retain prior published state
+  unchanged effective state -> skip redundant publication
+  otherwise publish the complete stage with SQLite online Backup
+  release A's writer lease
 
 refresh(checkout_B)
-  execute the same flow against B's own coordinator and database
-  proceed independently of A's parsing or publication
+  perform the same cycle under B's independent lease
+  parse and publish while A is still preparing or waiting
 ```
 
-Readers see a committed logical index generation, not an atomic snapshot of
-the live filesystem. A file changing during ingestion must schedule another
-observation; existing body verification still handles subsequent source drift.
-Primary index updates cannot mutate a base already pinned by a worktree.
+The lease covers the complete read-stage-parse-validate-publish cycle across
+processes, so an older per-file parse cannot finish after a newer accepted
+publication in the same checkout. Cooperative symbol edits also serialize
+under the checkout's writer lease. External editors do not acquire that lease;
+source validation and the existing stale-body checks still apply.
 
-## Resource exhaustion is part of the correctness contract
+Publication uses a destination SQLite transaction in the stable live WAL
+database. An existing reader keeps the old complete snapshot; a new reader sees
+the new complete state. Dropping an incomplete backup rolls back the destination
+transaction. Stages and their sidecars are cleaned up after use. No mutable
+SQLite database is renamed over a live pathname.
 
-The unchanged parent implementation was reproduced serving an old symbol
-after watcher startup failed with `EMFILE`, while a live syntax query returned
-the newly edited symbol. The MCP process remained available. This is a failure
-of freshness, not merely an inconvenient test environment. Linux can report
-`EMFILE` when the user's inotify-instance quota is exhausted even when the
-starting process has few open file descriptors. See
-[Linux's inotify allocation errors][inotify-errors].
+A logical generation is an index snapshot, not an atomic filesystem snapshot.
+A later source edit requires another observation. Bodies continue to verify
+live content before returning indexed ranges.
 
-Sharing index storage does not by itself bound watcher allocation. Multiple
-agent processes must coordinate watcher ownership or use a shared service;
-resource use must not grow unchecked with the number of clients. On-demand
-refresh must remain a correctness path when notification resources are
-unavailable, with explicit failure if that refresh cannot complete. Logging
-watcher failure only to stderr is insufficient for clients relying on results.
+Complete content-hash verification also runs for unchanged reconciliation;
+only extraction parsing is limited to changed files. Any encountered source
+read or extraction failure prevents freshness success, and an overlay does not
+publish a partial replacement generation. Managed reads fail until a complete
+refresh succeeds. A source changing during reconciliation returns a retryable
+tool error with no overlay publication; continuous external editing can require
+repeated retries. These availability and latency costs are deliberate, while
+the primary's explicit `--no-refresh` opt-out remains supported.
 
-Required regressions include watcher startup failure before the initial
-refresh, loss or incomplete registration after a successful refresh, edit
-visibility through every indexed read, recovery when resources become
-available, and cleanup after owner exit.
-An exhausted watcher budget must not prevent independent worktree ingestion.
-Use deterministic failure injection or a process-local resource limit in the
-test, rather than exhausting the host's shared quota.
+## Notification resources and freshness
 
-## Publication and lifecycle rules
+The parent was reproduced serving an old indexed symbol after watcher startup
+failed with `EMFILE`, while a live syntax query returned the newly edited
+symbol. The process remained responsive. Linux can report `EMFILE` when the
+user's inotify-instance quota is exhausted even when that process has few open
+file descriptors. See [Linux's inotify allocation errors][inotify-errors].
 
-- Store the base identifier and effective overlay changes coherently. A query
-  must not combine a new base with an overlay prepared for an older one.
-- Keep persistent worktree pins and active-reader lifetimes. An in-process
-  reference count alone cannot protect bases used by another process.
-- Prepare compaction or rebasing separately. Publish only if the checkout
-  generation used to prepare it is still current, otherwise retry.
-- Keep existing materialized worktree indexes usable during migration. Prepare
-  replacement state separately and retain the old index if preparation fails.
-- Do not add automatic base deletion or rebasing before their crash and reader
-  lifetime tests pass. These are separate implementation slices.
+MCP servers with compatible database/configuration share watcher ownership
+through a process-safe lease. Ownership releases on process exit. A failed
+watcher retries, and another server may take over; reads can always use
+on-demand reconciliation. HTTP uses that reconciliation without a watcher.
+Explicit `--no-refresh` opts the primary out of automatic maintenance, while
+linked-checkout selection retains its on-demand refresh behavior.
 
-## Implementation sequence after trace review
+A successful full-refresh marker is configuration- and generation-matched,
+checked again after acquiring the cross-process refresh coordinator lease.
+Only a successful complete build advances it. Targeted path updates and
+partial repo builds cannot postpone reconciliation of a missing notification
+route. Even a healthy watcher does not bypass the bounded full-refresh check.
+Failure to establish freshness is returned to the caller.
 
-Each step adds one failing behavioral or storage-interface test, implements
-that slice, and reruns the baseline contract. Storage-specific assertions will
-belong at an explicit storage interface, rather than inspecting SQLite tables
-from the MCP contract suite.
+Linked checkout scans also coalesce across compatible processes through the
+durable marker and coordinator lease. A reused marker retains its original
+age in the local cache, so a second interval is not added to its freshness
+window. Zero intervals reconcile every request; explicit builds remain forced.
 
-1. Introduce the checkout read-view seam, retaining the copied-index adapter.
-2. Add immutable base publication and a private overlay for one checkout.
-3. Implement full-file authority, deletions, exclusions, and effective paging.
-4. Add cross-process ingestion coordination and stale-observation rejection.
-5. Remove global request waits; prove B progresses while A is deliberately
-   blocked. Test independent processes and multiple requests to one server.
-6. Bound notification ownership across clients and add watcher-failure
-   freshness and recovery tests before retaining automatic watching.
-7. Add safe migration and lifecycle behavior, then measure storage, first-use
-   latency, sustained ingestion, and query latency against the parent PR.
+Deterministic tests inject inotify allocation failure into a child process,
+exercise watcher recovery and lease handover, and hold one checkout's writer
+lease while proving another progresses. They do not exhaust the host's shared
+watch budget or change system limits.
 
-Checkout discovery, names and aliases, configuration inheritance, source
-walking, language extraction, MCP tool schemas, timeout policy, and watcher
-registration logic are candidates for reuse. The full database copy, direct
-storage queries, global dispatch locks, and watcher ownership/failure policy
-are the main replacement points.
+## Compatibility and lifecycle
 
-Before opening the stacked PR, account for the test workflow's current
-`pull_request.branches: [main]` filter: a PR targeting the parent feature branch
-otherwise receives no runs from that workflow.
+- Published overlays have a distinct schema version and physical extraction
+  table names. Parent indexed readers reject them; parent raw queries fall
+  back to a complete live walk instead of treating the delta as a full index.
+- Existing materialized worktree caches remain supported and retain their
+  previous storage. A missing or incompatible base, or changed configuration
+  outside the single-checkout domain, triggers a separately prepared standalone
+  rebuild. Failed preparation leaves the old published bytes intact.
+  Explicit changes to a configured workspace's name or root that no longer
+  match the stored overlay workspace also use this cold-rebuild path.
+- An absent or mismatched base identity refuses reads with rebuild guidance;
+  ordinary reconciliation or an explicit build cold-recovers the checkout.
+  Already pinned readers retain their original base. Older bases without an
+  identity record stay untouched, and fresh checkouts use standalone storage.
+- Bases are deliberately retained. Persistent checkout pins and active readers
+  in other processes require a reclamation protocol beyond an in-process count.
+  There is no automatic base deletion, rebase, or compaction in this stack.
+- To downgrade, stop servers using affected caches and regenerate their derived
+  indexes with the older binary, preserving configuration. Overlay formats are
+  not backward-compatible materialized caches.
+
+## Validation and evidence
+
+The unchanged MCP contracts and original worktree tests preserve user-visible
+behavior. Storage-interface tests cover thin extraction, snapshot retention,
+whole-file authority, reuse on restore, missing-base recovery, incompatible
+configurations, and legacy-reader fencing. Transport tests exercise deliberate
+out-of-order completion, bounded queues, configuration publication, EOF, and
+broken output; maintenance tests cover fallback, ownership, and coordination.
+
+See [measurement notes](../benchmarks/worktree-overlays.md) for the reproducible
+synthetic comparison. The test workflow runs on pull requests targeting feature
+branches as well as `main`, allowing the stacked PR to receive ordinary CI.
 
 [inotify-errors]: https://man7.org/linux/man-pages/man2/inotify_init.2.html

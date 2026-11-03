@@ -53,6 +53,8 @@ pub struct ServerConfig {
     pub http_port: u16,
     #[serde(default = "default_query_timeout_ms")]
     pub query_timeout_ms: u64,
+    #[serde(default = "default_worktree_refresh_ms")]
+    pub worktree_refresh_ms: u64,
     #[serde(default = "default_result_limit")]
     pub default_result_limit: usize,
     #[serde(default = "default_max_result_limit")]
@@ -79,6 +81,7 @@ impl Default for ServerConfig {
             mcp_port: 0,
             http_port: default_http_port(),
             query_timeout_ms: default_query_timeout_ms(),
+            worktree_refresh_ms: default_worktree_refresh_ms(),
             default_result_limit: default_result_limit(),
             max_result_limit: default_max_result_limit(),
             default_body_line_limit: default_body_line_limit(),
@@ -94,6 +97,10 @@ fn default_http_port() -> u16 {
 }
 
 fn default_query_timeout_ms() -> u64 {
+    2_000
+}
+
+fn default_worktree_refresh_ms() -> u64 {
     2_000
 }
 

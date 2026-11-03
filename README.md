@@ -190,9 +190,9 @@ configured repo(s), compares files against the existing index, indexes new or
 changed files, skips unchanged files, and purges rows for files that were
 deleted or are no longer indexable. Index-backed CLI commands (`symbol`,
 `outline`, `enclosing`, and `refs`) read the existing SQLite index; they do not
-refresh it on every query. `query` is the exception: it reads live source files,
-not the index, so it works without a prior `build` and does not gate on the
-initial index completing.
+refresh it on every query. `query` reads live source contents using indexed
+file candidates when the index is ready. Before the first build it falls back
+to a live walk, so it remains usable without a prior `build`.
 
 `serve` (HTTP) runs one incremental refresh at startup so sessions begin from a
 fresh index; keep `watch` running alongside it for long-lived HTTP sessions.
@@ -239,6 +239,31 @@ tsindex --root /path/to/catalog refs authenticate_user --repo auth
 tsindex --root /path/to/catalog query '(function_definition name: (identifier) @fn)' --language python --repo auth
 ```
 
+## Linked Git worktrees
+
+MCP and HTTP servers discover linked worktrees from Git metadata, including
+worktrees created after startup. In a linked worktree, pass
+`repo=<worktree directory name>` or its absolute root. Omitting `repo` keeps
+queries in the server's primary catalog; results are never merged across
+checkouts. Unknown names return an error listing known repos and index status.
+
+Each used checkout keeps its own `.tsindex/`. Its first request seeds from the
+main checkout's index using a consistent SQLite backup, then updates changed
+files. Files with identical content only need metadata updates. A server
+started in a fresh linked checkout also seeds from the main index. Unused
+worktrees get no index or watcher. Additional worktrees refresh on demand at
+most once every `worktree_refresh_ms` (default 2000 ms); requests wait up to
+30 seconds for a refresh and can retry if it is still running.
+
+Names that collide use `<basename>@<git-worktree-id>`; the main checkout uses
+`@main`. `tsindex worktrees --json` lists the resolved names, paths, index status,
+and last update times. The HTTP `/repos` endpoint includes the same worktrees.
+
+```bash
+tsindex --root /path/to/main worktrees
+tsindex --root /path/to/main worktrees --json
+```
+
 ---
 
 ## CLI commands
@@ -252,7 +277,8 @@ tsindex --root /path/to/catalog query '(function_definition name: (identifier) @
 - `outline`: Returns the structure of one file without dumping the full file. Pass `--body-for <name>` (repeatable) to inline selected symbol bodies in the same call.
 - `enclosing`: Finds the symbol range that contains a file position. Accepts several rows to resolve a whole stack trace / hunk set in one call.
 - `refs`: Finds syntactic identifier occurrences (not binding-aware semantic references), batched and paginated.
-- `query`: Runs a raw tree-sitter query for one language.
+- `query`: Runs a raw tree-sitter query for one or more languages.
+- `worktrees`: Lists checkout names, paths, index status, and last update times.
 - `repos`: Lists, adds, and removes repos in the catalog.
 - `serve`: Starts the MCP or HTTP server.
 
@@ -281,8 +307,8 @@ tsindex query '(function_definition name: (identifier) @fn)' --language python -
 - `--root`: Workspace root to index or query.
 - `--db`: Override the SQLite database path.
 - `--languages <lang>`: Restrict work to one or more explicit languages
-  (repeatable). `query` has its own required `--language <lang>` selecting the
-  grammar to run the pattern with.
+  (repeatable). `query` accepts either `--language <lang>` or repeated
+  `--languages <lang>` options to query several grammars.
 - `--json`: Emit JSON output for CLI commands.
 - `--no-refresh`: Skip the one-time incremental refresh before `serve` starts
   (and, under `serve --mcp`, the in-process watcher).
@@ -367,6 +393,7 @@ Server limits are configurable under
 [server]
 http_port = 7337
 query_timeout_ms = 2000
+worktree_refresh_ms = 2000
 default_result_limit = 200
 max_result_limit = 300
 default_body_line_limit = 120
@@ -400,6 +427,21 @@ During the initial background build, the indexed read tools (`get_symbol`,
 `index is not ready` error instead of treating an incomplete index as an
 authoritative empty result. `query` is exempt — it reads live files, so it
 returns results immediately even before the first build finishes.
+
+Read responses include `diagnostics` only when a valid request needs attention.
+A bare `scope` or `file_glob` accepts a file or directory, including `./dir`,
+`dir/`, and absolute paths inside the selected repository. A typo that matches
+no indexed files emits `filter_matched_no_files`. `get_symbol` rejects unknown
+kinds and reports `kind_filtered_out` with the found kind counts when a kind
+removes every candidate for a requested name. `enclosing_symbol` always emits
+`matches`; an empty column lookup retries by row with `col_ignored`, and a
+top-level row reports `no_enclosing_symbol`. Omit `col` unless needed.
+
+MCP `query` accepts `languages: ["typescript", "tsx"]` alongside `language`.
+Compilation failures in a language array emit `query_compile_failed` while
+other languages continue. Indexed candidates and required equality literals
+avoid unrelated parsing. Responses report `files_scanned` and `files_parsed`;
+timeout errors also report `files_scanned`.
 
 Raw `query` responses set `truncated` when execution stops before all captures are returned. If this
 was caused by the configured query timeout instead of the result limit, the response also includes

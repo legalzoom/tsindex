@@ -20,6 +20,8 @@ use crate::index::{
     ReplaceSymbolArgs, Runtime,
 };
 
+use crate::worktrees::Runtimes;
+
 static PARENT_WATCHDOG_STARTED: AtomicBool = AtomicBool::new(false);
 
 pub fn serve_mcp(runtime: Runtime) -> Result<()> {
@@ -32,6 +34,8 @@ pub fn serve_mcp(runtime: Runtime) -> Result<()> {
 /// The stdio JSON-RPC loop, split from `serve_mcp` so tests can drive it with
 /// an in-memory reader/writer.
 fn serve_mcp_io(runtime: &Runtime, input: impl BufRead, mut output: impl Write) -> Result<()> {
+    let runtimes = Runtimes::new(runtime.clone());
+    let runtime = &runtimes;
     // Read raw bytes: one non-UTF-8 byte from the client must not end the
     // session, but it must not be decoded lossily either (U+FFFD substitution
     // could turn a corrupt request into a different, valid one). Answer with a
@@ -122,9 +126,9 @@ fn parent_watchdog_shutdown_message(initial: libc::pid_t, current: libc::pid_t) 
     format!("tsindex: parent {initial} exited (now reparented to {current}); shutting down")
 }
 
-fn handle_json_rpc_line(runtime: &Runtime, line: &str) -> Result<Option<Value>> {
+fn handle_json_rpc_line(runtime: &Runtimes, line: &str) -> Result<Option<Value>> {
     Ok(match serde_json::from_str::<Value>(line) {
-        Ok(request) => handle_request(runtime, request)?,
+        Ok(request) => handle_request_with_runtimes(runtime, request)?,
         Err(error) => Some(json_rpc_error(
             None,
             -32700,
@@ -165,7 +169,7 @@ pub fn serve_http(runtime: Runtime, bind: &str, port: u16, allowed_hosts: &[Stri
         .with_context(|| format!("failed to bind http server on {bind}:{port}"))?;
     let bound_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
     eprintln!("tsindex http server listening on http://{bind}:{bound_port}");
-    let runtime = Arc::new(Mutex::new(runtime));
+    let runtime = Arc::new(Mutex::new(Runtimes::new(runtime)));
     let allowed_hosts = Arc::new(allowed_hosts.to_vec());
     for stream in listener.incoming() {
         let stream = stream?;
@@ -185,7 +189,7 @@ pub fn serve_http(runtime: Runtime, bind: &str, port: u16, allowed_hosts: &[Stri
 /// socket politely. The request is read without holding the runtime lock, so
 /// a slow client does not block other connections' tool calls.
 fn handle_http_connection(
-    runtime: &Mutex<Runtime>,
+    runtime: &Mutex<Runtimes>,
     mut stream: TcpStream,
     bound_port: u16,
     allowed_hosts: &[String],
@@ -208,7 +212,7 @@ fn handle_http_connection(
 }
 
 fn serve_http_request(
-    runtime: &Mutex<Runtime>,
+    runtime: &Mutex<Runtimes>,
     stream: &mut TcpStream,
     bound_port: u16,
     allowed_hosts: &[String],
@@ -541,6 +545,10 @@ fn write_http_bytes_response(
 /// Public so integration tests can assert on the exact wire payload the
 /// MCP client receives (e.g. the dropped `structuredContent` duplicate).
 pub fn handle_request(runtime: &Runtime, request: Value) -> Result<Option<Value>> {
+    handle_request_with_runtimes(&Runtimes::new(runtime.clone()), request)
+}
+
+pub fn handle_request_with_runtimes(runtime: &Runtimes, request: Value) -> Result<Option<Value>> {
     let id = request.get("id").cloned();
     let Some(method) = request.get("method").and_then(Value::as_str) else {
         return Ok(Some(json_rpc_error(id, -32600, "missing method")));
@@ -684,7 +692,7 @@ fn tool_list(writable: bool) -> Value {
 /// (invalid params) / HTTP 400 instead of an internal-error code, letting
 /// clients tell "I passed the wrong thing" from "the server broke".
 #[derive(Debug)]
-struct InvalidParams(String);
+pub(crate) struct InvalidParams(pub(crate) String);
 
 impl std::fmt::Display for InvalidParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -706,7 +714,53 @@ fn is_invalid_params(error: &anyhow::Error) -> bool {
     error.downcast_ref::<InvalidParams>().is_some()
 }
 
-fn call_tool(runtime: &Runtime, name: &str, arguments: Value, writable: bool) -> Result<Value> {
+fn call_tool(
+    runtimes: &Runtimes,
+    name: &str,
+    mut arguments: Value,
+    writable: bool,
+) -> Result<Value> {
+    let repo = match arguments.get("repo") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(repo)) => Some(repo.as_str()),
+        Some(_) => return Err(InvalidParams("repo must be a string".into()).into()),
+    };
+    let (runtime, repo) = runtimes.resolve(repo)?;
+    if let Some(repo) = repo {
+        arguments["repo"] = Value::String(repo);
+    }
+    let mut result = dispatch_tool(&runtime, name, arguments, writable)?;
+    // Keep returned repo identifiers usable as inputs even when a basename
+    // collision disambiguates an existing index's stored repo name.
+    let aliases = runtimes.repo_aliases(&runtime)?;
+    if !aliases.is_empty() {
+        rewrite_repo_names(&mut result, &aliases);
+    }
+    Ok(result)
+}
+
+fn rewrite_repo_names(value: &mut Value, aliases: &std::collections::HashMap<String, String>) {
+    match value {
+        Value::Object(fields) => {
+            if let Some(repo) = fields.get_mut("repo")
+                && let Some(alias) = repo.as_str().and_then(|name| aliases.get(name))
+            {
+                *repo = Value::String(alias.clone());
+            }
+            for value in fields.values_mut() {
+                rewrite_repo_names(value, aliases);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                rewrite_repo_names(value, aliases);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn dispatch_tool(runtime: &Runtime, name: &str, arguments: Value, writable: bool) -> Result<Value> {
     let result = match name {
         "get_symbol" => {
             let args: GetSymbolArgs = tool_args(arguments)?;
@@ -779,28 +833,7 @@ fn call_tool(runtime: &Runtime, name: &str, arguments: Value, writable: bool) ->
 }
 
 fn handle_repos_list(runtime: &Runtime) -> Result<Value> {
-    let workspaces = runtime.workspaces()?;
-    let conn = rusqlite::Connection::open(&runtime.db_path).ok();
-    let repos: Vec<Value> = workspaces
-        .into_iter()
-        .map(|w| {
-            let indexed = conn.as_ref().is_some_and(|c| {
-                c.query_row(
-                    "SELECT COUNT(*) FROM files f JOIN repos r ON r.id = f.repo_id WHERE r.name = ?1",
-                    [&w.name],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap_or(0)
-                    > 0
-            });
-            json!({
-                "name": w.name,
-                "path": w.root.to_string_lossy(),
-                "indexed": indexed,
-            })
-        })
-        .collect();
-    Ok(json!({ "repos": repos }))
+    Ok(json!({ "repos": Runtimes::new(runtime.clone()).list()? }))
 }
 
 fn handle_dashboard_data(runtime: &Runtime) -> Result<Value> {
@@ -2408,7 +2441,7 @@ mod tests {
         );
 
         let error = call_tool(
-            &runtime,
+            &Runtimes::new(runtime),
             "replace_symbol",
             json!({ "file": "x.py", "name": "f", "new_body": "" }),
             false,
@@ -2499,7 +2532,7 @@ mod tests {
             Vec::new(),
         );
 
-        let response = handle_json_rpc_line(&runtime, "{not json")?
+        let response = handle_json_rpc_line(&Runtimes::new(runtime), "{not json")?
             .expect("malformed JSON should return a JSON-RPC response");
 
         assert_eq!(response["id"], Value::Null);
@@ -2756,7 +2789,7 @@ mod tests {
 
         let server = std::thread::spawn(move || -> Result<()> {
             let (stream, _) = listener.accept()?;
-            handle_http_connection(&Mutex::new(runtime), stream, bound_port, &[])?;
+            handle_http_connection(&Mutex::new(Runtimes::new(runtime)), stream, bound_port, &[])?;
             Ok(())
         });
 
@@ -2922,7 +2955,7 @@ mod tests {
         let bound_port = listener.local_addr()?.port();
         let server = std::thread::spawn(move || -> Result<()> {
             let (stream, _) = listener.accept()?;
-            handle_http_connection(&Mutex::new(runtime), stream, bound_port, &[])?;
+            handle_http_connection(&Mutex::new(Runtimes::new(runtime)), stream, bound_port, &[])?;
             Ok(())
         });
         let mut client = TcpStream::connect(("127.0.0.1", bound_port))?;
@@ -2944,6 +2977,23 @@ mod tests {
 
     fn status_line(response: &str) -> &str {
         response.lines().next().unwrap_or_default()
+    }
+
+    #[test]
+    fn http_unknown_repo_is_invalid_params_and_lists_known_repos() -> Result<()> {
+        let body = r#"{"name":"get_symbol","arguments":{"name":"target","repo":"does-not-exist"}}"#;
+        let response = http_roundtrip(&format!(
+            "POST /tools/call HTTP/1.1\r\nHost: localhost:{{port}}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ))?;
+        assert!(
+            status_line(&response).starts_with("HTTP/1.1 400 "),
+            "{response}"
+        );
+        assert!(response.contains("unknown repo"));
+        assert!(response.contains("known repos:"));
+        assert!(response.contains("indexed=false"));
+        Ok(())
     }
 
     #[test]
@@ -3117,7 +3167,7 @@ mod tests {
         let bound_port = listener.local_addr()?.port();
         let server = std::thread::spawn(move || -> Result<()> {
             let (stream, _) = listener.accept()?;
-            handle_http_connection(&Mutex::new(runtime), stream, bound_port, &[])?;
+            handle_http_connection(&Mutex::new(Runtimes::new(runtime)), stream, bound_port, &[])?;
             Ok(())
         });
         let mut client = TcpStream::connect(("127.0.0.1", bound_port))?;

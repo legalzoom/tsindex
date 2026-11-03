@@ -5,9 +5,9 @@
   "properties": {
     "name": { "type": "string", "description": "A single symbol name. Provide this or `names`." },
     "names": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Several symbol names to fetch in ONE call. Prefer this when you need multiple symbols — it batches the lookups and saves round-trips. Distinguish results by each match's `name` field." },
-    "repo": { "type": "string" },
+    "repo": { "type": "string", "description": "Configured repo name, linked worktree directory name, or absolute checkout root. Unknown names return an error listing known repos and index status. Omit to use the primary catalog." },
     "kind": { "type": "string" },
-    "file_glob": { "type": "string" },
+    "file_glob": { "type": "string", "description": "File, directory, or glob. Bare directories include descendants; absolute paths must be inside a selected repo. A filter matching no indexed files emits filter_matched_no_files." },
     "include_body": { "type": "boolean", "description": "When true, each match includes its verbatim source `body` — for understanding a symbol. It cannot be used to skip Edit's required file read; to rewrite a whole symbol without reading, use replace_symbol." },
     "context_lines": { "type": "integer", "minimum": 0 },
     "max_body_lines": { "type": "integer", "minimum": 1, "description": "Keep this many source lines per returned `body`, eliding the middle with an additional `… N lines elided …` marker line that reports the true line count. The serialized body may therefore contain up to `max_body_lines + 1` lines. Omit to use `default_body_line_limit`; explicit values are clamped to `max_body_line_limit`." },

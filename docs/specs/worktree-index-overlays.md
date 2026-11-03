@@ -94,6 +94,8 @@ receive request(id, repo, arguments)
     read the committed base pin before attaching immutable base extraction
     require the attached base's persisted identity to match that pin
     expose effective files, symbols, and references through local views
+    matching directory generation -> seek persisted effective file metadata
+    absent/stale directory -> merged files until the next writer rebuilds it
     hide replaced/deleted/excluded base paths before filters and pagination
 
   dispatch the existing tool using the selected live source root

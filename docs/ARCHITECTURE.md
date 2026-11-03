@@ -59,10 +59,25 @@ file.
 
 The base branches of the symbol and reference views join base files directly
 and apply the same visibility predicates, avoiding a second effective-files
-materialization inside those views. The runtime's outer join still materializes
-the complete effective-files view once for a named symbol or reference lookup.
-That retains work proportional to the base file count; selective lookup
-scalability is a remaining limitation of this implementation.
+materialization inside those views. Each private overlay also persists an
+`overlay_file_directory` with resolved file metadata, indexed by signed logical
+file ID and relative path. The `files` read view selects that directory when
+its version and generation match the extraction state. Existing tool SQL can
+then seek matching files rather than materialize the full file catalog for
+each named lookup. Symbols, references, and visibility predicates are unchanged.
+
+The directory is derived from private files, base files, and authority records.
+File upserts, metadata observations, restores, and deletions maintain it in the
+same private-stage transactions. Only a completed build stamps its generation;
+the existing online backup publishes the directory with the facts. Readers
+continue to pin one consistent generation. Existing overlays, or overlays
+published by an older writer that does not maintain the directory, fall back
+to the original merged file view when the directory is absent or stale. The
+next new writer rebuilds it before publication without reparsing unchanged
+files. This adds per-checkout file metadata and staging bytes while retaining
+the existing extraction format, reconciliation, and source verification. See
+the [directory ADR](adrs/0003-effective-file-directory.md) and
+[measurement](benchmarks/worktree-file-directory.md).
 
 All writers for one database take the same cross-process lease before reading
 input state or parsing. Refresh copies only the thin overlay into a private

@@ -1,5 +1,8 @@
 # Worktree overlay measurement
 
+These results describe PR15 before the
+[effective file directory experiment](worktree-file-directory.md).
+
 `bench/worktree_overlays.py` compares the PR #13 binary with this stack on
 fresh, real Git worktrees. It uses synthetic Python sources and actual MCP
 requests, checking each checkout's initial body, a later one-file edit, and

@@ -264,6 +264,14 @@ an older checkout's index. First use still walks and checks local content, so
 a dirty primary cannot supply another
 checkout's bodies. Bodies and edits always use the selected checkout's source.
 
+Each overlay also stores an indexed directory of its effective file metadata.
+Symbol and reference lookups join that directory by logical file ID, avoiding
+a complete file-list merge for each query. Symbols and references remain shared
+with the base. The directory is derived state: an older overlay writer makes
+its generation stale, so readers fall back to merged files until it is rebuilt.
+See the [directory measurement](docs/benchmarks/worktree-file-directory.md) for
+the lookup, refresh, and storage tradeoff.
+
 Publishing a refresh replaces the private overlay atomically; active readers
 retain their earlier complete SQLite snapshot. Worktrees ingest independently,
 including across server processes. MCP and HTTP dispatch use bounded worker

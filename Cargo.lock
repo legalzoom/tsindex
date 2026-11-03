@@ -1067,6 +1067,7 @@ dependencies = [
  "globset",
  "ignore",
  "libc",
+ "memchr",
  "notify",
  "rayon",
  "rusqlite",

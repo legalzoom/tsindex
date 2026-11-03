@@ -14,6 +14,7 @@ use crate::index::{IGNORE_FILE_NAMES, Workspace};
 pub(crate) struct IgnoreInputs {
     source_directories: HashSet<PathBuf>,
     files: HashMap<PathBuf, HashSet<PathBuf>>,
+    worktree_directories: HashSet<PathBuf>,
 }
 
 impl IgnoreInputs {
@@ -35,8 +36,20 @@ impl IgnoreInputs {
             })
         });
         self.files.clear();
+        self.worktree_directories.clear();
         let global = global_inputs();
         for workspace in workspaces {
+            if let Some(common) = crate::worktrees::common_dir(&workspace.root) {
+                let worktrees = common.join("worktrees");
+                for path in self.add(&worktrees, &workspace.root) {
+                    self.worktree_directories.insert(path);
+                }
+                if let Ok(entries) = fs::read_dir(&worktrees) {
+                    for entry in entries.flatten() {
+                        self.add(&entry.path().join("gitdir"), &workspace.root);
+                    }
+                }
+            }
             for file in &global {
                 self.add(file, &workspace.root);
             }
@@ -100,12 +113,28 @@ impl IgnoreInputs {
         self.files
             .keys()
             .filter_map(|file| existing_parent(file))
+            .chain(
+                self.worktree_directories
+                    .iter()
+                    .filter(|path| path.is_dir())
+                    .cloned(),
+            )
             .collect()
     }
 
     pub fn changed_targets(&self, changed: &[PathBuf]) -> HashSet<PathBuf> {
         let mut targets = HashSet::new();
         let changed: HashSet<_> = changed.iter().map(PathBuf::as_path).collect();
+        for path in &changed {
+            for ancestor in path
+                .ancestors()
+                .filter(|p| self.worktree_directories.contains(*p))
+            {
+                if let Some(owners) = self.files.get(ancestor) {
+                    targets.extend(owners.iter().cloned());
+                }
+            }
+        }
         for file in self
             .files
             .keys()
@@ -644,5 +673,40 @@ mod tests {
             assert_eq!(inputs.changed_targets(&[new_rules]), HashSet::from([root]));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod worktree_tests {
+    use super::*;
+
+    #[test]
+    fn worktree_creation_and_metadata_edits_invalidate_the_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::create_dir(root.join(".git")).unwrap();
+        let workspace = Workspace {
+            name: "main".into(),
+            root: root.clone(),
+            languages: vec![],
+            ignore: vec![],
+        };
+        let mut inputs = IgnoreInputs::default();
+        inputs.refresh(std::slice::from_ref(&workspace));
+        let metadata = root.join(".git/worktrees/new");
+        fs::create_dir_all(&metadata).unwrap();
+        assert!(
+            inputs
+                .changed_targets(std::slice::from_ref(&metadata))
+                .contains(&root)
+        );
+        inputs.refresh(&[workspace]);
+        assert!(inputs.directories().contains(&root.join(".git/worktrees")));
+        assert!(inputs.directories().contains(&metadata));
+        assert!(
+            inputs
+                .changed_targets(&[metadata.join("gitdir")])
+                .contains(&root)
+        );
     }
 }

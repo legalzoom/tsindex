@@ -7,3 +7,4 @@ pub mod lang;
 pub mod mcp;
 pub mod model;
 mod watch;
+pub mod worktrees;

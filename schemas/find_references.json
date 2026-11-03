@@ -4,8 +4,8 @@
   "description": "Result `range` values are `[start_row, start_col, end_row, end_col]`: rows are 1-based, columns are 0-based UTF-8 BYTE offsets (tree-sitter convention, not character indexes), and the end is exclusive.",
   "properties": {
     "names": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "One or more identifiers to find references for. Always pass an array: use `[\"symbol\"]` for one identifier. Batching saves round-trips before a multi-symbol refactor; when multiple identifiers are requested, each reference carries its `name` so you can tell them apart." },
-    "repo": { "type": "string" },
-    "scope": { "type": "string" },
+    "repo": { "type": "string", "description": "Configured repo name, linked worktree directory name, or absolute checkout root. Unknown names return an error listing known repos and index status. Omit to use the primary catalog." },
+    "scope": { "type": "string", "description": "File, directory, or glob. Bare directories include descendants; absolute paths must be inside a selected repo. A filter matching no indexed files emits filter_matched_no_files." },
     "exclude_tests": { "type": "boolean" },
     "include_declarations": { "type": "boolean", "description": "Include declaration-name occurrences. Off by default so the defining declaration is not reported as a use." },
     "group_by_file": { "type": "boolean", "description": "Group results by file. When the response is `truncated`, `groups` covers only the returned slice — it is NOT the full set of matching files, and its length is not the distinct-file count. Use the response's `total_files` for the distinct-file count (across ALL requested names combined, pre-pagination); paginate via `next_offset` before reporting any per-file totals." },

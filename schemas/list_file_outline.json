@@ -4,7 +4,7 @@
   "description": "Result `range` values are `[start_row, start_col, end_row, end_col]`: rows are 1-based, columns are 0-based UTF-8 BYTE offsets (tree-sitter convention, not character indexes), and the end is exclusive.",
   "properties": {
     "file": { "type": "string" },
-    "repo": { "type": "string" },
+    "repo": { "type": "string", "description": "Configured repo name, linked worktree directory name, or absolute checkout root. Unknown names return an error listing known repos and index status. Omit to use the primary catalog." },
     "depth": { "type": "integer", "minimum": 1 },
     "include_signatures": { "type": "boolean" },
     "include_docstrings": { "type": "boolean" },

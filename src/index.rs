@@ -21,7 +21,7 @@ use crate::detect::detect_languages;
 use crate::ignore_inputs::{IgnoreInputs, existing_parent as existing_watch_parent};
 use crate::lang::{LanguageSpec, detect_language_from_file, lookup_language};
 use crate::model::{
-    EnclosingHit, EnclosingSymbolResponse, FileOutlineResponse, FileRefCount,
+    Diagnostic, EnclosingHit, EnclosingSymbolResponse, FileOutlineResponse, FileRefCount,
     FindReferencesResponse, GetSymbolResponse, IndexedSymbol, NameRefCount, OutlineSymbol,
     QueryCapture as RawQueryCapture, QueryResponse, RangePoint, RefCountsResponse, ReferenceGroup,
     ReferenceMatch, ReferenceRow, ReplaceSymbolResponse, RepoInfo, RepoLanguageReport, SourceRange,
@@ -190,7 +190,10 @@ pub struct FindReferencesArgs {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryArgs {
+    #[serde(default)]
     pub language: String,
+    #[serde(default)]
+    pub languages: Vec<String>,
     #[serde(default)]
     pub repo: Option<String>,
     pub query: String,
@@ -469,8 +472,8 @@ impl Runtime {
                     )?;
                     processed_so_far += batch.len();
                     eprintln!(
-                        "  [{}] indexed={} skipped={} failed={}",
-                        processed_so_far, stats.indexed, stats.skipped, stats.failed
+                        "  [{}] indexed={} touched={} skipped={} failed={}",
+                        processed_so_far, stats.indexed, stats.touched, stats.skipped, stats.failed
                     );
                     batch.clear();
                 }
@@ -488,8 +491,8 @@ impl Runtime {
             )?;
             processed_so_far += batch.len();
             eprintln!(
-                "  [{}] indexed={} skipped={} failed={}",
-                processed_so_far, stats.indexed, stats.skipped, stats.failed
+                "  [{}] indexed={} touched={} skipped={} failed={}",
+                processed_so_far, stats.indexed, stats.touched, stats.skipped, stats.failed
             );
         }
 
@@ -504,8 +507,8 @@ impl Runtime {
             set_user_version(conn, SCHEMA_VERSION)?;
         }
         eprintln!(
-            "build complete: {} indexed, {} skipped, {} failed",
-            stats.indexed, stats.skipped, stats.failed
+            "build complete: {} indexed, {} touched, {} skipped, {} failed",
+            stats.indexed, stats.touched, stats.skipped, stats.failed
         );
         Ok(stats)
     }
@@ -526,7 +529,7 @@ impl Runtime {
     /// same include/exclude decisions as `walk_source_files`.
     ///
     /// Paths outside every configured workspace are ignored. Returns the same
-    /// `BuildStats` shape as `build` (indexed / skipped / failed counts; deleted
+    /// `BuildStats` shape as `build` (indexed / touched / skipped / failed counts; deleted
     /// files are not counted in any of those fields).
     pub fn update_paths(&self, changed: &[PathBuf]) -> Result<BuildStats> {
         self.initialize()?;
@@ -705,7 +708,9 @@ impl Runtime {
             let mut to_upsert = Vec::new();
             for result in results {
                 match result {
-                    ProcessedFile::Indexed { .. } => to_upsert.push(result),
+                    ProcessedFile::Indexed { .. } | ProcessedFile::Touched { .. } => {
+                        to_upsert.push(result)
+                    }
                     ProcessedFile::Unchanged { .. } => stats.skipped += 1,
                     ProcessedFile::ParseFailed {
                         workspace_name,
@@ -745,6 +750,17 @@ impl Runtime {
             }
 
             for result in to_upsert {
+                if let ProcessedFile::Touched {
+                    repo_id,
+                    ref relative,
+                    mtime_ns,
+                    byte_size,
+                } = result
+                {
+                    update_file_metadata(&tx, repo_id, relative, mtime_ns, byte_size)?;
+                    stats.touched += 1;
+                    continue;
+                }
                 if let ProcessedFile::Indexed {
                     repo_id,
                     relative,
@@ -767,8 +783,8 @@ impl Runtime {
         }
 
         eprintln!(
-            "update complete: {} indexed, {} deleted, {} failed",
-            touched, deleted, stats.failed
+            "update complete: {} indexed, {} touched, {} deleted, {} failed",
+            touched, stats.touched, deleted, stats.failed
         );
         Ok(stats)
     }
@@ -1174,11 +1190,21 @@ impl Runtime {
 
     pub fn get_symbol(&self, args: GetSymbolArgs) -> Result<GetSymbolResponse> {
         let conn = self.open_read_conn()?;
-        let matcher = args
-            .file_glob
-            .as_deref()
-            .map(build_glob_matcher)
-            .transpose()?;
+        let (matcher, mut diagnostics) =
+            self.path_filter(&conn, args.file_glob.as_deref(), args.repo.as_deref())?;
+        if let Some(kind) = &args.kind {
+            let kinds = conn
+                .prepare("SELECT DISTINCT kind FROM symbols ORDER BY kind")?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if !kinds.contains(kind) {
+                return Err(crate::mcp::InvalidParams(format!(
+                    "unknown kind {kind:?}; valid kinds: {}",
+                    kinds.join(", ")
+                ))
+                .into());
+            }
+        }
 
         // Accept a single `name` and/or a `names` list; dedupe, preserve order.
         // Batching several names into one call is the point — it turns N
@@ -1196,9 +1222,8 @@ impl Runtime {
             ));
         }
 
-        // Build `s.name IN (?, ?, ...)` then bind repo/kind twice each for the
-        // `(? IS NULL OR col = ?)` filters. All placeholders are positional in
-        // bind order: names…, repo, repo, kind, kind.
+        // Bind names followed by the optional repo filter. Apply kind after
+        // collecting candidates so a mismatch can report the kinds found.
         let placeholders = vec!["?"; names.len()].join(", ");
         let partial = self.partial_projection();
         let sql = format!(
@@ -1211,7 +1236,6 @@ impl Runtime {
             JOIN repos r ON r.id = f.repo_id
             WHERE s.name IN ({placeholders})
               AND (? IS NULL OR r.name = ?)
-              AND (? IS NULL OR s.kind = ?)
             ORDER BY s.name, r.name, f.path, s.start_row, s.start_col
             "#
         );
@@ -1220,11 +1244,8 @@ impl Runtime {
         use rusqlite::types::Value;
         let mut binds: Vec<Value> = names.iter().cloned().map(Value::Text).collect();
         let repo_value = args.repo.clone().map_or(Value::Null, Value::Text);
-        let kind_value = args.kind.clone().map_or(Value::Null, Value::Text);
         binds.push(repo_value.clone());
         binds.push(repo_value);
-        binds.push(kind_value.clone());
-        binds.push(kind_value);
 
         let mut rows = stmt.query(rusqlite::params_from_iter(binds))?;
 
@@ -1247,12 +1268,31 @@ impl Runtime {
                 let symbol = indexed_symbol_from_row(row)?;
                 if matcher
                     .as_ref()
-                    .is_some_and(|matcher| !matcher.is_match(&symbol.file))
+                    .is_some_and(|matcher| !matcher.is_match(&symbol.repo, &symbol.file))
                 {
                     continue;
                 }
                 if let Some(&bucket) = order.get(&symbol.name) {
                     buckets[bucket].push(symbol);
+                }
+            }
+        }
+
+        if let Some(kind) = &args.kind {
+            for (name, bucket) in names.iter().zip(&mut buckets) {
+                let mut kinds = std::collections::BTreeMap::new();
+                for symbol in bucket.iter() {
+                    *kinds.entry(symbol.kind.clone()).or_default() += 1;
+                }
+                bucket.retain(|symbol| &symbol.kind == kind);
+                if bucket.is_empty() && !kinds.is_empty() {
+                    let mut diagnostic = Diagnostic::new(
+                        "kind_filtered_out",
+                        format!("kind {kind:?} removed every match for {name:?}"),
+                        "Omit kind or use one of the found kinds.",
+                    );
+                    diagnostic.kinds = kinds;
+                    diagnostics.push(diagnostic);
                 }
             }
         }
@@ -1361,6 +1401,7 @@ impl Runtime {
                 .collect::<Vec<_>>();
             let truncated = !truncated_names.is_empty();
             GetSymbolResponse {
+                diagnostics: diagnostics.clone(),
                 matches,
                 truncated,
                 total,
@@ -1741,6 +1782,7 @@ impl Runtime {
         let budget = self.config.server.max_response_chars;
         let next_offset = if end < total { Some(end) } else { None };
         let mut response = FileOutlineResponse {
+            diagnostics: Vec::new(),
             repo,
             file: args.file,
             language,
@@ -1826,7 +1868,12 @@ impl Runtime {
         )>,
     > {
         let conn = self.open_read_conn()?;
-        let scope = args.scope.as_deref().map(build_glob_matcher).transpose()?;
+        let workspaces = self.selected_workspaces(args.repo.as_deref())?;
+        let scope = args
+            .scope
+            .as_deref()
+            .map(|p| build_path_filter(p, &workspaces))
+            .transpose()?;
 
         // Combine `name` + `names`, dedupe, preserve order.
         let mut names: Vec<String> = Vec::new();
@@ -1883,10 +1930,10 @@ impl Runtime {
         // Apply the same in-memory filters both read paths honor.
         Ok(refs
             .into_iter()
-            .filter(|(_, _, file, _, _, _, _, context, _, _)| {
+            .filter(|(_, repo, file, _, _, _, _, context, _, _)| {
                 if scope
                     .as_ref()
-                    .is_some_and(|matcher| !matcher.is_match(file))
+                    .is_some_and(|matcher| !matcher.is_match(repo, file))
                 {
                     return false;
                 }
@@ -1908,6 +1955,9 @@ impl Runtime {
     /// (top-N by count, with `files_truncated` set) so a many-file repo can't
     /// produce an oversized response — the invariant the row path enforces.
     pub fn find_reference_counts(&self, args: FindReferencesArgs) -> Result<RefCountsResponse> {
+        let conn = self.open_read_conn()?;
+        let (_, diagnostics) =
+            self.path_filter(&conn, args.scope.as_deref(), args.repo.as_deref())?;
         let multi = args.name.iter().count() + args.names.as_ref().map_or(0, |n| n.len()) > 1;
         let rows = self.query_reference_rows(&args)?;
 
@@ -1956,6 +2006,7 @@ impl Runtime {
         // budget-shrink loops on the row-level read paths.
         let budget = self.config.server.max_response_chars;
         let build = |files: &[FileRefCount], files_truncated: bool| RefCountsResponse {
+            diagnostics: diagnostics.clone(),
             total,
             total_files,
             files_returned: files.len(),
@@ -1998,6 +2049,9 @@ impl Runtime {
     }
 
     pub fn find_references(&self, args: FindReferencesArgs) -> Result<FindReferencesResponse> {
+        let conn = self.open_read_conn()?;
+        let (_, diagnostics) =
+            self.path_filter(&conn, args.scope.as_deref(), args.repo.as_deref())?;
         // Several names => tag each ref with its name so the caller can tell
         // them apart; single-name responses stay byte-identical.
         let tag_names = args.names.as_ref().is_some_and(|n| n.len() > 1)
@@ -2132,6 +2186,7 @@ impl Runtime {
                 .collect();
             grouped.sort_by(|a, b| a.repo.cmp(&b.repo).then_with(|| a.file.cmp(&b.file)));
             FindReferencesResponse {
+                diagnostics: diagnostics.clone(),
                 total,
                 total_files,
                 returned,
@@ -2192,7 +2247,8 @@ impl Runtime {
     /// only). When `args.col` is `None` the lookup is row-only — useful
     /// for stack-trace lines and commit hunks where you have a line
     /// number but not a column. When `args.col` is `Some`, symbols are
-    /// filtered by exact `(row, col)` containment.
+    /// filtered by exact `(row, col)` containment, with a diagnostic and a
+    /// row-only retry when the column-qualified lookup is empty.
     ///
     /// Returns an error if the file isn't in the index. Returns an
     /// `Ok` with empty `matches` when the file is indexed but the
@@ -2275,7 +2331,16 @@ impl Runtime {
                         args.context_lines,
                         effective_max_body_lines,
                     )?;
-                    results.push(EnclosingHit { row, matches });
+                    let diagnostics = if matches.is_empty() {
+                        vec![no_enclosing_symbol(row)]
+                    } else {
+                        Vec::new()
+                    };
+                    results.push(EnclosingHit {
+                        row,
+                        matches,
+                        diagnostics,
+                    });
                 }
                 Ok(results)
             };
@@ -2287,6 +2352,7 @@ impl Runtime {
                 let mut guard = 0;
                 loop {
                     let response = EnclosingSymbolResponse {
+                        diagnostics: Vec::new(),
                         repo: resolved_repo.clone(),
                         file: args.file.clone(),
                         matches: Vec::new(),
@@ -2310,6 +2376,7 @@ impl Runtime {
                 }
             }
             return Ok(EnclosingSymbolResponse {
+                diagnostics: Vec::new(),
                 repo: resolved_repo,
                 file: args.file,
                 matches: Vec::new(),
@@ -2334,7 +2401,7 @@ impl Runtime {
         let mut depth_kept = depth;
         let mut guard = 0;
         loop {
-            let matches = self.enclosing_matches(
+            let mut matches = self.enclosing_matches(
                 &conn,
                 &args.file,
                 &resolved_repo,
@@ -2345,7 +2412,35 @@ impl Runtime {
                 args.context_lines,
                 effective_max_body_lines,
             )?;
+            let mut diagnostics = Vec::new();
+            if matches.is_empty()
+                && let Some(col) = args.col
+            {
+                matches = self.enclosing_matches(
+                    &conn,
+                    &args.file,
+                    &resolved_repo,
+                    internal_row,
+                    None,
+                    depth_kept,
+                    args.include_body,
+                    args.context_lines,
+                    effective_max_body_lines,
+                )?;
+                diagnostics.push(Diagnostic::new(
+                    "col_ignored",
+                    format!(
+                        "no symbol contains column {} on row {row}; retried by row",
+                        col
+                    ),
+                    "Omit col unless the line holds more than one symbol.",
+                ));
+            }
+            if matches.is_empty() {
+                diagnostics.push(no_enclosing_symbol(row));
+            }
             let response = EnclosingSymbolResponse {
+                diagnostics,
                 repo: resolved_repo.clone(),
                 file: args.file.clone(),
                 matches,
@@ -2482,21 +2577,75 @@ impl Runtime {
     }
 
     pub fn query(&self, args: QueryArgs) -> Result<QueryResponse> {
-        // Raw queries read live files (via `walk_source_files`), not the index,
-        // so they must NOT be gated on the initial build completing — a query
-        // against a brand-new or never-indexed root is still meaningful and
-        // should return live results, not "index is not ready". We only
-        // bootstrap the schema (cheap, idempotent) so the DB file is valid and
-        // no database initialization or readiness check is needed.
-        let spec = lookup_language(&args.language)
-            .ok_or_else(|| anyhow!("unsupported language {}", args.language))?;
-        let query = Query::new(&(spec.language)(), &args.query)
-            .with_context(|| format!("invalid query for {}", args.language))?;
+        let mut requested = args.languages.clone();
+        if !args.language.is_empty() {
+            requested.insert(0, args.language.clone());
+        }
+        if requested.is_empty() {
+            return Err(crate::mcp::InvalidParams(
+                "query requires language or a non-empty languages array".into(),
+            )
+            .into());
+        }
+        let mut compiled = HashMap::new();
+        let mut diagnostics = Vec::new();
+        let mut seen_languages = HashSet::new();
+        for language in &requested {
+            if !seen_languages.insert(language) {
+                continue;
+            }
+            let result = (|| -> Result<_> {
+                let spec = lookup_language(language)
+                    .ok_or_else(|| anyhow!("unsupported language {language}"))?;
+                let query = Query::new(&(spec.language)(), &args.query)
+                    .with_context(|| format!("invalid query for {language}"))?;
+                let literals = query_literals(&query, &args.query);
+                Ok((spec, query, literals))
+            })();
+            match result {
+                Ok((spec, query, literals)) => {
+                    compiled.insert(spec.id, (spec, query, literals));
+                }
+                Err(error) if args.languages.is_empty() => {
+                    return Err(crate::mcp::InvalidParams(format!("{error:#}")).into());
+                }
+                Err(error) => diagnostics.push(Diagnostic::new(
+                    "query_compile_failed",
+                    format!("{language}: {error:#}"),
+                    "Use a query supported by this language.",
+                )),
+            }
+        }
+        let workspaces = self.selected_workspaces(args.repo.as_deref())?;
         let matcher = args
             .file_glob
             .as_deref()
-            .map(build_glob_matcher)
+            .map(|p| build_path_filter(p, &workspaces))
             .transpose()?;
+        // A never-indexed root remains queryable through the live walk. A ready
+        // index supplies candidates without traversing unrelated directories.
+        let conn = if self.db_path.exists() {
+            let conn = Connection::open_with_flags(
+                &self.db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            if table_exists(&conn, "files")? && ensure_index_ready(&conn).is_ok() {
+                Some(conn)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(conn) = &conn {
+            diagnostics.extend(
+                self.path_filter(conn, args.file_glob.as_deref(), args.repo.as_deref())?
+                    .1,
+            );
+        }
+        let mut files_scanned = 0;
+        let mut files_parsed = 0;
+        let mut filter_matched = false;
         let limit = resolve_limit(&self.config.server, args.limit);
         let offset = args.offset.unwrap_or(0);
         let capture_char_limit = self.config.server.capture_char_limit;
@@ -2513,120 +2662,163 @@ impl Runtime {
         // correct even when the timeout cuts it short.
         let mut stream_pos = 0usize;
 
-        for workspace in self.workspaces()? {
-            if truncated || timed_out {
+        for workspace in workspaces {
+            if truncated || timed_out || compiled.is_empty() {
                 break;
             }
-            if args
-                .repo
-                .as_ref()
-                .is_some_and(|repo| repo != &workspace.name)
-            {
-                continue;
+            let mut candidates = Vec::new();
+            if let Some(conn) = &conn {
+                let mut language_ids = compiled.keys().copied().collect::<Vec<_>>();
+                language_ids.sort();
+                for language in language_ids {
+                    let mut stmt = conn.prepare("SELECT f.path FROM files f JOIN repos r ON r.id = f.repo_id WHERE r.name = ?1 AND f.language = ?2 ORDER BY f.path")?;
+                    for file in stmt.query_map(params![workspace.name, language], |row| {
+                        row.get::<_, String>(0)
+                    })? {
+                        let relative = file?;
+                        if matcher
+                            .as_ref()
+                            .is_none_or(|m| m.is_match(&workspace.name, &relative))
+                        {
+                            candidates.push((
+                                workspace.root.join(&relative),
+                                relative,
+                                language.to_string(),
+                            ));
+                        }
+                    }
+                }
+            } else {
+                for path in self.walk_source_files(&workspace)? {
+                    let relative = relative_path(&workspace.root, &path);
+                    if matcher
+                        .as_ref()
+                        .is_some_and(|m| !m.is_match(&workspace.name, &relative))
+                    {
+                        continue;
+                    }
+                    filter_matched = true;
+                    if let Some(language) = detect_language_from_file(&workspace.root, &path)?
+                        && compiled.contains_key(language)
+                    {
+                        candidates.push((path, relative, language.to_string()));
+                    }
+                }
             }
-            for path in self.walk_source_files(&workspace)? {
+            candidates.sort_by(|a, b| a.1.cmp(&b.1));
+            // Bound prefetch memory while overlapping cold-file reads. Keep
+            // the collected order stable so pagination is deterministic.
+            for batch in candidates.chunks(64) {
+                if truncated || timed_out {
+                    break;
+                }
                 if started.elapsed() > timeout {
                     timed_out = true;
                     break;
                 }
-                let Some(language_id) = detect_language_from_file(&workspace.root, &path)? else {
-                    continue;
-                };
-                if language_id != spec.id {
-                    continue;
-                }
-                let relative = relative_path(&workspace.root, &path);
-                if matcher
-                    .as_ref()
-                    .is_some_and(|matcher| !matcher.is_match(&relative))
-                {
-                    continue;
-                }
-                // Match build's file gate: skip oversized files outright, and
-                // let one unreadable file degrade the response to `partial`
-                // instead of failing the whole query.
-                if fs::metadata(&path).is_ok_and(|meta| meta.len() > MAX_FILE_SIZE) {
-                    continue;
-                }
-                let source = match fs::read(&path) {
-                    Ok(source) => source,
-                    Err(error) => {
-                        eprintln!("warning: query skipped {}: {error}", path.display());
-                        partial = true;
-                        continue;
-                    }
-                };
-                if is_binary(&source) {
-                    continue;
-                }
-                let parsed = parse_tree(&spec, &source)?;
-                // Track this file's parse-recovery state, but only fold it into
-                // the response `partial` when a capture from this file is
-                // actually returned — otherwise a malformed file that matched
-                // nothing would flag the whole response partial for no reason
-                // visible to the caller.
-                let file_has_error = parsed.root_node().has_error();
-                let mut emitted_from_file = false;
-                let mut cursor = QueryCursor::new();
-                let names = query.capture_names();
-                let mut capture_iter =
-                    cursor.captures(&query, parsed.root_node(), source.as_slice());
-                while let Some(capture) = capture_iter.next() {
+                let sources: Vec<_> = batch
+                    .par_iter()
+                    .map(|(path, _, language)| {
+                        read_query_source(path, &compiled[language.as_str()].2)
+                    })
+                    .collect();
+                files_scanned += batch.len();
+                for ((path, relative, language), source) in batch.iter().zip(sources) {
                     if started.elapsed() > timeout {
                         timed_out = true;
                         break;
                     }
-                    let (matched, index) = capture;
-                    let QueryCapture { node, .. } = matched.captures[*index];
-                    let name = names[matched.captures[*index].index as usize].to_string();
-                    if args.capture.as_ref().is_some_and(|needle| needle != &name) {
-                        continue;
-                    }
-                    // Advance the stream position for every matched capture
-                    // so the offset window is stable across the whole walk,
-                    // not per file.
-                    if stream_pos < offset {
+                    let source = match source {
+                        Ok(Some(source)) => source,
+                        Ok(None) => continue,
+                        Err(error) => {
+                            eprintln!("warning: query skipped {}: {error}", path.display());
+                            partial = true;
+                            continue;
+                        }
+                    };
+                    let (spec, query, _) = &compiled[language.as_str()];
+                    files_parsed += 1;
+                    let parsed = parse_tree(spec, &source)?;
+                    // Track this file's parse-recovery state, but only fold it into
+                    // the response `partial` when a capture from this file is
+                    // actually returned — otherwise a malformed file that matched
+                    // nothing would flag the whole response partial for no reason
+                    // visible to the caller.
+                    let file_has_error = parsed.root_node().has_error();
+                    let mut emitted_from_file = false;
+                    let mut cursor = QueryCursor::new();
+                    let names = query.capture_names();
+                    let mut capture_iter =
+                        cursor.captures(query, parsed.root_node(), source.as_slice());
+                    while let Some(capture) = capture_iter.next() {
+                        if started.elapsed() > timeout {
+                            timed_out = true;
+                            break;
+                        }
+                        let (matched, index) = capture;
+                        let QueryCapture { node, .. } = matched.captures[*index];
+                        let name = names[matched.captures[*index].index as usize].to_string();
+                        if args.capture.as_ref().is_some_and(|needle| needle != &name) {
+                            continue;
+                        }
+                        // Advance the stream position for every matched capture
+                        // so the offset window is stable across the whole walk,
+                        // not per file.
+                        if stream_pos < offset {
+                            stream_pos += 1;
+                            continue;
+                        }
+                        if captures.len() >= limit {
+                            // This match exists past the window — stop emitting.
+                            truncated = true;
+                            break;
+                        }
+                        let raw_text = node.utf8_text(&source).unwrap_or_default().to_string();
+                        // Cap the capture text at `capture_char_limit` chars so a
+                        // single huge capture (e.g. a whole-file string) can't
+                        // dominate the response. The cap counts Unicode scalar
+                        // values, not bytes, and marks the capture `text_truncated`
+                        // so the caller knows it was trimmed.
+                        let (text, text_truncated) = truncate_chars(&raw_text, capture_char_limit);
+                        captures.push(RawQueryCapture {
+                            repo: workspace.name.clone(),
+                            name,
+                            text,
+                            file: relative.clone(),
+                            range: SourceRange {
+                                start: RangePoint(
+                                    node.start_position().row,
+                                    node.start_position().column,
+                                ),
+                                end: RangePoint(
+                                    node.end_position().row,
+                                    node.end_position().column,
+                                ),
+                            },
+                            text_truncated,
+                        });
+                        emitted_from_file = true;
                         stream_pos += 1;
-                        continue;
                     }
-                    if captures.len() >= limit {
-                        // This match exists past the window — stop emitting.
-                        truncated = true;
+                    // Only fold this file's parse-recovery flag in when it
+                    // actually contributed a returned capture.
+                    if emitted_from_file {
+                        partial |= file_has_error;
+                    }
+                    if truncated || timed_out {
                         break;
                     }
-                    let raw_text = node.utf8_text(&source).unwrap_or_default().to_string();
-                    // Cap the capture text at `capture_char_limit` chars so a
-                    // single huge capture (e.g. a whole-file string) can't
-                    // dominate the response. The cap counts Unicode scalar
-                    // values, not bytes, and marks the capture `text_truncated`
-                    // so the caller knows it was trimmed.
-                    let (text, text_truncated) = truncate_chars(&raw_text, capture_char_limit);
-                    captures.push(RawQueryCapture {
-                        repo: workspace.name.clone(),
-                        name,
-                        text,
-                        file: relative.clone(),
-                        range: SourceRange {
-                            start: RangePoint(
-                                node.start_position().row,
-                                node.start_position().column,
-                            ),
-                            end: RangePoint(node.end_position().row, node.end_position().column),
-                        },
-                        text_truncated,
-                    });
-                    emitted_from_file = true;
-                    stream_pos += 1;
-                }
-                // Only fold this file's parse-recovery flag in when it
-                // actually contributed a returned capture.
-                if emitted_from_file {
-                    partial |= file_has_error;
-                }
-                if truncated || timed_out {
-                    break;
                 }
             }
+        }
+
+        if conn.is_none()
+            && !compiled.is_empty()
+            && !filter_matched
+            && let Some(pattern) = &args.file_glob
+        {
+            diagnostics.push(filter_no_files(pattern));
         }
 
         // A timeout that fires before this page emitted anything would hand
@@ -2636,7 +2828,7 @@ impl Runtime {
         if timed_out && captures.is_empty() {
             return Err(anyhow!(
                 "query timed out before reaching offset {offset} (no captures emitted \
-                 within {} ms); raise `query_timeout_ms` or narrow with `file_glob`",
+                 within {} ms; files_scanned={files_scanned}); raise `query_timeout_ms` or narrow with `file_glob`",
                 self.config.server.query_timeout_ms
             ));
         }
@@ -2651,7 +2843,11 @@ impl Runtime {
         let build = |captures: Vec<RawQueryCapture>, truncated: bool| {
             let next_offset = truncated.then_some(offset + captures.len());
             QueryResponse {
+                diagnostics: diagnostics.clone(),
                 language: args.language.clone(),
+                languages: args.languages.clone(),
+                files_scanned,
+                files_parsed,
                 warning: crate::model::truncation_warning(captures.len(), None, next_offset, None),
                 captures,
                 truncated,
@@ -2734,6 +2930,41 @@ impl Runtime {
         Ok(workspaces)
     }
 
+    fn selected_workspaces(&self, repo: Option<&str>) -> Result<Vec<Workspace>> {
+        Ok(self
+            .workspaces()?
+            .into_iter()
+            .filter(|workspace| repo.is_none_or(|repo| repo == workspace.name))
+            .collect())
+    }
+
+    fn path_filter(
+        &self,
+        conn: &Connection,
+        pattern: Option<&str>,
+        repo: Option<&str>,
+    ) -> Result<(Option<PathFilter>, Vec<Diagnostic>)> {
+        let Some(pattern) = pattern else {
+            return Ok((None, Vec::new()));
+        };
+        let filter = build_path_filter(pattern, &self.selected_workspaces(repo)?)?;
+        let mut stmt = conn.prepare("SELECT r.name, f.path FROM files f JOIN repos r ON r.id = f.repo_id WHERE (?1 IS NULL OR r.name = ?1)")?;
+        let mut rows = stmt.query([repo])?;
+        let mut matched = false;
+        while let Some(row) = rows.next()? {
+            if filter.is_match(&row.get::<_, String>(0)?, &row.get::<_, String>(1)?) {
+                matched = true;
+                break;
+            }
+        }
+        let diagnostics = if matched {
+            Vec::new()
+        } else {
+            vec![filter_no_files(pattern)]
+        };
+        Ok((Some(filter), diagnostics))
+    }
+
     fn watch_input_directories(&self, ignore_inputs: &IgnoreInputs) -> HashSet<PathBuf> {
         let mut inputs = ignore_inputs.directories();
         let configured_roots = if self.config.repos.is_empty() {
@@ -2804,7 +3035,7 @@ impl Runtime {
     /// Walks prune these so a nested repo's files are indexed only under the
     /// repo that owns them (deepest root wins, matching `best_workspace_for_path`).
     fn other_workspace_roots(&self, workspace: &Workspace) -> Result<HashSet<PathBuf>> {
-        Ok(foreign_workspace_roots(workspace, &self.workspaces()?))
+        foreign_workspace_roots(workspace, &self.workspaces()?)
     }
 
     pub fn source_path(&self, repo: &str, file: &str) -> Result<PathBuf> {
@@ -2897,6 +3128,7 @@ impl Runtime {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BuildStats {
     pub indexed: usize,
+    pub touched: usize,
     pub skipped: usize,
     pub failed: usize,
 }
@@ -2946,6 +3178,12 @@ struct FileJob {
 }
 
 enum ProcessedFile {
+    Touched {
+        repo_id: i64,
+        relative: String,
+        mtime_ns: i64,
+        byte_size: i64,
+    },
     Indexed {
         repo_id: i64,
         relative: String,
@@ -3085,9 +3323,12 @@ fn process_batch(
             .collect::<Result<Vec<_>>>()
     })?;
 
-    let has_writes = results
-        .iter()
-        .any(|r| matches!(r, ProcessedFile::Indexed { .. }));
+    let has_writes = results.iter().any(|r| {
+        matches!(
+            r,
+            ProcessedFile::Indexed { .. } | ProcessedFile::Touched { .. }
+        )
+    });
     let tx = if has_writes {
         Some(conn.transaction_with_behavior(TransactionBehavior::Immediate)?)
     } else {
@@ -3095,6 +3336,22 @@ fn process_batch(
     };
     for result in results {
         match result {
+            ProcessedFile::Touched {
+                repo_id,
+                relative,
+                mtime_ns,
+                byte_size,
+            } => {
+                update_file_metadata(
+                    tx.as_ref().unwrap(),
+                    repo_id,
+                    &relative,
+                    mtime_ns,
+                    byte_size,
+                )?;
+                active_paths.entry(repo_id).or_default().insert(relative);
+                stats.touched += 1;
+            }
             ProcessedFile::Indexed {
                 repo_id,
                 relative,
@@ -3150,6 +3407,20 @@ fn process_batch(
     if let Some(tx) = tx {
         tx.commit()?;
     }
+    Ok(())
+}
+
+fn update_file_metadata(
+    conn: &Connection,
+    repo_id: i64,
+    path: &str,
+    mtime_ns: i64,
+    byte_size: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE files SET mtime_ns = ?1, byte_size = ?2 WHERE repo_id = ?3 AND path = ?4",
+        params![mtime_ns, byte_size, repo_id, path],
+    )?;
     Ok(())
 }
 
@@ -3225,8 +3496,17 @@ fn process_file_job(
     if let Some((lang, existing_sha, existing_mtime, _)) = stored
         && *lang == job.spec.id
         && *existing_sha == sha
-        && *existing_mtime == mtime_ns
+        // -1 is a schema-upgrade sentinel: those files MUST be re-extracted.
+        && *existing_mtime >= 0
     {
+        if *existing_mtime != mtime_ns {
+            return Ok(ProcessedFile::Touched {
+                repo_id: job.repo_id,
+                relative: job.relative.clone(),
+                mtime_ns,
+                byte_size: metadata.len() as i64,
+            });
+        }
         return Ok(ProcessedFile::Unchanged {
             repo_id: job.repo_id,
             relative: job.relative.clone(),
@@ -4466,8 +4746,197 @@ fn is_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(1024).any(|byte| *byte == 0)
 }
 
-fn build_glob_matcher(pattern: &str) -> Result<GlobMatcher> {
-    Ok(Glob::new(pattern)?.compile_matcher())
+enum PathPattern {
+    Literal(String),
+    Glob(GlobMatcher),
+}
+
+fn read_query_source(path: &Path, literals: &[Vec<String>]) -> std::io::Result<Option<Vec<u8>>> {
+    if fs::metadata(path)?.len() > MAX_FILE_SIZE {
+        return Ok(None);
+    }
+    let source = fs::read(path)?;
+    // Patterns are alternatives; literals within a pattern are conjunctive.
+    if is_binary(&source)
+        || !literals.iter().any(|pattern| {
+            pattern
+                .iter()
+                .all(|literal| memchr::memmem::find(&source, literal.as_bytes()).is_some())
+        })
+    {
+        return Ok(None);
+    }
+    Ok(Some(source))
+}
+
+/// Required literals per alternative query pattern. Only mandatory captures
+/// can prefilter: equality on an absent optional capture is vacuously true.
+fn query_literals(query: &Query, source: &str) -> Vec<Vec<String>> {
+    (0..query.pattern_count())
+        .map(|pattern| {
+            let text =
+                &source[query.start_byte_for_pattern(pattern)..query.end_byte_for_pattern(pattern)];
+            let mut tokens = Vec::new();
+            let mut chars = text.char_indices().peekable();
+            while let Some((start, ch)) = chars.next() {
+                match ch {
+                    ';' => while chars.next().is_some_and(|(_, c)| c != '\n') {},
+                    c if c.is_whitespace() => {}
+                    '(' | ')' => tokens.push(&text[start..start + 1]),
+                    '"' => {
+                        while let Some((end, c)) = chars.next() {
+                            if c == '\\' {
+                                chars.next();
+                            } else if c == '"' {
+                                tokens.push(&text[start..end + 1]);
+                                break;
+                            }
+                        }
+                    }
+                    _ => {
+                        while chars
+                            .peek()
+                            .is_some_and(|(_, c)| !c.is_whitespace() && !"();\"".contains(*c))
+                        {
+                            chars.next();
+                        }
+                        let end = chars.peek().map_or(text.len(), |(i, _)| *i);
+                        tokens.push(&text[start..end]);
+                    }
+                }
+            }
+            tokens
+                .windows(5)
+                .filter_map(|tokens| {
+                    if tokens[0] != "(" || tokens[1] != "#eq?" || tokens[4] != ")" {
+                        return None;
+                    }
+                    let capture = query.capture_index_for_name(tokens[2].strip_prefix('@')?)?;
+                    if !matches!(
+                        query.capture_quantifiers(pattern)[capture as usize],
+                        tree_sitter::CaptureQuantifier::One
+                            | tree_sitter::CaptureQuantifier::OneOrMore
+                    ) {
+                        return None;
+                    }
+                    let literal = tokens[3].strip_prefix('"')?.strip_suffix('"')?;
+                    let mut decoded = String::new();
+                    let mut chars = literal.chars();
+                    while let Some(ch) = chars.next() {
+                        decoded.push(if ch == '\\' {
+                            // Match tree-sitter's query string decoding (query.c).
+                            match chars.next()? {
+                                'n' => '\n',
+                                'r' => '\r',
+                                't' => '\t',
+                                '0' => '\0',
+                                c => c,
+                            }
+                        } else {
+                            ch
+                        });
+                    }
+                    Some(decoded)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+struct PathFilter {
+    patterns: HashMap<String, PathPattern>,
+}
+
+fn filter_no_files(pattern: &str) -> Diagnostic {
+    Diagnostic::new(
+        "filter_matched_no_files",
+        format!("path filter {pattern:?} matched no indexed files"),
+        "Check the path and selected repo, or omit the filter.",
+    )
+}
+
+fn no_enclosing_symbol(row: usize) -> Diagnostic {
+    Diagnostic::new(
+        "no_enclosing_symbol",
+        format!("row {row} is at top level; no enclosing symbol was found"),
+        "Check the row or use list_file_outline to find nearby symbols.",
+    )
+}
+
+impl PathFilter {
+    fn is_match(&self, repo: &str, file: &str) -> bool {
+        match self.patterns.get(repo) {
+            Some(PathPattern::Literal(path)) => {
+                path.is_empty()
+                    || file == path
+                    || file
+                        .strip_prefix(path)
+                        .is_some_and(|tail| tail.starts_with('/'))
+            }
+            Some(PathPattern::Glob(glob)) => glob.is_match(file),
+            None => false,
+        }
+    }
+}
+
+fn build_path_filter(pattern: &str, workspaces: &[Workspace]) -> Result<PathFilter> {
+    let mut normalized = PathBuf::new();
+    for component in Path::new(pattern).components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(crate::mcp::InvalidParams(format!(
+                        "path filter {pattern:?} escapes the workspace root"
+                    ))
+                    .into());
+                }
+            }
+            component => normalized.push(component),
+        }
+    }
+    let mut patterns = HashMap::new();
+    if normalized.is_absolute()
+        && let Some((ancestor, canonical)) = normalized.ancestors().find_map(|path| {
+            path.canonicalize()
+                .ok()
+                .map(|canonical| (path.to_path_buf(), canonical))
+        })
+    {
+        normalized = canonical.join(normalized.strip_prefix(ancestor)?);
+    }
+    for workspace in workspaces {
+        let relative = if normalized.is_absolute() {
+            let Ok(relative) = normalized.strip_prefix(&workspace.root) else {
+                continue;
+            };
+            relative
+        } else {
+            &normalized
+        };
+        let relative = relative.to_string_lossy().into_owned();
+        #[cfg(windows)]
+        let relative = relative.replace('\\', "/");
+        let filter = if relative.contains(['*', '?', '[', '{']) {
+            PathPattern::Glob(
+                Glob::new(&relative)
+                    .map_err(|e| {
+                        crate::mcp::InvalidParams(format!("invalid path filter {pattern:?}: {e}"))
+                    })?
+                    .compile_matcher(),
+            )
+        } else {
+            PathPattern::Literal(relative)
+        };
+        patterns.insert(workspace.name.clone(), filter);
+    }
+    if normalized.is_absolute() && patterns.is_empty() {
+        return Err(crate::mcp::InvalidParams(format!(
+            "absolute path filter {pattern:?} is outside the selected workspace roots"
+        ))
+        .into());
+    }
+    Ok(PathFilter { patterns })
 }
 
 /// Options that govern how a symbol body is sliced out of its source file.
@@ -5115,12 +5584,22 @@ fn workspace_walk_builder(workspace: &Workspace) -> WalkBuilder {
 /// Walks prune these so a nested repo's files are indexed and watched only
 /// under the repo that owns them (deepest root wins, matching
 /// `best_workspace_for_path`).
-fn foreign_workspace_roots(workspace: &Workspace, workspaces: &[Workspace]) -> HashSet<PathBuf> {
-    workspaces
+fn foreign_workspace_roots(
+    workspace: &Workspace,
+    workspaces: &[Workspace],
+) -> Result<HashSet<PathBuf>> {
+    let mut roots: HashSet<_> = workspaces
         .iter()
         .filter(|other| other.root != workspace.root)
         .map(|other| other.root.clone())
-        .collect()
+        .collect();
+    roots.extend(
+        crate::worktrees::discover(&workspace.root)?
+            .into_iter()
+            .filter(|checkout| checkout.path != workspace.root)
+            .map(|checkout| checkout.path),
+    );
+    Ok(roots)
 }
 
 /// `inotify_add_watch` failed with ENOSPC: the per-user watch budget is spent.
@@ -5313,7 +5792,7 @@ fn register_watch_directories(
     // `filter_entry` demands a `'static + Send + Sync` closure, so it owns
     // copies of everything it consults.
     let db_dir = db_dir.to_path_buf();
-    let foreign_roots = foreign_workspace_roots(workspace, workspaces);
+    let foreign_roots = foreign_workspace_roots(workspace, workspaces)?;
     let workspaces = workspaces.to_vec();
     let targets: HashSet<_> = targets.iter().cloned().collect();
     let subtrees = targets.clone();

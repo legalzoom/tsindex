@@ -308,8 +308,8 @@ fn base_shadow_checks_use_the_private_repository_and_path_index() -> Result<()> 
     let alpha = fixture.runtime(&fixture.alpha)?;
     let reader = read_connection(&alpha.db_path)?;
     let details = reader
-        .prepare("EXPLAIN QUERY PLAN SELECT id FROM files")?
-        .query_map([], |row| row.get::<_, String>(3))?
+        .prepare("EXPLAIN QUERY PLAN SELECT id FROM symbols WHERE name=?1")?
+        .query_map(["shared"], |row| row.get::<_, String>(3))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     assert!(
         details
@@ -387,6 +387,143 @@ fn named_reference_lookup_uses_the_base_name_index_without_an_inner_file_catalog
         "common",
         "idx_refs_name",
     )
+}
+
+#[test]
+fn selective_lookups_seek_effective_files_without_materializing_the_catalog() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let alpha = fixture.runtime(&fixture.alpha)?;
+    let reader = read_connection(&alpha.db_path)?;
+    for (sql, name) in [
+        (
+            "SELECT s.id, s.file_id, r.name, f.path, f.language, s.kind, s.name,
+                    s.qualified, s.start_row, s.start_col, s.end_row, s.end_col,
+                    s.signature, s.docstring, f.sha, f.partial
+             FROM symbols s JOIN files f ON f.id=s.file_id JOIN repos r ON r.id=f.repo_id
+             WHERE s.name IN (?1) AND (?2 IS NULL OR r.name=?3)
+             ORDER BY s.name, r.name, f.path, s.start_row, s.start_col",
+            "shared",
+        ),
+        (
+            "SELECT rf.name, rp.name, f.path, rf.start_row, rf.start_col, rf.end_row,
+                    rf.end_col, rf.context, f.sha, f.partial
+             FROM refs rf JOIN files f ON f.id=rf.file_id JOIN repos rp ON rp.id=f.repo_id
+             WHERE rf.name IN (?1) AND (?2 IS NULL OR rp.name=?3)
+             ORDER BY rf.name, rp.name, f.path, rf.start_row, rf.start_col",
+            "common",
+        ),
+    ] {
+        let plan = reader
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?
+            .query_map(rusqlite::params![name, None::<&str>, None::<&str>], |row| {
+                row.get::<_, String>(3)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert!(
+            !plan.iter().any(|step| step.contains("MATERIALIZE files")),
+            "a selective lookup rebuilt the effective file catalog: {plan:#?}"
+        );
+        assert!(
+            plan.iter().any(|step| {
+                step.contains("overlay_file_directory")
+                    && step.contains("SEARCH")
+                    && step.contains("INTEGER PRIMARY KEY")
+            }),
+            "the effective file directory must be searched by logical file id: {plan:#?}"
+        );
+        let paths = reader
+            .prepare(sql)?
+            .query_map(rusqlite::params![name, None::<&str>, None::<&str>], |row| {
+                row.get::<_, String>("path")
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(paths, ["shared.py"]);
+    }
+    Ok(())
+}
+
+#[test]
+fn an_existing_overlay_adopts_the_directory_without_reparsing() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fs::write(
+        fixture.alpha.join("change.py"),
+        "def private():\n    pass\n",
+    )?;
+    let alpha = fixture.runtime(&fixture.alpha)?;
+    // Removing only derived metadata reproduces the existing overlay schema.
+    // Extraction and authority records remain the independent source of truth.
+    rusqlite::Connection::open(&alpha.db_path)?
+        .execute_batch("DROP TABLE overlay_file_directory; DROP TABLE overlay_directory_state;")?;
+    assert_eq!(symbol(&alpha, "private")?, 1);
+    assert_eq!(symbol(&alpha, "original")?, 0);
+    let pinned = read_connection(&alpha.db_path)?;
+    let rebuilt = alpha.build(true, None)?;
+    assert_eq!(rebuilt.indexed, 0);
+    assert_eq!(symbol(&alpha, "private")?, 1);
+    assert_eq!(symbol(&alpha, "shared")?, 1);
+    assert_eq!(
+        pinned.query_row(
+            "SELECT COUNT(*) FROM symbols WHERE name='private'",
+            [],
+            |r| { r.get::<_, i64>(0) }
+        )?,
+        1
+    );
+    let reader = read_connection(&alpha.db_path)?;
+    let plan = reader
+        .prepare("EXPLAIN QUERY PLAN SELECT path FROM files WHERE id=?1")?
+        .query_map([-1], |row| row.get::<_, String>(3))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("overlay_file_directory"))
+    );
+    Ok(())
+}
+
+#[test]
+fn a_stale_directory_falls_back_to_facts_and_is_rebuilt_before_publication() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let alpha = fixture.runtime(&fixture.alpha)?;
+    let pinned = read_connection(&alpha.db_path)?;
+    // An older writer can update extraction without knowing about this cache.
+    // Its generation change is the signal that the directory is not usable.
+    rusqlite::Connection::open(&alpha.db_path)?.execute_batch(
+        "BEGIN;
+         DELETE FROM overlay_file_directory WHERE path='shared.py';
+         UPDATE index_state SET generation=generation+1 WHERE id=1;
+         COMMIT;",
+    )?;
+    assert_eq!(symbol(&alpha, "shared")?, 1);
+    let refreshed = alpha.build(true, None)?;
+    assert_eq!(refreshed.indexed, 0);
+    assert_eq!(symbol(&alpha, "shared")?, 1);
+    assert_eq!(
+        pinned.query_row(
+            "SELECT COUNT(*) FROM files WHERE path='shared.py'",
+            [],
+            |row| { row.get::<_, i64>(0) }
+        )?,
+        1
+    );
+    let reader = read_connection(&alpha.db_path)?;
+    assert_eq!(
+        reader.query_row(
+            "SELECT COUNT(*) FROM files WHERE path='shared.py'",
+            [],
+            |row| { row.get::<_, i64>(0) }
+        )?,
+        1
+    );
+    let plan = reader
+        .prepare("EXPLAIN QUERY PLAN SELECT path FROM files WHERE id=?1")?
+        .query_map([-1], |row| row.get::<_, String>(3))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("overlay_file_directory"))
+    );
+    Ok(())
 }
 
 #[test]

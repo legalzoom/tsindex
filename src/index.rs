@@ -3522,6 +3522,8 @@ fn update_file_metadata(
     )?;
     if changed == 0 && crate::overlay::table_exists(conn, "overlay_meta")? {
         crate::overlay::observe_base_file(conn, path, mtime_ns, byte_size)?;
+    } else {
+        crate::overlay::touch_file_directory(conn, path, mtime_ns, byte_size)?;
     }
     Ok(())
 }
@@ -4379,7 +4381,7 @@ fn upsert_file(
             ],
         )?;
     }
-    Ok(())
+    crate::overlay::sync_private_file_directory(conn, path)
 }
 
 fn purge_stale_files(

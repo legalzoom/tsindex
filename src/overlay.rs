@@ -302,6 +302,8 @@ pub(crate) fn prepare(checkout: &Checkout, runtime: &Runtime) -> Result<()> {
     transaction.pragma_update(None, "user_version", OVERLAY_FORMAT_VERSION)?;
     private_tables(&transaction, false)?;
     transaction.commit()?;
+    attach_views(&conn)?;
+    rebuild_file_directory(&conn)?;
     Ok(())
 }
 
@@ -407,15 +409,27 @@ pub(crate) fn attach_views(conn: &Connection) -> Result<bool> {
          AND NOT EXISTS(SELECT 1 FROM main.{files} p WHERE p.repo_id = r.id AND p.path = b.path)",
         meta.repo_id
     );
+    // This is a derived index, not a second source of extraction truth. An
+    // older binary can still publish facts without maintaining the directory;
+    // its generation change makes readers use the original merged view until
+    // the next writer rebuilds the directory inside a private stage.
+    let effective_files = if file_directory_is_current(conn)? {
+        "SELECT id, repo_id, path, language, sha, mtime_ns, byte_size, partial
+         FROM main.overlay_file_directory"
+            .to_owned()
+    } else {
+        format!(
+            "SELECT * FROM main.{files}
+             UNION ALL
+             SELECT -b.id, r.id, b.path, b.language, b.sha,
+                    COALESCE(o.mtime_ns, 0), COALESCE(o.byte_size, b.byte_size), b.partial
+             FROM overlay_base.files b CROSS JOIN main.repos r
+             LEFT JOIN main.overlay_state o ON o.path = b.path
+             WHERE {visible_base_file}"
+        )
+    };
     let sql = format!(
-        "CREATE TEMP VIEW files AS
-           SELECT * FROM main.{files}
-           UNION ALL
-           SELECT -b.id, r.id, b.path, b.language, b.sha,
-                  COALESCE(o.mtime_ns, 0), COALESCE(o.byte_size, b.byte_size), b.partial
-           FROM overlay_base.files b CROSS JOIN main.repos r
-           LEFT JOIN main.overlay_state o ON o.path = b.path
-           WHERE {visible_base_file};
+        "CREATE TEMP VIEW files AS {effective_files};
          CREATE TEMP VIEW symbols AS
            SELECT * FROM main.{symbols}
            UNION ALL
@@ -437,6 +451,94 @@ pub(crate) fn attach_views(conn: &Connection) -> Result<bool> {
     );
     conn.execute_batch(&sql)?;
     Ok(true)
+}
+
+fn file_directory_is_current(conn: &Connection) -> Result<bool> {
+    if !table_exists(conn, "overlay_file_directory")?
+        || !table_exists(conn, "overlay_directory_state")?
+    {
+        return Ok(false);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT d.version = 1 AND d.generation = i.generation
+             FROM main.overlay_directory_state d JOIN main.index_state i ON i.id=d.id
+             WHERE d.id=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
+fn stamp_file_directory(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT INTO main.overlay_directory_state(id, version, generation)
+         SELECT 1, 1, generation FROM main.index_state WHERE id=1
+         ON CONFLICT(id) DO UPDATE SET version=excluded.version, generation=excluded.generation",
+        [],
+    )?;
+    Ok(())
+}
+
+/// The caller has already attached the authoritative merged view. Rebuild only
+/// for old/mismatched derived state, retaining compatibility with existing
+/// overlays and writers rather than requiring a new extraction format.
+fn rebuild_file_directory(conn: &Connection) -> Result<bool> {
+    if file_directory_is_current(conn)? {
+        return Ok(false);
+    }
+    let transaction = conn.unchecked_transaction()?;
+    transaction.execute_batch(
+        "DROP TABLE IF EXISTS main.overlay_file_directory;
+         DROP TABLE IF EXISTS main.overlay_directory_state;
+         CREATE TABLE overlay_file_directory (
+           id INTEGER PRIMARY KEY, repo_id INTEGER NOT NULL,
+           path TEXT NOT NULL UNIQUE, language TEXT NOT NULL, sha TEXT NOT NULL,
+           mtime_ns INTEGER NOT NULL, byte_size INTEGER NOT NULL, partial INTEGER NOT NULL,
+           FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+         );
+         CREATE TABLE overlay_directory_state (
+           id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL,
+           generation INTEGER NOT NULL
+         );
+         INSERT INTO main.overlay_file_directory
+         SELECT id, repo_id, path, language, sha, mtime_ns, byte_size, partial
+         FROM temp.files ORDER BY id;",
+    )?;
+    stamp_file_directory(&transaction)?;
+    transaction.commit()?;
+    Ok(true)
+}
+
+pub(crate) fn touch_file_directory(
+    conn: &Connection,
+    path: &str,
+    mtime_ns: i64,
+    byte_size: i64,
+) -> Result<()> {
+    if table_exists(conn, "overlay_file_directory")? {
+        conn.execute(
+            "UPDATE main.overlay_file_directory SET mtime_ns=?2, byte_size=?3 WHERE path=?1",
+            params![path, mtime_ns, byte_size],
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn sync_private_file_directory(conn: &Connection, path: &str) -> Result<()> {
+    if table_exists(conn, "overlay_file_directory")? {
+        conn.execute(
+            "INSERT INTO main.overlay_file_directory
+             SELECT id, repo_id, path, language, sha, mtime_ns, byte_size, partial
+             FROM main.files WHERE path=?1
+             ON CONFLICT(path) DO UPDATE SET id=excluded.id, repo_id=excluded.repo_id,
+             language=excluded.language, sha=excluded.sha, mtime_ns=excluded.mtime_ns,
+             byte_size=excluded.byte_size, partial=excluded.partial",
+            [path],
+        )?;
+    }
+    Ok(())
 }
 
 fn private_tables(conn: &Connection, staging: bool) -> Result<()> {
@@ -464,6 +566,7 @@ pub(crate) fn observe_base_file(
          mtime_ns=excluded.mtime_ns, byte_size=excluded.byte_size, hidden=0",
         params![path, mtime_ns, byte_size],
     )?;
+    touch_file_directory(conn, path, mtime_ns, byte_size)?;
     Ok(())
 }
 
@@ -497,7 +600,20 @@ pub(crate) fn restore_base(
     byte_size: i64,
 ) -> Result<()> {
     conn.execute("DELETE FROM main.files WHERE path=?1", [path])?;
-    observe_base_file(conn, path, mtime_ns, byte_size)
+    observe_base_file(conn, path, mtime_ns, byte_size)?;
+    if table_exists(conn, "overlay_file_directory")? {
+        let meta = metadata(conn)?.context("file directory has no overlay base")?;
+        conn.execute(
+            "INSERT INTO main.overlay_file_directory
+             SELECT -b.id, r.id, b.path, b.language, b.sha, ?3, ?4, b.partial
+             FROM overlay_base.files b CROSS JOIN main.repos r WHERE b.repo_id=?1 AND b.path=?2
+             ON CONFLICT(path) DO UPDATE SET id=excluded.id, repo_id=excluded.repo_id,
+             language=excluded.language, sha=excluded.sha, mtime_ns=excluded.mtime_ns,
+             byte_size=excluded.byte_size, partial=excluded.partial",
+            params![meta.repo_id, path, mtime_ns, byte_size],
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn base_file_states<'a>(
@@ -528,6 +644,12 @@ pub(crate) fn hide_path(conn: &Connection, path: &str) -> Result<()> {
              VALUES(?1, 0, 0, 1) ON CONFLICT(path) DO UPDATE SET hidden=1",
             [path],
         )?;
+        if table_exists(conn, "overlay_file_directory")? {
+            conn.execute(
+                "DELETE FROM main.overlay_file_directory WHERE path=?1",
+                [path],
+            )?;
+        }
     }
     Ok(())
 }
@@ -732,6 +854,7 @@ pub(crate) fn refresh(
         drop(source);
         return recover(runtime);
     }
+    let directory_rebuilt = rebuild_file_directory(&staged)?;
     staged.close().map_err(|(_, e)| e)?;
     drop(source);
 
@@ -749,9 +872,13 @@ pub(crate) fn refresh(
         return Ok(stats);
     }
     let staged = Connection::open(&scratch.path)?;
+    // Facts, observations and the derived directory were maintained together
+    // in the writer's private transactions. Stamp only the complete build;
+    // failed stages never make a stale directory look current to readers.
+    stamp_file_directory(&staged)?;
     attach_views(&staged)?;
     validate_sources(&staged)?;
-    let changed = fingerprint(&staged)? != before;
+    let changed = directory_rebuilt || fingerprint(&staged)? != before;
     if !changed {
         return Ok(stats);
     }

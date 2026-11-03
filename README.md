@@ -547,6 +547,9 @@ counts, not model accuracy, billing, or realized savings.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution and validation guidance.
 
+Research on a possible worktree storage alternative is collected in the
+[overlay research](docs/research/worktree-index-overlays-prior-art.md).
+
 For iterative work, run the CLI through Cargo so you don't have to reinstall on every change:
 
 ```bash

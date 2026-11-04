@@ -3,19 +3,11 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Mutex,
-    atomic::{AtomicU64, Ordering},
-    mpsc,
-};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
-use rusqlite::{
-    Connection, OpenFlags,
-    backup::{Backup, StepResult},
-    params,
-};
+use anyhow::{Result, anyhow, bail};
+use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 
 use crate::config::{RepoConfig, TsIndexConfig, db_path};
@@ -151,15 +143,29 @@ fn index_status(db: &Path) -> (bool, Option<i64>) {
 
 #[derive(Default)]
 struct WorktreeEntry {
-    name: String,
     runtime: Option<Runtime>,
-    pending: Option<mpsc::Receiver<Result<Runtime>>>,
+    pending: bool,
+    started: u64,
+    completed: u64,
+    failure: Option<Arc<anyhow::Error>>,
     refreshed: Option<Instant>,
+}
+
+#[derive(Default)]
+struct CheckoutState {
+    entry: Mutex<WorktreeEntry>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct CachedCheckout {
+    name: String,
+    state: Arc<CheckoutState>,
 }
 
 pub struct Runtimes {
     pub primary: Runtime,
-    worktrees: Mutex<HashMap<PathBuf, WorktreeEntry>>,
+    worktrees: Mutex<HashMap<PathBuf, CachedCheckout>>,
 }
 
 impl std::ops::Deref for Runtimes {
@@ -254,7 +260,28 @@ impl Runtimes {
     /// Resolve names or absolute roots, refreshing a used worktree at most once
     /// per interval. Slow builds continue in the background after the 30s wait.
     pub fn resolve(&self, repo: Option<&str>) -> Result<(Runtime, Option<String>)> {
+        self.resolve_with_primary_refresh(repo, true)
+    }
+
+    pub(crate) fn resolve_live_query(
+        &self,
+        repo: Option<&str>,
+    ) -> Result<(Runtime, Option<String>)> {
+        // Primary syntax queries can walk live sources while their initial
+        // index is unready, blocked or failed. Linked-checkout ingestion below
+        // retains its existing coordination and freshness requirements.
+        self.resolve_with_primary_refresh(repo, false)
+    }
+
+    fn resolve_with_primary_refresh(
+        &self,
+        repo: Option<&str>,
+        refresh_primary: bool,
+    ) -> Result<(Runtime, Option<String>)> {
         let Some(repo) = repo else {
+            if refresh_primary {
+                crate::maintenance::refresh_if_managed(&self.primary)?;
+            }
             return Ok((self.primary.clone(), None));
         };
         let absolute = Path::new(repo).is_absolute().then(|| {
@@ -278,6 +305,7 @@ impl Runtimes {
             .into());
         }
         cache.retain(|path, _| path.is_dir());
+        drop(cache);
         // Metadata discovery is cheap and also notices worktrees created after
         // startup, renamed entries, and removals without adding any watchers.
         let checkout = self
@@ -301,13 +329,25 @@ impl Runtimes {
             .into_iter()
             .find(|w| w.root == checkout.path)
         {
+            // Named or absolute primary selectors use the same maintenance
+            // policy as an omitted selector; aliases must preserve live reads.
+            if refresh_primary {
+                crate::maintenance::refresh_if_managed(&self.primary)?;
+            }
             return Ok((self.primary.clone(), Some(workspace.name)));
         }
-        let entry = cache.entry(checkout.path.clone()).or_default();
-        entry.name = checkout.name.clone();
+        let state = {
+            let mut cache = self.worktrees.lock().unwrap_or_else(|p| p.into_inner());
+            let cached = cache.entry(checkout.path.clone()).or_default();
+            cached.name = checkout.name.clone();
+            Arc::clone(&cached.state)
+        };
+        // Only this checkout's condition is retained while work is pending.
+        // Waiting releases its entry lock; the global registry is already free.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut entry = state.entry.lock().unwrap_or_else(|p| p.into_inner());
         let refresh = Duration::from_millis(self.primary.config.server.worktree_refresh_ms);
-        if entry.pending.is_none() && entry.refreshed.is_none_or(|time| time.elapsed() >= refresh) {
-            let (tx, rx) = mpsc::channel();
+        if !entry.pending && entry.refreshed.is_none_or(|time| time.elapsed() >= refresh) {
             let mut config = self.primary.config.clone();
             if let Some(workspace) = self
                 .primary
@@ -320,52 +360,97 @@ impl Runtimes {
                 config.repos.clear();
             }
             let languages = self.primary.languages.clone();
-            let jobs = self.primary.jobs;
+            // A server's automatic job setting must not create one whole-machine
+            // parser pool for every simultaneously active worktree.
+            let jobs = if self.primary.jobs == 0 {
+                1
+            } else {
+                self.primary.jobs
+            };
             let checkout = checkout.clone();
-            let previous = entry.runtime.take();
-            entry.pending = Some(rx);
-            std::thread::spawn(move || {
-                let result = (|| {
-                    let runtime = match previous {
-                        Some(runtime)
-                            if runtime
-                                .config
-                                .repos
-                                .first()
-                                .is_some_and(|r| r.name == checkout.name) =>
-                        {
-                            runtime
+            let previous = entry.runtime.clone();
+            let worker_state = Arc::clone(&state);
+            let generation = entry.started.checked_add(1).ok_or_else(|| {
+                anyhow!("worktree refresh generation exhausted; restart the server")
+            })?;
+            entry.started = generation;
+            entry.pending = true;
+            let spawned = std::thread::Builder::new()
+                .name("tsindex-worktree".into())
+                .spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                        || -> Result<(Runtime, Instant)> {
+                            let runtime = match previous {
+                                Some(runtime)
+                                    if runtime
+                                        .config
+                                        .repos
+                                        .first()
+                                        .is_some_and(|r| r.name == checkout.name) =>
+                                {
+                                    runtime
+                                }
+                                _ => open_checkout(&checkout, &config, languages)?.with_jobs(jobs),
+                            };
+                            let refreshed = crate::maintenance::reconcile_if_due(&runtime)?;
+                            Ok((runtime, refreshed))
+                        },
+                    ))
+                    .unwrap_or_else(|_| {
+                        Err(anyhow!("worktree index worker panicked; retry shortly"))
+                    });
+                    let mut entry = worker_state.entry.lock().unwrap_or_else(|p| p.into_inner());
+                    entry.pending = false;
+                    entry.completed = generation;
+                    match result {
+                        Ok((runtime, refreshed)) => {
+                            entry.runtime = Some(runtime);
+                            entry.refreshed = Some(refreshed);
+                            entry.failure = None;
                         }
-                        _ => open_checkout(&checkout, &config, languages)?.with_jobs(jobs),
-                    };
-                    let stats = runtime.build(true, None)?;
-                    if stats.failed > 0 {
-                        bail!(
-                            "worktree index update failed for {} files; retry shortly",
-                            stats.failed
-                        );
+                        Err(error) => {
+                            entry.failure = Some(Arc::new(error));
+                            entry.refreshed = None;
+                        }
                     }
-                    Ok(runtime)
-                })();
-                let _ = tx.send(result);
-            });
+                    worker_state.ready.notify_all();
+                });
+            // Thread allocation may fail under the same resource pressure as
+            // watcher creation. Clear pending so every waiter can fail or retry
+            // instead of waiting forever for a worker that never started.
+            if let Err(error) = spawned {
+                entry.pending = false;
+                entry.completed = generation;
+                entry.failure = Some(Arc::new(
+                    anyhow!(error).context("failed to start worktree index worker; retry shortly"),
+                ));
+                entry.refreshed = None;
+                state.ready.notify_all();
+            }
         }
-        if let Some(pending) = &entry.pending {
-            match pending.recv_timeout(Duration::from_secs(30)) {
-                Ok(result) => {
-                    entry.pending = None;
-                    entry.runtime = Some(result?);
-                    entry.refreshed = Some(Instant::now());
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => bail!(
+        // A zero-interval request may start the next job before notified
+        // waiters regain this lock. They joined the completed generation and
+        // must not be dragged through every later refresh under sustained load.
+        let joined = entry.started;
+        while entry.completed < joined {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!(
                     "index is not ready for worktree {}; update exceeded 30 s; retry shortly",
                     checkout.name
-                ),
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    entry.pending = None;
-                    bail!("worktree index worker stopped; retry shortly");
-                }
+                );
             }
+            let (next, _) = state
+                .ready
+                .wait_timeout(entry, remaining)
+                .unwrap_or_else(|p| p.into_inner());
+            entry = next;
+        }
+        if let Some(error) = &entry.failure {
+            if error.downcast_ref::<InvalidParams>().is_some() {
+                return Err(InvalidParams(error.to_string()).into());
+            }
+            bail!("{error:#}");
         }
         let runtime = entry.runtime.as_ref().unwrap().clone();
         let repo = runtime
@@ -395,6 +480,14 @@ pub fn open_checkout(
         .into());
     }
     let db = db_path(root);
+    // Two servers may discover the same new checkout together. Serialize its
+    // configuration and seeding so neither reads another's truncated config.
+    // The distinct lease is acquired before prepare's ingestion lease; normal
+    // builds never acquire it, so the ordering cannot recursively lock a file.
+    let _preparing = crate::maintenance::FileLease::acquire(
+        db.with_extension("prepare.lock"),
+        Duration::from_secs(30),
+    )?;
     let config_path = crate::config::config_path(root);
     if db.exists() && config_path.exists() {
         return Ok(Runtime::new(
@@ -452,82 +545,7 @@ pub fn open_checkout(
         rules.push_str("*\n");
         fs::write(ignore, rules)?;
     }
-    if !db.exists() {
-        seed(checkout, &db)?;
-    }
-    Ok(Runtime::new(root.clone(), db, config, languages))
-}
-
-fn seed(checkout: &Checkout, destination: &Path) -> Result<()> {
-    let source = db_path(&checkout.main_root);
-    if source == destination || !source.is_file() {
-        return Ok(());
-    }
-    // Both endpoints must still belong to the discovered Git repository.
-    if common_dir(&checkout.main_root).as_ref() != Some(&checkout.common_dir)
-        || common_dir(&checkout.path).as_ref() != Some(&checkout.common_dir)
-    {
-        return Ok(());
-    }
-    let source = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    static SEED_ID: AtomicU64 = AtomicU64::new(0);
-    let temporary = destination.with_extension(format!(
-        "seed-{}-{}",
-        std::process::id(),
-        SEED_ID.fetch_add(1, Ordering::Relaxed)
-    ));
-    let result = (|| -> Result<()> {
-        let mut dest = Connection::open(&temporary)?;
-        {
-            let backup = Backup::new(&source, &mut dest)?;
-            let started = Instant::now();
-            loop {
-                match backup.step(256)? {
-                    StepResult::Done => break,
-                    StepResult::Busy | StepResult::Locked => {
-                        std::thread::sleep(Duration::from_millis(10))
-                    }
-                    _ => {}
-                }
-                if started.elapsed() > Duration::from_secs(30) {
-                    bail!("worktree backup exceeded 30 s; retry shortly");
-                }
-            }
-        }
-        // Keep only the main checkout's rows if its database is a catalog.
-        let repos = dest
-            .prepare("SELECT id, root_path FROM repos")?
-            .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let Some((id, _)) = repos.iter().find(|(_, root)| {
-            Path::new(root).canonicalize().ok().as_ref() == Some(&checkout.main_root)
-        }) else {
-            return Ok(());
-        };
-        dest.execute_batch("PRAGMA foreign_keys = ON;")?;
-        dest.execute("DELETE FROM repos WHERE id != ?1", [id])?;
-        dest.execute(
-            "UPDATE repos SET name = ?1, root_path = ?2 WHERE id = ?3",
-            params![checkout.name, checkout.path.to_string_lossy(), id],
-        )?;
-        // Checkout timestamps cannot establish content identity across roots.
-        // Force the first refresh through hashing while retaining schema-stale
-        // sentinels, which must still force parsing.
-        dest.execute("UPDATE files SET mtime_ns = 0 WHERE mtime_ns >= 0", [])?;
-        if dest.prepare("SELECT ready FROM index_state").is_ok() {
-            dest.execute("UPDATE index_state SET ready = 0 WHERE id = 1", [])?;
-        }
-        dest.close().map_err(|(_, error)| error)?;
-        // Publish only a complete copy, without overwriting a concurrent build.
-        match fs::hard_link(&temporary, destination) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e.into()),
-        }
-        Ok(())
-    })();
-    let _ = fs::remove_file(temporary);
-    result.context("failed to seed worktree index")
+    let runtime = Runtime::new(root.clone(), db, config, languages);
+    crate::overlay::prepare(checkout, &runtime)?;
+    Ok(runtime)
 }

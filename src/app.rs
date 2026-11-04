@@ -602,6 +602,9 @@ pub fn run() -> Result<()> {
                 return serve_mcp(runtime);
             }
             refresh_if_needed(&cli, &runtime)?;
+            if !cli.no_refresh {
+                crate::maintenance::register_primary(&runtime, false);
+            }
             // `--mcp` returned above; everything else (`--http` or no mode at
             // all) serves the HTTP dashboard.
             let port = command.port.unwrap_or(runtime.config.server.http_port);
@@ -727,15 +730,18 @@ fn with_runtime(cli: &Cli, f: impl FnOnce(Runtime) -> Result<()>) -> Result<()> 
         let config = TsIndexConfig::load_or_default(&checkout.main_root)?;
         let languages = cli.languages.clone();
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let result = (|| -> Result<Runtime> {
-                let runtime = crate::worktrees::open_checkout(&checkout, &config, languages)?;
-                let stats = runtime.build(true, None)?;
-                check_full_build_failures(&stats)?;
-                Ok(runtime)
-            })();
-            let _ = tx.send(result);
-        });
+        std::thread::Builder::new()
+            .name("tsindex-checkout-startup".into())
+            .spawn(move || {
+                let result = (|| -> Result<Runtime> {
+                    let runtime = crate::worktrees::open_checkout(&checkout, &config, languages)?;
+                    let stats = runtime.build(true, None)?;
+                    check_full_build_failures(&stats)?;
+                    Ok(runtime)
+                })();
+                let _ = tx.send(result);
+            })
+            .context("failed to start worktree index worker; retry shortly")?;
         let runtime = rx
             .recv_timeout(std::time::Duration::from_secs(30))
             .context("worktree index is not ready after 30 s; retry shortly")??;
@@ -771,33 +777,12 @@ fn refresh_if_needed(cli: &Cli, runtime: &Runtime) -> Result<()> {
 /// brand-new root return empty results instead of "no such table" while the
 /// first build runs.
 fn spawn_background_watch(cli: &Cli, runtime: &Runtime) -> Result<()> {
-    // Bootstrap the schema even under --no-refresh: the flag opts out of
-    // refreshing the index, not of having a database, and skipping it would
-    // turn every query on a brand-new root into "no such table".
+    // Schema bootstrap stays synchronous so initialization never exposes a
+    // missing database while the first maintained refresh runs in the background.
     runtime.initialize()?;
-    if cli.no_refresh {
-        return Ok(());
+    if !cli.no_refresh {
+        crate::maintenance::register_primary(runtime, true);
     }
-    let runtime = runtime.clone();
-    std::thread::spawn(move || {
-        // The startup build inside `watch()` can lose a lock race with a
-        // concurrent `tsindex build`/second server or hit a transient I/O
-        // error; a one-shot failure would leave this session serving a stale
-        // index for its whole lifetime. Retry a few times before giving up.
-        const ATTEMPTS: u32 = 5;
-        for attempt in 1..=ATTEMPTS {
-            match runtime.watch() {
-                Ok(()) => return,
-                Err(e) if attempt < ATTEMPTS => {
-                    eprintln!(
-                        "warning: background index watch failed (attempt {attempt}/{ATTEMPTS}): {e:#}"
-                    );
-                    std::thread::sleep(std::time::Duration::from_secs(2 * u64::from(attempt)));
-                }
-                Err(e) => eprintln!("warning: background index watch failed; giving up: {e:#}"),
-            }
-        }
-    });
     Ok(())
 }
 

@@ -171,6 +171,10 @@ fn mcp_stdio_emits_only_json_rpc_lines() -> Result<()> {
             stdin,
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05","capabilities":{{}},"clientInfo":{{"name":"t","version":"0"}}}}}}"#
         )?;
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
+        )?;
         writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list"}}"#)?;
         writeln!(
             stdin,
@@ -185,7 +189,7 @@ fn mcp_stdio_emits_only_json_rpc_lines() -> Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let lines: Vec<Value> = BufReader::new(&output.stdout[..])
+    let mut lines: Vec<Value> = BufReader::new(&output.stdout[..])
         .lines()
         .map(|l| serde_json::from_str(&l.unwrap()).expect("every stdout line is JSON-RPC"))
         .collect();
@@ -194,6 +198,9 @@ fn mcp_stdio_emits_only_json_rpc_lines() -> Result<()> {
         3,
         "one response per request, nothing else on stdout"
     );
+    // Concurrent handlers may finish out of order; IDs associate each result
+    // with its request while the exact count still detects duplicates/loss.
+    lines.sort_by_key(|line| line["id"].as_u64());
     for (i, line) in lines.iter().enumerate() {
         assert_eq!(line["jsonrpc"], "2.0");
         assert_eq!(line["id"], (i as u64) + 1);
@@ -212,6 +219,58 @@ fn mcp_stdio_emits_only_json_rpc_lines() -> Result<()> {
     );
     let text = lines[2]["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("\"alpha\""));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_exits_when_stdout_closes_even_if_the_parent_keeps_stdin_open() -> Result<()> {
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    struct Server(std::process::Child);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/transport-fixtures");
+    fs::create_dir_all(&artifacts)?;
+    let dir = tempfile::tempdir_in(artifacts)?;
+    fixture(dir.path())?;
+    let mut server = Server(
+        Command::new(BIN)
+            .arg("--root")
+            .arg(dir.path())
+            .args(["--no-refresh", "serve", "--mcp"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    drop(server.0.stdout.take());
+    let input = server.0.stdin.as_mut().unwrap();
+    writeln!(input, r#"{{"jsonrpc":"2.0","id":1,"method":"ping"}}"#)?;
+    input.flush()?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = server.0.try_wait()? {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        status.is_some(),
+        "stdout failure must interrupt the stdin wait"
+    );
+    assert!(
+        !status.unwrap().success(),
+        "a broken output pipe is an I/O error"
+    );
     Ok(())
 }
 

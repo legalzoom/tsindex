@@ -211,7 +211,9 @@ pub(crate) fn prepare(checkout: &Checkout, runtime: &Runtime) -> Result<()> {
         );
     }
     let directory = checkout.main_root.join(".tsindex/bases");
-    fs::create_dir_all(&directory)?;
+    if let Err(error) = fs::create_dir_all(&directory) {
+        return base_creation_failed(runtime, error.into());
+    }
     let base = directory.join(format!("extraction-v{SCHEMA_VERSION}.db"));
     if !base.is_file() {
         let source = open_readonly(&source_path)?;
@@ -227,9 +229,22 @@ pub(crate) fn prepare(checkout: &Checkout, runtime: &Runtime) -> Result<()> {
         if !ready {
             return initialize_standalone(runtime, "the primary index is not ready");
         }
-        let scratch = Scratch::new(&base)?;
+        let scratch = match Scratch::new(&base) {
+            Ok(scratch) => scratch,
+            Err(error) => return base_creation_failed(runtime, error),
+        };
         let mut destination = Connection::open(&scratch.path)?;
         copy_database(&source, &mut destination, 256, Duration::from_secs(30))?;
+        // A failed legacy upgrade can be ready at the current schema while
+        // retaining rows marked for re-extraction. Never freeze those ranges
+        // into a shared base just because the source SHA still matches.
+        if destination.query_row(
+            "SELECT EXISTS(SELECT 1 FROM files WHERE mtime_ns=-1)",
+            [],
+            |row| row.get::<_, bool>(0),
+        )? {
+            return initialize_standalone(runtime, "the primary extraction needs rebuilding");
+        }
         destination.execute_batch("PRAGMA journal_mode = DELETE;")?;
         destination.close().map_err(|(_, e)| e)?;
         // A pathname can be deleted and reused while older overlays still pin
@@ -253,7 +268,7 @@ pub(crate) fn prepare(checkout: &Checkout, runtime: &Runtime) -> Result<()> {
         match fs::hard_link(&scratch.path, &base) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
+            Err(error) => return base_creation_failed(runtime, error.into()),
         }
     }
     let base_conn = open_readonly(&base)?;
@@ -281,6 +296,11 @@ pub(crate) fn prepare(checkout: &Checkout, runtime: &Runtime) -> Result<()> {
     let Some(repo_id) = repo_id else {
         return initialize_standalone(runtime, "the shared base does not contain this repository");
     };
+    // Previously published bases need the same extraction check. Preserve the
+    // immutable file for its existing readers and build this checkout locally.
+    if base_extraction_is_stale(&base_conn, repo_id, false)? {
+        return initialize_standalone(runtime, "the shared base extraction needs rebuilding");
+    }
     runtime.initialize()?;
     let mut conn = Connection::open(&runtime.db_path)?;
     let transaction = conn.transaction()?;
@@ -315,6 +335,31 @@ fn initialize_standalone(runtime: &Runtime, reason: &str) -> Result<()> {
         runtime.root.display()
     );
     runtime.initialize()
+}
+
+fn base_creation_failed(runtime: &Runtime, error: anyhow::Error) -> Result<()> {
+    // Sharing is optional: a readable primary may live in a protected checkout.
+    // Keep indexing local sources when only the shared base store is unwritable;
+    // unexpected storage failures still surface instead of being hidden.
+    if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+        )
+    }) {
+        initialize_standalone(runtime, "the primary shared-base store is read-only")
+    } else {
+        Err(error)
+    }
+}
+
+fn base_extraction_is_stale(conn: &Connection, repo_id: i64, attached: bool) -> Result<bool> {
+    let sql = if attached {
+        "SELECT EXISTS(SELECT 1 FROM overlay_base.files WHERE repo_id=?1 AND mtime_ns=-1)"
+    } else {
+        "SELECT EXISTS(SELECT 1 FROM main.files WHERE repo_id=?1 AND mtime_ns=-1)"
+    };
+    Ok(conn.query_row(sql, [repo_id], |row| row.get(0))?)
 }
 
 fn file_uri(path: &Path) -> Result<String> {
@@ -830,6 +875,16 @@ pub(crate) fn refresh(
     // outside root needs the ordinary materialized schema to keep identities
     // disjoint, so replace this derivation through the same atomic cold path.
     if !single_checkout(runtime)? || !published_repo_matches(runtime)? {
+        // An explicit external database opts out of repository pruning. A
+        // cold stage contains only this configuration, so publishing it could
+        // silently discard the previous catalog. Refuse that conversion while
+        // the caller can still choose a separate destination and retain it.
+        if !runtime.prune_repos {
+            bail!(
+                "cannot preserve existing overlay repositories during this configuration change; \
+                 use a separate --db destination"
+            );
+        }
         eprintln!(
             "note: rebuilding {} as a standalone index: overlay repository configuration changed",
             runtime.root.display()
@@ -850,6 +905,15 @@ pub(crate) fn refresh(
     // bytes survive any failure and are replaced only after full validation.
     if let Err(error) = attach_views(&staged) {
         eprintln!("warning: rebuilding checkout after overlay base became unavailable: {error:#}");
+        drop(staged);
+        drop(source);
+        return recover(runtime);
+    }
+    let meta = metadata(&staged)?.context("staged overlay has no base metadata")?;
+    // Older publishers could pin a schema-stale base. Rebuild the selected
+    // checkout instead of letting normalized observations or a directory
+    // cache turn those invalid ranges into reusable extraction.
+    if base_extraction_is_stale(&staged, meta.repo_id, true)? {
         drop(staged);
         drop(source);
         return recover(runtime);
@@ -926,9 +990,17 @@ fn published_repo_matches(runtime: &Runtime) -> Result<bool> {
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let workspaces = runtime.workspaces()?;
-    Ok(repositories.len() == 1
-        && repositories[0].0 == workspaces[0].name
-        && Path::new(&repositories[0].1).canonicalize()? == runtime.root.canonicalize()?)
+    if repositories.len() != 1 || repositories[0].0 != workspaces[0].name {
+        return Ok(false);
+    }
+    let previous = match Path::new(&repositories[0].1).canonicalize() {
+        Ok(path) => path,
+        // Moving a worktree carries its index but invalidates the old root.
+        // Treat that as a recovery mismatch; other I/O errors still surface.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(previous == runtime.root.canonicalize()?)
 }
 
 #[cfg(test)]

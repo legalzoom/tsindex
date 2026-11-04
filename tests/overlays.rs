@@ -126,6 +126,150 @@ fn two_checkouts_share_one_base_and_store_only_changed_extractions() -> Result<(
 }
 
 #[test]
+fn schema_stale_primary_or_published_base_cannot_seed_a_fresh_overlay() -> Result<()> {
+    for published_base in [false, true] {
+        let fixture = Fixture::new()?;
+        let source = if published_base {
+            let alpha = fixture.runtime(&fixture.alpha)?;
+            storage_stats(&alpha.db_path)?.base_path.unwrap()
+        } else {
+            db_path(&fixture.main)
+        };
+        // A failed legacy upgrade can leave ready/current-schema storage with
+        // stale extraction. Matching source bytes do not repair its old ranges.
+        let conn = rusqlite::Connection::open(&source)?;
+        conn.execute("UPDATE files SET mtime_ns=-1 WHERE path='shared.py'", [])?;
+        conn.execute("UPDATE symbols SET start_row=2 WHERE name='shared'", [])?;
+        drop(conn);
+        let beta = fixture.runtime(&fixture.beta)?;
+        let result = serde_json::to_value(beta.get_symbol(serde_json::from_value(
+            serde_json::json!({"name":"shared"}),
+        )?)?)?;
+        assert_eq!(result["matches"][0]["range"][0], 1, "{result}");
+        assert_eq!(storage_stats(&beta.db_path)?.base_path, None);
+    }
+    Ok(())
+}
+
+#[test]
+fn an_existing_overlay_recovers_from_a_schema_stale_base() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let alpha = fixture.runtime(&fixture.alpha)?;
+    let base = storage_stats(&alpha.db_path)?.base_path.unwrap();
+    // Reproduce an invalid base accepted by an older publisher. The directory
+    // already exists, so changing only the fallback projection cannot fix it.
+    let conn = rusqlite::Connection::open(base)?;
+    conn.execute("UPDATE files SET mtime_ns=-1 WHERE path='shared.py'", [])?;
+    conn.execute("UPDATE symbols SET start_row=2 WHERE name='shared'", [])?;
+    drop(conn);
+    alpha.build(true, None)?;
+    let result = serde_json::to_value(alpha.get_symbol(serde_json::from_value(
+        serde_json::json!({"name":"shared"}),
+    )?)?)?;
+    assert_eq!(result["matches"][0]["range"][0], 1, "{result}");
+    assert_eq!(storage_stats(&alpha.db_path)?.base_path, None);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_read_only_primary_base_store_falls_back_to_private_indexing() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    for existing_directory in [false, true] {
+        let fixture = Fixture::new()?;
+        // Keep SQLite sidecars present so the primary stays readable while
+        // its directory cannot accept a newly published shared snapshot.
+        let primary = rusqlite::Connection::open(db_path(&fixture.main))?;
+        primary.query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, i64>(0))?;
+        let store = fixture.main.join(".tsindex");
+        let bases = store.join("bases");
+        let mut permissions = vec![(store.clone(), fs::metadata(&store)?.permissions())];
+        if existing_directory {
+            fs::create_dir(&bases)?;
+            permissions.push((bases.clone(), fs::metadata(&bases)?.permissions()));
+        }
+        for (path, _) in &permissions {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o555))?;
+        }
+        let result = fixture.runtime(&fixture.alpha);
+        // Restore permissions before propagating errors or making assertions,
+        // so the fixture is removable on the original failure path as well.
+        for (path, original) in permissions {
+            fs::set_permissions(path, original)?;
+        }
+        let alpha = result?;
+        assert_eq!(symbol(&alpha, "shared")?, 1);
+        assert_eq!(storage_stats(&alpha.db_path)?.base_path, None);
+        drop(primary);
+    }
+    Ok(())
+}
+
+#[test]
+fn a_moved_checkout_recovers_when_its_previous_root_no_longer_exists() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let alpha = fixture.runtime(&fixture.alpha)?;
+    let parent = fixture.alpha.parent().unwrap().join("relocated");
+    fs::create_dir(&parent)?;
+    let moved = parent.join("alpha");
+    fs::rename(&fixture.alpha, &moved)?;
+    fs::write(
+        fixture.main.join(".git/worktrees/alpha/gitdir"),
+        format!("{}\n", moved.join(".git").display()),
+    )?;
+    fs::write(moved.join("change.py"), "def relocated():\n    return 42\n")?;
+    let relocated = Runtime::new(
+        moved.clone(),
+        db_path(&moved),
+        fixture.config.clone(),
+        vec![],
+    );
+    relocated.build(true, None)?;
+    assert_eq!(symbol(&relocated, "relocated")?, 1);
+    assert_eq!(symbol(&relocated, "original")?, 0);
+    assert_eq!(symbol(&relocated, "shared")?, 1);
+    assert!(!alpha.root.exists());
+    let result = serde_json::to_value(relocated.get_symbol(serde_json::from_value(
+        serde_json::json!({"name":"relocated", "include_body":true}),
+    )?)?)?;
+    assert!(
+        result["matches"][0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("42")
+    );
+    Ok(())
+}
+
+#[test]
+fn foreign_database_recovery_refuses_to_discard_existing_repositories() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fs::write(
+        fixture.alpha.join("change.py"),
+        "def private():\n    pass\n",
+    )?;
+    let alpha = fixture.runtime(&fixture.alpha)?;
+    let before = storage_stats(&alpha.db_path)?;
+    let foreign = fixture.alpha.parent().unwrap().join("foreign");
+    fs::create_dir(&foreign)?;
+    fs::write(foreign.join("foreign.py"), "def foreign():\n    pass\n")?;
+    let other = Runtime::new(
+        foreign,
+        alpha.db_path.clone(),
+        fixture.config.clone(),
+        vec![],
+    )
+    .with_repo_pruning(false);
+    let error = other.build(true, None).unwrap_err();
+    assert!(error.to_string().contains("preserve"), "{error:#}");
+    assert_eq!(symbol(&alpha, "shared")?, 1);
+    assert_eq!(symbol(&alpha, "private")?, 1);
+    assert_eq!(storage_stats(&alpha.db_path)?.generation, before.generation);
+    assert_eq!(storage_stats(&alpha.db_path)?.base_path, before.base_path);
+    Ok(())
+}
+
+#[test]
 fn a_missing_base_is_recovered_by_rebuilding_the_selected_checkout() -> Result<()> {
     let fixture = Fixture::new()?;
     let alpha = fixture.runtime(&fixture.alpha)?;
@@ -527,6 +671,51 @@ fn a_stale_directory_falls_back_to_facts_and_is_rebuilt_before_publication() -> 
 }
 
 #[test]
+fn an_unknown_directory_version_uses_facts_until_the_cache_is_rebuilt() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fs::write(
+        fixture.alpha.join("change.py"),
+        "def private():\n    pass\n",
+    )?;
+    let alpha = fixture.runtime(&fixture.alpha)?;
+    let pinned = read_connection(&alpha.db_path)?;
+    let files = |conn: &rusqlite::Connection| -> Result<Vec<(i64, String, String, String)>> {
+        Ok(conn
+            .prepare(
+                "SELECT f.id, f.path, f.sha, s.name FROM files f
+                 JOIN symbols s ON s.file_id=f.id ORDER BY f.path, s.name",
+            )?
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    };
+    let before = files(&pinned)?;
+    assert!(before.iter().any(|row| row.0 > 0));
+    assert!(before.iter().any(|row| row.0 < 0));
+    rusqlite::Connection::open(&alpha.db_path)?.execute_batch(
+        "BEGIN; DELETE FROM overlay_file_directory;
+         UPDATE overlay_directory_state SET version=99; COMMIT;",
+    )?;
+    assert_eq!(symbol(&alpha, "private")?, 1);
+    assert_eq!(symbol(&alpha, "shared")?, 1);
+    assert_eq!(files(&read_connection(&alpha.db_path)?)?, before);
+    assert_eq!(alpha.build(true, None)?.indexed, 0);
+    assert_eq!(files(&pinned)?, before);
+    let repaired = read_connection(&alpha.db_path)?;
+    assert_eq!(files(&repaired)?, before);
+    let plan = repaired
+        .prepare("EXPLAIN QUERY PLAN SELECT path FROM files WHERE id=?1")?
+        .query_map([-1], |row| row.get::<_, String>(3))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("overlay_file_directory"))
+    );
+    Ok(())
+}
+
+#[test]
 fn restoring_changed_and_deleted_files_returns_to_shared_extractions() -> Result<()> {
     let fixture = Fixture::new()?;
     fs::write(
@@ -538,6 +727,16 @@ fn restoring_changed_and_deleted_files_returns_to_shared_extractions() -> Result
     assert_eq!(symbol(&alpha, "original")?, 0);
     assert_eq!(symbol(&alpha, "removed")?, 0);
     assert_eq!(storage_stats(&alpha.db_path)?.private_files, 1);
+    let pinned = read_connection(&alpha.db_path)?;
+    let metadata = |conn: &rusqlite::Connection| -> rusqlite::Result<(i64, String, i64)> {
+        conn.query_row(
+            "SELECT id, sha, mtime_ns FROM files WHERE path='change.py'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+    };
+    let private = metadata(&pinned)?;
+    assert!(private.0 > 0);
     fs::copy(
         fixture.main.join("change.py"),
         fixture.alpha.join("change.py"),
@@ -551,6 +750,10 @@ fn restoring_changed_and_deleted_files_returns_to_shared_extractions() -> Result
     assert_eq!(symbol(&alpha, "original")?, 1);
     assert_eq!(symbol(&alpha, "removed")?, 1);
     assert_eq!(storage_stats(&alpha.db_path)?.private_files, 0);
+    let restored = metadata(&read_connection(&alpha.db_path)?)?;
+    assert!(restored.0 < 0);
+    assert_ne!(restored.1, private.1);
+    assert_eq!(metadata(&pinned)?, private);
     Ok(())
 }
 

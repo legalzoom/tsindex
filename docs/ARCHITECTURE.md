@@ -33,9 +33,12 @@ identity with its base path. Every attach compares the identities before
 exposing extraction: a pathname and schema version alone cannot identify a
 generation if someone deletes and recreates the base at the same path.
 
-If a ready main index is unavailable on first use, the checkout instead builds
-a standalone materialized index. This preserves availability without requiring
-the main checkout to finish indexing first. A later ready main index does not
+If a ready main index is unavailable on first use, or its shared-base store is
+read-only, the checkout instead builds a standalone materialized index.
+Snapshots with schema-stale file markers are also excluded: matching content
+does not make old extraction ranges compatible. This preserves availability
+without requiring the main checkout to finish indexing first. A later ready
+main index does not
 automatically convert that existing cache to an overlay.
 
 The linked checkout keeps `.tsindex/index.db` containing its base pin, per-path
@@ -123,6 +126,12 @@ configuration with several workspaces or an outside source root, rebuild the
 selected checkout into a standalone private stage and publish only on success.
 An explicitly changed configuration whose repository name or source root no
 longer matches the stored workspace also takes that cold-rebuild path.
+A moved checkout whose stored root no longer exists is such a mismatch.
+When repository pruning is disabled for an explicit external database,
+configuration-changing recovery refuses publication rather than discard
+repositories absent from its new stage. The caller can choose a separate
+database destination. Existing overlays backed by schema-stale extraction
+also rebuild independently, even when their file directory is current.
 A changed or absent base identity similarly refuses reads with rebuild
 guidance until ordinary reconciliation or an explicit build recovers it.
 Existing readers that already attached the previous base retain that snapshot.

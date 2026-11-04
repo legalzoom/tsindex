@@ -293,12 +293,16 @@ can therefore require retries. The primary's `--no-refresh` opt-out remains
 available. An index generation is not an atomic snapshot of the live filesystem.
 
 Sharing applies to a fresh, single-checkout configuration with a ready main
-index. If that source is not ready or is unavailable on first use, the checkout
-builds a standalone index so it can still serve requests. That index remains
+index. If that source is not ready, contains schema-stale extraction, or cannot
+publish a shared base on first use, the checkout builds a standalone index so
+it can still serve requests. That index remains
 materialized when the main index later becomes ready. Existing materialized
 worktree indexes also remain usable without automatic conversion, and multi-repo
 catalogs retain materialized storage. Missing or incompatible bases recover by
 rebuilding the selected checkout separately.
+An explicit `--db` pointing at an overlay from another configuration refuses a
+recovery that would discard its existing repositories. Use a separate database
+destination for that root.
 Bases are fixed snapshots and are retained: automatic rebasing, compaction,
 and deletion are future work. The first base adds one full copy next to the
 primary, so savings grow with checkout count and shared content. Downgrading

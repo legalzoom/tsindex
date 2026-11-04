@@ -122,9 +122,11 @@ prepare_checkout(checkout)
   find a compatible immutable base in the same Git repository
     none exists:
       copy the ready main database into a private scratch file using Backup
+      schema-stale file markers -> ordinary standalone, never freeze old ranges
       persist its SHA-derived snapshot identity before publication
       close/checkpoint the copy and publish it with a create-only hard link
       reuse the completed winner if another creator published first
+    shared store read-only or existing base schema-stale -> ordinary standalone
 
   initialize private overlay metadata and its persistent base pin
   run the normal complete checkout reconciliation
@@ -141,7 +143,8 @@ first use still walks and checks local files. Dirty files in the main checkout
 cannot substitute for the selected checkout's bytes.
 
 If the main index is unready or unavailable on first use, the checkout builds
-a standalone materialized index. It stays materialized when the main index
+a standalone materialized index. A protected shared-base store or schema-stale
+extraction takes the same fallback. It stays materialized when the main index
 later becomes ready: availability does not depend on main-index preparation,
 and there is no automatic later conversion of existing caches.
 
@@ -235,6 +238,10 @@ watch budget or change system limits.
   rebuild. Failed preparation leaves the old published bytes intact.
   Explicit changes to a configured workspace's name or root that no longer
   match the stored overlay workspace also use this cold-rebuild path.
+  A moved checkout's absent old root is a mismatch rather than a fatal error.
+  Explicit external-database operations that disable repository pruning
+  refuse configuration-changing recovery before replacing existing rows;
+  the caller must choose a separate destination instead of losing repositories.
 - An absent or mismatched base identity refuses reads with rebuild guidance;
   ordinary reconciliation or an explicit build cold-recovers the checkout.
   Already pinned readers retain their original base. Older bases without an

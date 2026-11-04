@@ -22,11 +22,11 @@ for HTTP servers and watchers. Inferred owners that cannot be inspected retain
 parent-PID-only tracking; inspection failures after capture do not imply exit.
 
 Linux reads process metadata as bytes because the kernel can truncate a process
-name inside a UTF-8 character. Only the numeric suffix of `/proc/<pid>/stat` is
-decoded. Its start time detects PID reuse, and its thread count distinguishes
-a zombie leader with surviving workers from an entirely exited process. Both
-values come from the same read; monitoring requires no per-thread directory
-walk.
+name inside a UTF-8 character. Only fields following the process name in
+`/proc/<pid>/stat` are decoded. Its start time detects PID reuse, and its thread
+count distinguishes a zombie leader with surviving workers from an entirely
+exited process. Both values come from the same read without scanning individual
+threads.
 
 ## Filesystem updates
 

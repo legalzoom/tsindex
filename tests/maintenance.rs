@@ -1,7 +1,9 @@
 //! Maintenance contracts at the process and lease interfaces.
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -17,6 +19,7 @@ use tsindex::maintenance::{self, FileLease};
 use tsindex::mcp::handle_request_with_runtimes;
 use tsindex::worktrees::Runtimes;
 
+#[cfg(target_os = "linux")]
 const BIN: &str = env!("CARGO_BIN_EXE_tsindex");
 
 fn fixture() -> Result<(TempDir, PathBuf)> {
@@ -133,6 +136,7 @@ fn waiting_requests(
     Ok(results)
 }
 
+#[cfg(target_os = "linux")]
 struct Client {
     child: Child,
     responses: mpsc::Receiver<std::io::Result<String>>,
@@ -141,8 +145,8 @@ struct Client {
     log: PathBuf,
 }
 
+#[cfg(target_os = "linux")]
 impl Client {
-    #[cfg(target_os = "linux")]
     fn without_inotify(root: &Path, no_refresh: bool) -> Result<Self> {
         use std::os::unix::process::CommandExt;
         static NEXT_LOG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -287,6 +291,7 @@ impl Client {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for Client {
     fn drop(&mut self) {
         let _ = self.child.kill();

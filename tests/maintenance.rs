@@ -147,6 +147,53 @@ fn primary_live_queries_ignore_unrelated_reconciliation_failures() -> Result<()>
 }
 
 #[test]
+fn ready_primary_queries_use_indexed_candidates_until_reconciliation() -> Result<()> {
+    let (_directory, root) = fixture()?;
+    let runtime = Runtime::new(
+        root.clone(),
+        db_path(&root),
+        TsIndexConfig::load(&root)?,
+        vec![],
+    );
+    maintenance::register_primary(&runtime, false);
+    let runtimes = Runtimes::new(runtime);
+    fs::write(root.join("a.py"), "def edited_existing():\n    return 2\n")?;
+    fs::write(
+        root.join("new.py"),
+        "def newly_discovered():\n    return 3\n",
+    )?;
+    let names =
+        || -> Result<Vec<String>> {
+            let response = handle_request_with_runtimes(&runtimes, json!({
+            "jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params":{"name":"query", "arguments":{
+                "language":"python", "query":"(function_definition name: (identifier) @name)"
+            }}
+        }))?.context("missing live query response")?;
+            ensure!(response.get("error").is_none(), "{response}");
+            let payload: Value =
+                serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())?;
+            let mut names = payload["captures"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|capture| capture["text"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            names.sort();
+            Ok(names)
+        };
+    // Existing candidates are parsed from current bytes, but a live query
+    // deliberately does not scan for new paths in a ready primary catalog.
+    assert_eq!(names()?, ["edited_existing"]);
+    assert_eq!(
+        symbol(&runtimes, root.to_str().unwrap(), "newly_discovered")?["total"],
+        1
+    );
+    assert_eq!(names()?, ["edited_existing", "newly_discovered"]);
+    Ok(())
+}
+
+#[test]
 fn primary_live_query_does_not_wait_for_the_initial_writer() -> Result<()> {
     let (_directory, runtime) = unready_primary(2000)?;
     let writer = FileLease::acquire(

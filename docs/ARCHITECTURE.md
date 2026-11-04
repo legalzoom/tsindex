@@ -167,6 +167,11 @@ runtime's live-walk fallback before the initial index is ready, so a blocked
 writer or an unrelated refresh failure does not prevent querying readable
 sources. Index-backed and editing tools still establish freshness, and explicit
 linked-checkout queries retain their existing ingestion coordination.
+When the primary index is ready, it still supplies query's candidate file list.
+New source paths appear after a watcher update, an indexed read's refresh, or
+an explicit update. Query-only traffic does not itself reconcile that list or
+retry watcher ownership; the exemption preserves live source parsing and
+availability rather than guaranteeing complete discovery of newly added files.
 
 Linked checkout reconciliation uses the same durable marker protocol, so
 compatible processes can reuse a successful scan within a positive interval.

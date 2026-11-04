@@ -236,3 +236,121 @@ fn disconnected_stderr_does_not_prevent_shutdown() -> Result<()> {
     assert!(server.0.wait()?.success());
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+mod linux_owners {
+    use super::*;
+    use std::io::Write;
+
+    fn owner(dir: &Path, mode: &str) -> Result<Process> {
+        // A native fixture can exit the actual thread-group leader; exiting a
+        // Rust test thread would leave the harness's main thread alive instead.
+        let executable = dir.join("owner");
+        let output = Command::new("cc")
+            .args(["-pthread", "-o"])
+            .arg(&executable)
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/lifecycle-owner.c"
+            ))
+            .output()?;
+        assert!(output.status.success(), "{output:?}");
+        let mut owner = Process(
+            Command::new(executable)
+                .arg(mode)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()?,
+        );
+        let stdout = owner.0.stdout.take().context("owner stdout")?;
+        let (sent, received) = mpsc::channel();
+        thread::spawn(move || {
+            let mut line = String::new();
+            let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
+            let _ = sent.send(result);
+        });
+        assert_eq!(received.recv_timeout(Duration::from_secs(8))??, "ready\n");
+        Ok(owner)
+    }
+
+    fn exit_leader(owner: &mut Process) -> Result<()> {
+        owner
+            .0
+            .stdin
+            .as_mut()
+            .context("owner stdin")?
+            .write_all(b"x")?;
+        let status = format!("/proc/{}/status", owner.0.id());
+        wait_until(|| {
+            read_log(Path::new(&status))
+                .lines()
+                .any(|line| line.starts_with("State:\tZ"))
+        });
+        assert!(
+            owner.0.try_wait()?.is_none(),
+            "worker must keep owner alive"
+        );
+        Ok(())
+    }
+
+    fn exercise_owner(mode: &str, leader_exits_before_capture: bool) -> Result<()> {
+        let dir = fixture()?;
+        let log = dir.path().join("server.log");
+        let mut owner = owner(dir.path(), mode)?;
+        if mode == "unicode" {
+            let comm = fs::read(format!("/proc/{}/comm", owner.0.id()))?;
+            assert!(
+                std::str::from_utf8(&comm).is_err(),
+                "fixture must split UTF-8"
+            );
+        }
+        if leader_exits_before_capture {
+            exit_leader(&mut owner)?;
+        }
+        let mut server = Process(
+            Command::new(BIN)
+                .arg("--root")
+                .arg(dir.path())
+                .args(["--no-refresh", "serve", "--mcp", "--session-pid"])
+                .arg(owner.0.id().to_string())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(fs::File::create(&log)?)
+                .spawn()?,
+        );
+        wait_until(|| {
+            read_log(&log).contains("tracking session PID")
+                || server.0.try_wait().unwrap().is_some()
+        });
+        assert!(server.0.try_wait()?.is_none(), "{}", read_log(&log));
+        if mode == "threads" && !leader_exits_before_capture {
+            exit_leader(&mut owner)?;
+        }
+        // Cross a complete poll while the inspectable owner is still alive.
+        // stdin stays open so only lifecycle monitoring can terminate MCP.
+        thread::sleep(Duration::from_millis(5200));
+        assert!(owner.0.try_wait()?.is_none());
+        assert!(server.0.try_wait()?.is_none(), "{}", read_log(&log));
+        owner.0.kill()?;
+        // Do not reap: an entirely zombie process must still trigger cleanup.
+        wait_until(|| server.0.try_wait().unwrap().is_some());
+        assert!(server.0.wait()?.success(), "{}", read_log(&log));
+        assert!(read_log(&log).contains("exited; shutting down"));
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_owner_accepts_non_utf8_process_name() -> Result<()> {
+        exercise_owner("unicode", false)
+    }
+
+    #[test]
+    fn explicit_owner_accepts_zombie_leader_with_live_worker() -> Result<()> {
+        exercise_owner("threads", true)
+    }
+
+    #[test]
+    fn explicit_owner_survives_main_thread_exit() -> Result<()> {
+        exercise_owner("threads", false)
+    }
+}

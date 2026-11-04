@@ -977,7 +977,14 @@ fn call_tool(
         Some(Value::String(repo)) => Some(repo.as_str()),
         Some(_) => return Err(InvalidParams("repo must be a string".into()).into()),
     };
-    let (runtime, repo) = runtimes.resolve(repo)?;
+    // Live primary queries must reach their unready-index fallback without
+    // waiting for a full refresh of unrelated sources. Indexed and editing
+    // tools still establish freshness through the ordinary resolver.
+    let (runtime, repo) = if name == "query" {
+        runtimes.resolve_live_query(repo)?
+    } else {
+        runtimes.resolve(repo)?
+    };
     if let Some(repo) = repo {
         arguments["repo"] = Value::String(repo);
     }

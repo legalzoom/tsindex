@@ -205,7 +205,9 @@ last successful full refresh is older than `worktree_refresh_ms` (2000 ms by
 default). `serve --mcp` additionally coordinates a watcher with compatible
 servers using the same database. Its startup runs in the background so the MCP
 `initialize` handshake remains responsive; indexed reads establish freshness
-before returning. Watch notifications reduce latency, while periodic on-demand
+before returning. Primary live `query` requests bypass full-index
+reconciliation, including when startup is blocked or unrelated sources fail.
+Watch notifications reduce latency, while periodic on-demand
 reconciliation covers missing watches. Failed reconciliation returns an
 explicit freshness error. Pass `--no-refresh` to disable primary automatic
 maintenance; its index then reflects the last explicit `build`/`update`.

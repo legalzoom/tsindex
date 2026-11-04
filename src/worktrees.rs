@@ -260,8 +260,28 @@ impl Runtimes {
     /// Resolve names or absolute roots, refreshing a used worktree at most once
     /// per interval. Slow builds continue in the background after the 30s wait.
     pub fn resolve(&self, repo: Option<&str>) -> Result<(Runtime, Option<String>)> {
+        self.resolve_with_primary_refresh(repo, true)
+    }
+
+    pub(crate) fn resolve_live_query(
+        &self,
+        repo: Option<&str>,
+    ) -> Result<(Runtime, Option<String>)> {
+        // Primary syntax queries can walk live sources while their initial
+        // index is unready, blocked or failed. Linked-checkout ingestion below
+        // retains its existing coordination and freshness requirements.
+        self.resolve_with_primary_refresh(repo, false)
+    }
+
+    fn resolve_with_primary_refresh(
+        &self,
+        repo: Option<&str>,
+        refresh_primary: bool,
+    ) -> Result<(Runtime, Option<String>)> {
         let Some(repo) = repo else {
-            crate::maintenance::refresh_if_managed(&self.primary)?;
+            if refresh_primary {
+                crate::maintenance::refresh_if_managed(&self.primary)?;
+            }
             return Ok((self.primary.clone(), None));
         };
         let absolute = Path::new(repo).is_absolute().then(|| {
@@ -309,7 +329,11 @@ impl Runtimes {
             .into_iter()
             .find(|w| w.root == checkout.path)
         {
-            crate::maintenance::refresh_if_managed(&self.primary)?;
+            // Named or absolute primary selectors use the same maintenance
+            // policy as an omitted selector; aliases must preserve live reads.
+            if refresh_primary {
+                crate::maintenance::refresh_if_managed(&self.primary)?;
+            }
             return Ok((self.primary.clone(), Some(workspace.name)));
         }
         let state = {

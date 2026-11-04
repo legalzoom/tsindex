@@ -152,7 +152,7 @@ runtime watchers retry, and another server can take over. HTTP uses on-demand
 maintenance without allocating a watcher. `--no-refresh` opts the primary out
 of automatic maintenance; explicit linked checkout selection still reconciles.
 
-Before a managed primary read, a configuration-matched successful full-refresh
+Before a managed primary indexed read, a configuration-matched full-refresh
 marker can be reused for `worktree_refresh_ms` (default 2000 ms). Its generation
 must still match the database. A local coordinator and a cross-process lease
 coalesce scans; the marker is checked again after taking the lease. Only a
@@ -160,6 +160,13 @@ successful full build advances it. Partial path updates cannot conceal a gap
 in notification coverage. Reconciliation runs even with a healthy watcher,
 covering missed or incomplete registrations; failure returns a freshness
 error instead of silently treating old indexed data as current.
+
+Primary live syntax queries resolve sources without this reconciliation gate,
+including configured names and absolute primary selectors. They retain the
+runtime's live-walk fallback before the initial index is ready, so a blocked
+writer or an unrelated refresh failure does not prevent querying readable
+sources. Index-backed and editing tools still establish freshness, and explicit
+linked-checkout queries retain their existing ingestion coordination.
 
 Linked checkout reconciliation uses the same durable marker protocol, so
 compatible processes can reuse a successful scan within a positive interval.

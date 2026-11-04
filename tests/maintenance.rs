@@ -36,6 +36,198 @@ fn fixture() -> Result<(TempDir, PathBuf)> {
     Ok((directory, root))
 }
 
+fn unready_primary(refresh_ms: u64) -> Result<(TempDir, Runtime)> {
+    let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/maintenance-fixtures");
+    fs::create_dir_all(&artifacts)?;
+    let directory = tempfile::tempdir_in(artifacts)?;
+    let root = directory.path().canonicalize()?;
+    fs::write(root.join("a.py"), "def live_capture():\n    return 1\n")?;
+    let mut config = TsIndexConfig::default();
+    config.languages.include = vec!["python".into()];
+    config.server.worktree_refresh_ms = refresh_ms;
+    config.write(&root)?;
+    let runtime = Runtime::new(root.clone(), db_path(&root), config, vec![]);
+    runtime.initialize()?;
+    maintenance::register_primary(&runtime, false);
+    Ok((directory, runtime))
+}
+
+fn live_query(runtimes: &Runtimes, repo: Option<&str>) -> Result<Value> {
+    let mut arguments = json!({
+        "language":"python", "file_glob":"a.py",
+        "query":"(function_definition name: (identifier) @name)"
+    });
+    if let Some(repo) = repo {
+        arguments["repo"] = json!(repo);
+    }
+    handle_request_with_runtimes(
+        runtimes,
+        json!({"jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params":{"name":"query", "arguments":arguments}}),
+    )?
+    .context("missing live query response")
+}
+
+#[cfg(unix)]
+#[test]
+fn primary_live_queries_ignore_unrelated_reconciliation_failures() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        return Ok(());
+    }
+    struct RestorePermissions(PathBuf, fs::Permissions);
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, self.1.clone());
+        }
+    }
+    for refresh_ms in [2000, 0] {
+        let (_directory, runtime) = unready_primary(refresh_ms)?;
+        let unreadable = runtime.root.join("unrelated.py");
+        fs::write(&unreadable, "def unrelated():\n    pass\n")?;
+        let _restore =
+            RestorePermissions(unreadable.clone(), fs::metadata(&unreadable)?.permissions());
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))?;
+        // The live runtime can already read this filtered source without an
+        // index. Managed dispatch must preserve that same availability.
+        let expected = runtime.query(serde_json::from_value(json!({
+            "language":"python", "file_glob":"a.py",
+            "query":"(function_definition name: (identifier) @name)"
+        }))?)?;
+        assert_eq!(expected.captures[0].text, "live_capture");
+        let root = runtime.root.clone();
+        let runtimes = Runtimes::new(runtime);
+        for repo in [
+            None,
+            root.to_str(),
+            root.file_name().and_then(|name| name.to_str()),
+        ] {
+            let response = live_query(&runtimes, repo)?;
+            assert!(
+                response.get("error").is_none(),
+                "refresh_ms={refresh_ms}: {response}"
+            );
+            let payload: Value =
+                serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())?;
+            assert_eq!(payload["captures"][0]["text"], "live_capture");
+        }
+        for (name, arguments) in [
+            ("get_symbol", json!({"name":"live_capture"})),
+            ("list_file_outline", json!({"file":"a.py"})),
+            ("enclosing_symbol", json!({"file":"a.py", "row":1})),
+            ("find_references", json!({"names":["live_capture"]})),
+        ] {
+            let indexed = handle_request_with_runtimes(
+                &runtimes,
+                json!({
+                    "jsonrpc":"2.0", "id":2, "method":"tools/call",
+                    "params":{"name":name, "arguments":arguments}
+                }),
+            )?
+            .context("missing indexed response")?;
+            assert_eq!(indexed["error"]["code"], -32603, "{name}: {indexed}");
+            assert!(
+                indexed["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("freshness unavailable")
+            );
+        }
+        fs::write(
+            root.join("a.py"),
+            "def after_failed_refresh():\n    return 2\n",
+        )?;
+        let response = live_query(&runtimes, None)?;
+        assert!(response.get("error").is_none(), "{response}");
+        let payload: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())?;
+        assert_eq!(payload["captures"][0]["text"], "after_failed_refresh");
+    }
+    Ok(())
+}
+
+#[test]
+fn primary_live_query_does_not_wait_for_the_initial_writer() -> Result<()> {
+    let (_directory, runtime) = unready_primary(2000)?;
+    let writer = FileLease::acquire(
+        maintenance::writer_lease_path(&runtime.db_path),
+        Duration::from_secs(1),
+    )?;
+    let runtimes = Arc::new(Runtimes::new(runtime));
+    let (entered, started) = mpsc::channel();
+    let (finished, response) = mpsc::channel();
+    let caller = thread::spawn(move || {
+        let _ = entered.send(());
+        let _ = finished.send(live_query(&runtimes, None));
+    });
+    let early = started
+        .recv_timeout(Duration::from_secs(2))
+        .map_err(anyhow::Error::from)
+        .and_then(|_| {
+            response
+                .recv_timeout(Duration::from_secs(2))
+                .map_err(anyhow::Error::from)
+        });
+    // Release and join before asserting so a regression cannot strand a
+    // blocked refresh worker or leave the fixture's writer lease behind.
+    drop(writer);
+    caller.join().expect("live query caller panicked");
+    let response = early.context("primary live query waited behind the startup writer")??;
+    assert!(response.get("error").is_none(), "{response}");
+    let payload: Value =
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())?;
+    assert_eq!(payload["captures"][0]["text"], "live_capture");
+    Ok(())
+}
+
+#[test]
+fn a_linked_live_query_still_waits_for_its_checkout_refresh() -> Result<()> {
+    let (_directory, root) = fixture()?;
+    let checkout = linked_checkout(&root, "query-branch", "linked_capture")?;
+    let runtime = Runtime::new(
+        root.clone(),
+        db_path(&root),
+        TsIndexConfig::load(&root)?,
+        vec![],
+    );
+    maintenance::register_primary(&runtime, false);
+    let runtimes = Arc::new(Runtimes::new(runtime));
+    let writer = FileLease::acquire(
+        maintenance::writer_lease_path(&db_path(&checkout)),
+        Duration::from_secs(1),
+    )?;
+    let (entered, started) = mpsc::channel();
+    let (finished, responses) = mpsc::channel();
+    let root_for_caller = checkout.clone();
+    let caller = thread::spawn(move || {
+        let _ = entered.send(());
+        let result = live_query(&runtimes, root_for_caller.to_str());
+        let _ = finished.send(());
+        result
+    });
+    let waiting = (|| -> Result<()> {
+        started.recv_timeout(Duration::from_secs(2))?;
+        wait_for_file(&checkout.join(".tsindex/config.toml"))?;
+        ensure!(
+            matches!(
+                responses.recv_timeout(Duration::from_millis(150)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "linked query bypassed its checkout refresh"
+        );
+        Ok(())
+    })();
+    drop(writer);
+    let result = caller.join().expect("linked query caller panicked");
+    waiting?;
+    let response = result?;
+    assert!(response.get("error").is_none(), "{response}");
+    let payload: Value =
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())?;
+    assert_eq!(payload["captures"][0]["text"], "linked_capture");
+    Ok(())
+}
+
 fn linked_checkout(main: &Path, name: &str, symbol: &str) -> Result<PathBuf> {
     let checkout = main.join(".worktrees").join(name);
     let metadata = main.join(".git/worktrees").join(name);

@@ -76,7 +76,8 @@ receive request(id, repo, arguments)
     unknown checkout -> invalid-parameters error with known checkouts
 
   primary selection:
-    if automatic maintenance is enabled
+    live syntax query -> resolve sources without waiting for full reconciliation
+    otherwise, if automatic maintenance is enabled
       ensure a watcher owner exists when this is an MCP server
       reuse a configuration-matched full-refresh marker within the interval
       otherwise coalesce and run a full on-demand reconciliation
@@ -90,13 +91,14 @@ receive request(id, repo, arguments)
       timeout after 30 seconds -> retryable busy result; ingestion may continue
     another checkout's coordinator remains independent
 
-  open the selected index's SQLite read transaction
+  when the tool uses the selected index, open its SQLite read transaction
     read the committed base pin before attaching immutable base extraction
     require the attached base's persisted identity to match that pin
     expose effective files, symbols, and references through local views
     matching directory generation -> seek persisted effective file metadata
     absent/stale directory -> merged files until the next writer rebuilds it
     hide replaced/deleted/excluded base paths before filters and pagination
+  live syntax queries can instead walk sources while the index is unready
 
   dispatch the existing tool using the selected live source root
   frame response(id) through the transport's serialized output writer

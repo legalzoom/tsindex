@@ -71,8 +71,9 @@ each named lookup. Symbols, references, and visibility predicates are unchanged.
 
 The directory is derived from private files, base files, and authority records.
 File upserts, metadata observations, restores, and deletions maintain it in the
-same private-stage transactions. Only a completed build stamps its generation;
-the existing online backup publishes the directory with the facts. Readers
+same private-stage transactions. Preparation seeds an unready directory;
+a completed refresh stamps its generation before the existing online backup
+publishes the directory with the facts. Readers
 continue to pin one consistent generation. Existing overlays, or overlays
 published by an older writer that does not maintain the directory, fall back
 to the original merged file view when the directory is absent or stale. The

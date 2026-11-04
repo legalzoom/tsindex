@@ -17,6 +17,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
+          fetch-depth: 0
           persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
@@ -29,6 +30,15 @@ jobs:
           key: ${{ runner.os }}-test-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - name: Run tests
         run: cargo test --locked
+      - name: Prepare original overlay writer
+        run: git worktree add --detach .worktrees/legacy-pr15 840d7d8fd7c6fede2e04b68b5376e583e6fd5f5c
+      - name: Build original overlay writer
+        working-directory: .worktrees/legacy-pr15
+        run: cargo build --locked
+      - name: Test legacy writer compatibility
+        env:
+          TSINDEX_LEGACY_WRITER_BIN: ${{ github.workspace }}/.worktrees/legacy-pr15/target/debug/tsindex
+        run: cargo test --locked --test overlays a_pr15_writer_can_publish_changes_for_a_directory_enabled_reader -- --ignored
       - name: Test skill startup
         run: bash skills/tsindex/scripts/test-start-tsindex.sh
 

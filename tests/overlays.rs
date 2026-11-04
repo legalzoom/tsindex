@@ -716,6 +716,156 @@ fn an_unknown_directory_version_uses_facts_until_the_cache_is_rebuilt() -> Resul
 }
 
 #[test]
+fn directory_matches_authoritative_files_across_mutation_sequences() -> Result<()> {
+    type FileRow = (i64, i64, String, String, String, i64, i64, bool);
+    let fixture = Fixture::new()?;
+    let alpha = fixture.runtime(&fixture.alpha)?;
+    let verify = || -> Result<()> {
+        let conn = read_connection(&alpha.db_path)?;
+        let rows = |sql: &str| -> Result<Vec<FileRow>> {
+            Ok(conn
+                .prepare(sql)?
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<_>>()?)
+        };
+        // Resolve truth directly from extraction and masks, independently of
+        // the optimized files view that normally selects the derived cache.
+        let expected = rows(
+            "SELECT * FROM (
+               SELECT id, repo_id, path, language, sha, mtime_ns, byte_size, partial
+               FROM main.overlay_files
+               UNION ALL
+               SELECT -b.id, r.id, b.path, b.language, b.sha,
+                      COALESCE(o.mtime_ns, 0), COALESCE(o.byte_size, b.byte_size), b.partial
+               FROM overlay_base.files b CROSS JOIN main.repos r
+               LEFT JOIN main.overlay_state o ON o.path=b.path
+               WHERE b.repo_id=(SELECT base_repo_id FROM main.overlay_meta WHERE id=1)
+                 AND COALESCE(o.hidden, 0)=0
+                 AND NOT EXISTS(SELECT 1 FROM main.overlay_files p
+                                WHERE p.repo_id=r.id AND p.path=b.path)
+             ) ORDER BY path",
+        )?;
+        let actual = rows(
+            "SELECT id, repo_id, path, language, sha, mtime_ns, byte_size, partial
+             FROM main.overlay_file_directory ORDER BY path",
+        )?;
+        assert_eq!(actual, expected);
+        Ok(())
+    };
+    verify()?;
+    fs::write(fixture.alpha.join("extra.py"), "def extra():\n    pass\n")?;
+    fs::write(
+        fixture.alpha.join("change.py"),
+        "def private():\n    pass\n",
+    )?;
+    alpha.build(true, None)?;
+    verify()?;
+    fs::remove_file(fixture.alpha.join("extra.py"))?;
+    fs::remove_file(fixture.alpha.join("remove.py"))?;
+    alpha.build(true, None)?;
+    verify()?;
+    for name in ["change.py", "remove.py"] {
+        fs::copy(fixture.main.join(name), fixture.alpha.join(name))?;
+    }
+    alpha.build(true, None)?;
+    verify()?;
+    fs::write(fixture.alpha.join(".gitignore"), "shared.py\n")?;
+    alpha.build(true, None)?;
+    verify()?;
+    assert_eq!(symbol(&alpha, "shared")?, 0);
+    fs::write(fixture.alpha.join(".gitignore"), "")?;
+    alpha.build(true, None)?;
+    verify()?;
+    assert_eq!(symbol(&alpha, "shared")?, 1);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_build_does_not_publish_or_stamp_a_stale_directory() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new()?;
+    let alpha = fixture.runtime(&fixture.alpha)?;
+    let stamp = || -> Result<(i64, i64)> {
+        Ok(rusqlite::Connection::open(&alpha.db_path)?.query_row(
+            "SELECT i.generation, d.generation FROM index_state i
+             JOIN overlay_directory_state d ON d.id=i.id WHERE i.id=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?)
+    };
+    rusqlite::Connection::open(&alpha.db_path)?.execute(
+        "UPDATE index_state SET generation=generation+1 WHERE id=1",
+        [],
+    )?;
+    let before = stamp()?;
+    assert_ne!(before.0, before.1);
+    let source = fixture.alpha.join("shared.py");
+    let original = fs::metadata(&source)?.permissions();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o000))?;
+    let result = alpha.build(true, None);
+    fs::set_permissions(&source, original)?;
+    assert!(result?.failed > 0);
+    assert_eq!(stamp()?, before);
+    let reader = read_connection(&alpha.db_path)?;
+    let plan = reader
+        .prepare("EXPLAIN QUERY PLAN SELECT path FROM files WHERE id=?1")?
+        .query_map([-1], |row| row.get::<_, String>(3))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        !plan
+            .iter()
+            .any(|step| step.contains("overlay_file_directory"))
+    );
+    assert_eq!(symbol(&alpha, "shared")?, 1);
+    assert_eq!(alpha.build(true, None)?.indexed, 0);
+    let repaired = stamp()?;
+    assert_eq!(repaired.0, repaired.1);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires PR15 840d7d8 binary via TSINDEX_LEGACY_WRITER_BIN"]
+fn a_pr15_writer_can_publish_changes_for_a_directory_enabled_reader() -> Result<()> {
+    let binary = std::env::var_os("TSINDEX_LEGACY_WRITER_BIN")
+        .expect("set TSINDEX_LEGACY_WRITER_BIN to the original PR15 binary");
+    let fixture = Fixture::new()?;
+    let alpha = fixture.runtime(&fixture.alpha)?;
+    fs::write(
+        fixture.alpha.join("legacy.py"),
+        "def legacy_added():\n    pass\n",
+    )?;
+    let output = std::process::Command::new(binary)
+        .arg("--root")
+        .arg(&fixture.alpha)
+        .arg("update")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // This is a public reader call before any new-binary refresh. The legacy
+    // writer cannot maintain the directory, so its generation must select facts.
+    assert_eq!(symbol(&alpha, "legacy_added")?, 1);
+    assert_eq!(symbol(&alpha, "shared")?, 1);
+    assert_eq!(alpha.build(true, None)?.indexed, 0);
+    assert_eq!(symbol(&alpha, "legacy_added")?, 1);
+    Ok(())
+}
+
+#[test]
 fn restoring_changed_and_deleted_files_returns_to_shared_extractions() -> Result<()> {
     let fixture = Fixture::new()?;
     fs::write(

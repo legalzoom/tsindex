@@ -7,20 +7,21 @@ has a primary-key index on signed logical file ID and a unique path index.
 
 ## Measurement
 
-On November 3, 2026, three sequential rounds compared matching debug builds on
+On November 4, 2026, three sequential rounds compared matching debug builds on
 Linux using 2,000 synthetic Python files per checkout, four symbols per file,
 one primary, and eight linked Git worktrees. The variants were PR13 at
-`db9dc4d`, PR15 at `840d7d8`, and the directory candidate based on PR15. Variant
-order rotated between rounds. No compiler or other task-owned benchmark ran
+`db9dc4d`, PR15 at `840d7d8`, and the directory candidate at `fcd7732`, including
+the compatibility fixes. Variant order rotated between rounds. No compiler or
+other task-owned benchmark ran
 concurrently, though the shared development host was not otherwise idle.
 
 | Measurement | PR13 copied | PR15 overlay | Directory |
 | --- | ---: | ---: | ---: |
-| Cached `get_symbol` | 1.24 ms | 8.29 ms | 1.87 ms |
-| Cached `find_references` | 1.44 ms | 8.92 ms | 2.52 ms |
-| First use per checkout | 129 ms | 271 ms | 332 ms |
-| No-op refresh per checkout | 77 ms | 177 ms | 157 ms |
-| One-file update per checkout | 67 ms | 195 ms | 182 ms |
+| Cached `get_symbol` | 1.34 ms | 8.68 ms | 2.20 ms |
+| Cached `find_references` | 1.56 ms | 10.04 ms | 2.97 ms |
+| First use per checkout | 138 ms | 306 ms | 330 ms |
+| No-op refresh per checkout | 75 ms | 202 ms | 173 ms |
+| One-file update per checkout | 74 ms | 221 ms | 174 ms |
 | Total SQLite storage | 22,597,632 B | 6,860,800 B | 10,137,600 B |
 
 Entries are medians of the three round medians. Each round measured 200 cached
@@ -47,27 +48,32 @@ storage is retained; the extra copies contain file metadata.
 
 ## Interpretation
 
-The directory reduced cached symbol latency by 77.4% (4.4 times faster) and
-reference latency by 71.8% (3.5 times faster) versus PR15. All three rounds
-showed this improvement: symbol medians ranged from 1.87 to 1.94 ms versus
-7.74 to 8.53 ms; reference medians were 2.40 to 2.71 ms versus 8.75 to 9.03 ms.
+The directory reduced cached symbol latency by 74.7% (4.0 times faster) and
+reference latency by 70.4% (3.4 times faster) versus PR15. All three rounds
+showed this improvement: symbol medians ranged from 1.89 to 2.30 ms versus
+8.25 to 9.81 ms; reference medians were 2.63 to 3.06 ms versus 9.88 to 11.27 ms.
 The copied indexes remained faster for these reads.
 
-Ingestion changes were modest and noisy. The directory's first-use median
-rose 22.4%. No-op refresh fell 11.5% and one-file updates fell 6.4%, but round
-ranges overlap: no-op medians were 145 to 175 ms versus 149 to 187 ms, and
-one-file updates were 182 to 206 ms versus 183 to 199 ms. The larger private
-database adds preparation and staging work; walking, full source hashing,
-validation, and backup remain. Treat these local debug-build timings as a
-focused experiment, not a production latency estimate.
+The directory's first-use median rose 7.9%, no-op refresh fell 14.4%, and
+one-file updates fell 21.2%. Refresh variability was substantial: first-use
+medians were 323 to 382 ms versus 297 to 405 ms, and one-file updates were
+173 to 182 ms versus 180 to 238 ms. No-op medians were 162 to 178 ms versus
+193 to 212 ms. The copied indexes remained faster for ingestion as well.
+The larger private database adds preparation and staging work; walking, full
+source hashing, validation, and backup remain. Treat these local debug-build
+timings as a focused experiment, not a production latency estimate.
 
 The query-plan regression asserts that the existing selective tool query
 shapes seek `overlay_file_directory` by integer primary key without
 materializing `files`. It failed against PR15 before the implementation.
-Compatibility tests cover missing and stale directories and pinned readers.
-An additional local probe used the actual PR15 binary to add a source file:
-the new reader returned it through the generation-mismatch fallback, and the
-next new writer rebuilt the directory correctly.
+Compatibility tests cover missing, stale, and unknown-version directories,
+failed publication, and pinned readers across private/base file-ID changes.
+Mutation sequences compare the directory with extraction and masks directly.
+An interoperability regression uses the actual PR15 binary to add a source
+file: the new reader returns it through the generation-mismatch fallback,
+and the next new writer rebuilds the directory. CI builds that original
+writer and runs the regression explicitly; local runs can set
+`TSINDEX_LEGACY_WRITER_BIN` and run the ignored test in `tests/overlays.rs`.
 
 ## Reproduce
 

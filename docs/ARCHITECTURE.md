@@ -13,6 +13,21 @@ separate indexes or source-discovery rules.
 - `src/config.rs` loads project and catalog configuration. `src/model.rs`
   defines the data returned by queries and tools.
 
+## Process ownership
+
+`src/lifecycle.rs` monitors an owning process every five seconds on a dedicated
+thread, starting before index initialization. MCP infers its immediate parent;
+an explicit `--session-pid` replaces parent monitoring and also enables cleanup
+for HTTP servers and watchers. Inferred owners that cannot be inspected retain
+parent-PID-only tracking; inspection failures after capture do not imply exit.
+
+Linux reads process metadata as bytes because the kernel can truncate a process
+name inside a UTF-8 character. Only fields following the process name in
+`/proc/<pid>/stat` are decoded. Its start time detects PID reuse, and its thread
+count distinguishes a zombie leader with surviving workers from an entirely
+exited process. Both values come from the same read without scanning individual
+threads.
+
 ## Filesystem updates
 
 The MCP server owns a watcher for its lifetime. Watch startup validates the

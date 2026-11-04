@@ -10,7 +10,8 @@ use crate::index::{
     BuildStats, EnclosingSymbolArgs, FindReferencesArgs, GetSymbolArgs, OutlineArgs, QueryArgs,
     Runtime, print_json, print_language_reports,
 };
-use crate::mcp::{serve_http, serve_mcp, spawn_parent_watchdog};
+use crate::lifecycle::spawn_session_handler;
+use crate::mcp::{serve_http, serve_mcp};
 
 #[derive(Debug, Parser)]
 #[command(name = "tsindex")]
@@ -129,6 +130,13 @@ pub struct WatchArgs {
         help = "Exit when the parent process that spawned this watcher dies. Lets editor integrations spawn a detached watcher that cleans itself up without relying on the editor to send a signal."
     )]
     exit_with_parent: bool,
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u32).range(1..=i32::MAX as i64),
+        conflicts_with = "exit_with_parent",
+        help = "Inspectable owning session PID. Exit when it ends instead of monitoring the parent."
+    )]
+    session_pid: Option<u32>,
 }
 
 #[derive(Debug, Args)]
@@ -395,6 +403,12 @@ pub struct ServeCommand {
                 bound port."
     )]
     allowed_hosts: Vec<String>,
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u32).range(1..=i32::MAX as i64),
+        help = "Owning Codex/Claude/etc. session PID (must be inspectable). Check every 5s and exit when it ends. MCP defaults to its parent PID; HTTP only monitors an explicit session PID."
+    )]
+    session_pid: Option<u32>,
 }
 
 #[derive(Debug, Args)]
@@ -434,7 +448,12 @@ pub fn run() -> Result<()> {
     let mut cli = Cli::parse();
     merge_legacy_language_flag(&mut cli);
     if should_start_parent_watchdog(&cli.command) {
-        spawn_parent_watchdog();
+        let session_pid = match &cli.command {
+            Command::Serve(args) => args.session_pid,
+            Command::Watch(args) => args.session_pid,
+            _ => unreachable!(),
+        };
+        spawn_session_handler(session_pid)?;
     }
     match cli.command {
         Command::Init(ref args) => init(&cli, args),
@@ -600,8 +619,8 @@ fn build_stats_json(stats: &BuildStats) -> serde_json::Value {
 
 fn should_start_parent_watchdog(command: &Command) -> bool {
     match command {
-        Command::Serve(command) => command.mcp,
-        Command::Watch(args) => args.exit_with_parent,
+        Command::Serve(command) => command.mcp || command.session_pid.is_some(),
+        Command::Watch(args) => args.exit_with_parent || args.session_pid.is_some(),
         _ => false,
     }
 }
@@ -1074,6 +1093,9 @@ mod tests {
         for argv in [
             ["tsindex", "serve", "--mcp"].as_slice(),
             ["tsindex", "watch", "--exit-with-parent"].as_slice(),
+            ["tsindex", "serve", "--http", "--session-pid", "42"].as_slice(),
+            ["tsindex", "serve", "--session-pid", "42"].as_slice(),
+            ["tsindex", "watch", "--session-pid", "42"].as_slice(),
         ] {
             let cli = Cli::try_parse_from(argv).expect("watchdog-eligible command should parse");
             assert!(
@@ -1095,6 +1117,38 @@ mod tests {
                 !should_start_parent_watchdog(&cli.command),
                 "watchdog should not start for {argv:?}"
             );
+        }
+    }
+
+    #[test]
+    fn watch_rejects_conflicting_lifetime_flags() {
+        for argv in [
+            [
+                "tsindex",
+                "watch",
+                "--exit-with-parent",
+                "--session-pid",
+                "42",
+            ],
+            [
+                "tsindex",
+                "watch",
+                "--session-pid",
+                "42",
+                "--exit-with-parent",
+            ],
+        ] {
+            let error = Cli::try_parse_from(argv).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+
+    #[test]
+    fn session_pid_must_be_a_positive_process_id() {
+        for command in ["serve", "watch"] {
+            for pid in ["0", "-1", "2147483648", "abc"] {
+                assert!(Cli::try_parse_from(["tsindex", command, "--session-pid", pid]).is_err());
+            }
         }
     }
 

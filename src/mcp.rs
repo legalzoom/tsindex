@@ -1094,7 +1094,7 @@ fn handle_dashboard_data(runtime: &Runtime) -> Result<Value> {
     let adoption = dashboard_adoption(runtime);
     let configuration = dashboard_configuration(runtime);
     let features = dashboard_features(runtime, None)?;
-    let conn = match rusqlite::Connection::open(&runtime.db_path) {
+    let conn = match crate::overlay::read_connection(&runtime.db_path) {
         Ok(conn) => conn,
         Err(_) => {
             let economics = with_realized_savings(dashboard_economics(0, 0), &runtime.root);
@@ -3566,6 +3566,64 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn http_dashboard_reads_the_complete_overlay_catalog() -> Result<()> {
+        let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/dashboard-fixtures");
+        fs::create_dir_all(&artifacts)?;
+        let directory = tempfile::tempdir_in(artifacts)?;
+        let main = directory.path().join("main");
+        let linked = directory.path().join("alpha");
+        let metadata = main.join(".git/worktrees/alpha");
+        fs::create_dir_all(&metadata)?;
+        fs::create_dir(&linked)?;
+        fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", metadata.display()),
+        )?;
+        fs::write(metadata.join("commondir"), "../..\n")?;
+        fs::write(
+            metadata.join("gitdir"),
+            format!("{}\n", linked.join(".git").display()),
+        )?;
+        for root in [&main, &linked] {
+            fs::write(
+                root.join("shared.py"),
+                "def shared():\n    return common()\n",
+            )?;
+            fs::write(
+                root.join("change.py"),
+                "def original():\n    return before()\n",
+            )?;
+        }
+        let mut config = TsIndexConfig::default();
+        config.languages.include = vec!["python".into()];
+        config.write(&main)?;
+        Runtime::new(main.clone(), db_path(&main), config.clone(), vec![]).build(false, None)?;
+        fs::write(
+            linked.join("change.py"),
+            "def private():\n    return local()\n",
+        )?;
+        let checkout = crate::worktrees::discover(&linked)?
+            .into_iter()
+            .find(|checkout| checkout.path == linked)
+            .unwrap();
+        let runtime = crate::worktrees::open_checkout(&checkout, &config, vec![])?;
+        runtime.build(true, None)?;
+        let response = http_roundtrip_with_runtime(
+            runtime,
+            "GET /dashboard/data HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n",
+        )?;
+        assert!(
+            status_line(&response).starts_with("HTTP/1.1 200 "),
+            "{response}"
+        );
+        let payload: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap())?;
+        assert_eq!(payload["totals"]["files"], 2);
+        assert_eq!(payload["totals"]["symbols"], 2);
+        assert!(payload["totals"]["refs"].as_u64().unwrap() >= 2);
+        Ok(())
+    }
+
     /// Send one raw HTTP request to a fresh server and return the response
     /// text. Runs the real `handle_http_connection` over a loopback socket.
     fn http_roundtrip(request: &str) -> Result<String> {
@@ -3577,6 +3635,10 @@ mod tests {
             Vec::new(),
         );
         runtime.initialize()?;
+        http_roundtrip_with_runtime(runtime, request)
+    }
+
+    fn http_roundtrip_with_runtime(runtime: Runtime, request: &str) -> Result<String> {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let bound_port = listener.local_addr()?.port();
         let server = std::thread::spawn(move || -> Result<()> {

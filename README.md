@@ -318,11 +318,13 @@ HTTP remains independent unless `--session-pid` is supplied; `watch
 replaces parent monitoring and cannot be combined with `--exit-with-parent`.
 
 On macOS and Linux, the handler also checks process start time to detect PID
-reuse and treats zombies as exited. If the inferred parent cannot be inspected,
-the handler falls back to parent-PID-only tracking, without PID-reuse or zombie
-checks. An explicit owner must exist and allow process inspection or startup
-fails; this includes PID 1 when inspection is denied. A later permission or
-inspection error does not count as an exit. Normal MCP stdin EOF still stops
+reuse and treats fully exited zombie processes as ended. On Linux, an exited
+main thread does not end ownership while worker threads remain alive, and
+process names need not be valid UTF-8. If the inferred parent cannot be
+inspected, the handler falls back to parent-PID-only tracking, without PID-reuse
+or zombie checks. An explicit owner must exist and allow process inspection or
+startup fails; this includes PID 1 when inspection is denied. A later permission
+or inspection error does not count as an exit. Normal MCP stdin EOF still stops
 the server promptly.
 
 The server exposes five read tools:

@@ -160,7 +160,7 @@ fn process_start_time(pid: libc::pid_t) -> io::Result<Option<(u64, u64)>> {
 
 #[cfg(target_os = "linux")]
 fn process_start_time(pid: libc::pid_t) -> io::Result<Option<(u64, u64)>> {
-    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+    match std::fs::read(format!("/proc/{pid}/stat")) {
         Ok(stat) => parse_proc_stat(&stat),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
@@ -168,19 +168,30 @@ fn process_start_time(pid: libc::pid_t) -> io::Result<Option<(u64, u64)>> {
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn parse_proc_stat(stat: &str) -> io::Result<Option<(u64, u64)>> {
-    // comm (field 2) can contain spaces and closing parentheses. Fields after
-    // its final ')' start with state (3); starttime is field 22.
-    let (_, tail) = stat
-        .rsplit_once(") ")
+fn parse_proc_stat(stat: &[u8]) -> io::Result<Option<(u64, u64)>> {
+    // comm (field 2) contains arbitrary bytes; Linux can even truncate a UTF-8
+    // name mid-character. Decode only the fields after its final ') '.
+    let end = stat
+        .windows(2)
+        .rposition(|pair| pair == b") ")
         .ok_or_else(|| io::Error::other("invalid process stat"))?;
+    let tail = std::str::from_utf8(&stat[end + 2..])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let mut fields = tail.split_whitespace();
     let state = fields.next();
+    // After state (3), num_threads is field 20 and starttime is field 22.
+    let threads = fields
+        .nth(16)
+        .and_then(|field| field.parse::<u64>().ok())
+        .ok_or_else(|| io::Error::other("missing process thread count"))?;
     let started_at = fields
-        .nth(18)
+        .nth(1)
         .and_then(|field| field.parse::<u64>().ok())
         .ok_or_else(|| io::Error::other("missing process start time"))?;
-    Ok((!matches!(state, Some("Z" | "X" | "x"))).then_some((started_at, 0)))
+    // A zombie leader still represents a live process when workers remain.
+    // The count includes the leader; only an entirely exited group ends ownership.
+    let alive = !matches!(state, Some("Z" | "X" | "x")) || threads > 1;
+    Ok(alive.then_some((started_at, 0)))
 }
 
 // Keep the existing Unix support outside the macOS/Linux release targets.
@@ -371,21 +382,32 @@ mod tests {
 
     #[test]
     fn linux_stat_handles_process_names_and_zombies() -> Result<()> {
-        let stat = |state| {
+        fn stat(state: &str, threads: impl std::fmt::Display) -> String {
             format!(
-                "123 (a name ) with parens) {state} {} 98765 0 0",
-                "0 ".repeat(18)
+                "123 (a name ) with parens) {state} {}{threads} 0 98765 0 0",
+                "0 ".repeat(16)
             )
-        };
-        assert_eq!(parse_proc_stat(&stat("S"))?, Some((98765, 0)));
-        for state in ["Z", "X", "x"] {
-            assert_eq!(parse_proc_stat(&stat(state))?, None);
         }
-        assert!(parse_proc_stat("malformed").is_err());
-        assert!(parse_proc_stat("123 (name) S 0").is_err());
+        assert_eq!(parse_proc_stat(stat("S", 1).as_bytes())?, Some((98765, 0)));
+        for state in ["Z", "X", "x"] {
+            assert_eq!(parse_proc_stat(stat(state, 1).as_bytes())?, None);
+            assert_eq!(
+                parse_proc_stat(stat(state, 2).as_bytes())?,
+                Some((98765, 0))
+            );
+        }
+        let mut non_utf8 = stat("S", 1).into_bytes();
+        non_utf8[5] = 0xff;
+        assert_eq!(parse_proc_stat(&non_utf8)?, Some((98765, 0)));
+        assert!(parse_proc_stat(b"malformed").is_err());
+        assert!(parse_proc_stat(b"123 (name) S 0").is_err());
         for started_at in ["-1", "18446744073709551616", "unknown"] {
-            let invalid = stat("S").replace("98765", started_at);
-            assert!(parse_proc_stat(&invalid).is_err());
+            let invalid = stat("S", 1).replace("98765", started_at);
+            assert!(parse_proc_stat(invalid.as_bytes()).is_err());
+        }
+        for threads in ["-1", "18446744073709551616", "unknown"] {
+            let invalid = stat("Z", threads);
+            assert!(parse_proc_stat(invalid.as_bytes()).is_err());
         }
         Ok(())
     }

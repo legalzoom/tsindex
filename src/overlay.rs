@@ -430,11 +430,8 @@ pub(crate) fn attach_views(conn: &Connection) -> Result<bool> {
         "ATTACH DATABASE ?1 AS overlay_base",
         [file_uri(&meta.base)?],
     )?;
-    let version: i64 = conn.pragma_query_value(
-        Some(rusqlite::DatabaseName::Attached("overlay_base")),
-        "user_version",
-        |r| r.get(0),
-    )?;
+    let version: i64 =
+        conn.pragma_query_value(Some("overlay_base"), "user_version", |r| r.get(0))?;
     if version != SCHEMA_VERSION {
         bail!("overlay base has incompatible extraction schema; refresh the checkout");
     }

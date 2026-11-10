@@ -60,7 +60,7 @@ jobs:
           cd dist
           shasum -a 256 tsindex-macos-arm64 tsindex-macos-x86_64 LICENSE LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md > checksums.txt
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
         with:
           subject-path: dist/*
       - name: Create release

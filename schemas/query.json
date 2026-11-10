@@ -3,13 +3,14 @@
   "additionalProperties": false,
   "description": "Result `range` values are `[start_row, start_col, end_row, end_col]`: rows are 1-based, columns are 0-based UTF-8 BYTE offsets (tree-sitter convention, not character indexes), and the end is exclusive.",
   "properties": {
-    "language": { "type": "string" },
-    "repo": { "type": "string" },
+    "language": { "type": "string", "description": "One language, or use languages for several." },
+    "languages": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+    "repo": { "type": "string", "description": "Configured repo name, linked worktree directory name, or absolute checkout root. Unknown names return an error listing known repos and index status. Omit to use the primary catalog." },
     "query": { "type": "string" },
-    "file_glob": { "type": "string" },
+    "file_glob": { "type": "string", "description": "File, directory, or glob. Bare directories include descendants; absolute paths must be inside a selected repo. A filter matching no indexed files emits filter_matched_no_files." },
     "capture": { "type": "string" },
     "limit": { "type": "integer", "minimum": 1, "description": "Cap on captures returned before truncation. Defaults to the server `default_result_limit`, clamped to `max_result_limit`. Capture text is char-capped at `capture_char_limit`." },
     "offset": { "type": "integer", "minimum": 0, "description": "Stable pagination offset over the capture stream. Use `next_offset` from the response to resume." }
   },
-  "required": ["language", "query"]
+  "required": ["query"]
 }

@@ -4,7 +4,8 @@ use std::io::{self, BufRead, Read, Write};
 use std::net::{IpAddr, Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -19,36 +20,232 @@ use crate::index::{
     ReplaceSymbolArgs, Runtime,
 };
 
+use crate::worktrees::Runtimes;
+
+#[derive(Default)]
+struct TransportCancellation {
+    stopped: AtomicBool,
+    #[cfg(unix)]
+    wake: Option<Mutex<std::os::unix::net::UnixStream>>,
+}
+
+impl TransportCancellation {
+    fn stop(&self) {
+        if !self.stopped.swap(true, Ordering::AcqRel) {
+            #[cfg(unix)]
+            if let Some(wake) = &self.wake {
+                let _ = wake
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .write_all(&[1]);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+struct CancellableStdin {
+    input: io::BufReader<fs::File>,
+    wake: std::os::unix::net::UnixStream,
+    cancellation: Arc<TransportCancellation>,
+}
+
+#[cfg(unix)]
+impl CancellableStdin {
+    fn new() -> Result<Self> {
+        use std::os::fd::AsFd;
+        let input = io::stdin().as_fd().try_clone_to_owned()?;
+        let (wake, notify) = std::os::unix::net::UnixStream::pair()?;
+        Ok(Self {
+            input: io::BufReader::new(fs::File::from(input)),
+            wake,
+            cancellation: Arc::new(TransportCancellation {
+                stopped: AtomicBool::new(false),
+                wake: Some(Mutex::new(notify)),
+            }),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Read for CancellableStdin {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        let input = self.fill_buf()?;
+        let count = input.len().min(output.len());
+        output[..count].copy_from_slice(&input[..count]);
+        self.consume(count);
+        Ok(count)
+    }
+}
+
+#[cfg(unix)]
+impl BufRead for CancellableStdin {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        use std::os::fd::AsRawFd;
+        loop {
+            if self.cancellation.stopped.load(Ordering::Acquire) {
+                return Ok(&[]);
+            }
+            if !self.input.buffer().is_empty() {
+                break;
+            }
+            let mut descriptors = [
+                libc::pollfd {
+                    fd: self.input.get_ref().as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: self.wake.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // SAFETY: both owned descriptors remain open throughout this call.
+            // Poll waits for input or a worker's failure signal without idle
+            // wakes.
+            // https://man7.org/linux/man-pages/man2/poll.2.html
+            let ready = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if descriptors[1].revents != 0 {
+                return Ok(&[]);
+            }
+            if descriptors[0].revents != 0 {
+                break;
+            }
+        }
+        self.input.fill_buf()
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.input.consume(amount);
+    }
+}
+
 pub fn serve_mcp(runtime: Runtime) -> Result<()> {
     spawn_parent_watchdog()?;
-    let stdin = io::stdin();
     let stdout = io::stdout();
-    serve_mcp_io(&runtime, stdin.lock(), stdout.lock())
+    #[cfg(unix)]
+    let input = CancellableStdin::new()?;
+    #[cfg(unix)]
+    let cancellation = Arc::clone(&input.cancellation);
+    // Non-Unix backends retain blocking stdio until an equivalent native
+    // cancellation wait is available; worker and queue limits still apply.
+    #[cfg(not(unix))]
+    let input = io::BufReader::new(io::stdin());
+    #[cfg(not(unix))]
+    let cancellation = Arc::new(TransportCancellation::default());
+    serve_mcp_io(&runtime, input, stdout, cancellation)
 }
 
 /// The stdio JSON-RPC loop, split from `serve_mcp` so tests can drive it with
 /// an in-memory reader/writer.
-fn serve_mcp_io(runtime: &Runtime, input: impl BufRead, mut output: impl Write) -> Result<()> {
-    // Read raw bytes: one non-UTF-8 byte from the client must not end the
-    // session, but it must not be decoded lossily either (U+FFFD substitution
-    // could turn a corrupt request into a different, valid one). Answer with a
-    // -32700 parse error and keep going; only a real I/O error ends the loop.
-    for line in input.split(b'\n') {
-        let response = match String::from_utf8(line?) {
-            Ok(line) if line.trim().is_empty() => continue,
-            Ok(line) => handle_json_rpc_line(runtime, &line)?,
-            Err(_) => Some(json_rpc_error(
-                None,
-                -32700,
-                "invalid JSON-RPC message: request is not valid UTF-8",
-            )),
-        };
-        if let Some(response) = response {
-            writeln!(output, "{}", serde_json::to_string(&response)?)?;
-            output.flush()?;
+fn serve_mcp_io(
+    runtime: &Runtime,
+    input: impl BufRead,
+    output: impl Write + Send,
+    cancellation: Arc<TransportCancellation>,
+) -> Result<()> {
+    let runtimes = Runtimes::new(runtime.clone());
+    serve_mcp_transport(
+        input,
+        output,
+        |line| handle_json_rpc_line(&runtimes, line),
+        cancellation,
+    )
+}
+
+const MAX_CONCURRENT_REQUESTS: usize = 4;
+const MAX_QUEUED_REQUESTS: usize = 16;
+
+/// Keep wire framing separate from tool dispatch so transports can schedule a
+/// slow handler without changing its JSON-RPC result or source semantics.
+fn serve_mcp_transport(
+    input: impl BufRead,
+    output: impl Write + Send,
+    dispatch: impl Fn(&str) -> Result<Option<Value>> + Sync,
+    cancellation: Arc<TransportCancellation>,
+) -> Result<()> {
+    let (sender, receiver) = mpsc::sync_channel(MAX_QUEUED_REQUESTS);
+    let receiver = Mutex::new(receiver);
+    let output = Mutex::new(output);
+    let failure = Mutex::<Option<anyhow::Error>>::new(None);
+    thread::scope(|scope| -> Result<()> {
+        for _ in 0..MAX_CONCURRENT_REQUESTS {
+            scope.spawn(|| {
+                loop {
+                    // Take only the next message under this lock. Tool work and
+                    // checkout refreshes run after releasing the shared queue.
+                    let message = receiver.lock().unwrap_or_else(|p| p.into_inner()).recv();
+                    let Ok(message) = message else { break };
+                    if cancellation.stopped.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    let result = (|| -> Result<()> {
+                        // Invalid UTF-8 is a parse error for one message. Lossy
+                        // decoding could turn corrupt arguments into valid edits.
+                        let response = match String::from_utf8(message) {
+                            Ok(line) if line.trim().is_empty() => return Ok(()),
+                            Ok(line) => dispatch(&line)?,
+                            Err(_) => Some(json_rpc_error(
+                                None,
+                                -32700,
+                                "invalid JSON-RPC message: request is not valid UTF-8",
+                            )),
+                        };
+                        if let Some(response) = response {
+                            // Responses may complete out of order, but each full
+                            // JSON-RPC line must stay intact on the shared pipe.
+                            let mut output = output.lock().unwrap_or_else(|p| p.into_inner());
+                            writeln!(&mut *output, "{response}")?;
+                            output.flush()?;
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = result {
+                        let mut failure = failure.lock().unwrap_or_else(|p| p.into_inner());
+                        if failure.is_none() {
+                            *failure = Some(error);
+                        }
+                        cancellation.stop();
+                    }
+                }
+            });
         }
+        // A bounded queue applies backpressure instead of creating one thread
+        // per request. Closing it on EOF drains accepted messages before join.
+        for line in input.split(b'\n') {
+            let line = match line {
+                Ok(line) => line,
+                Err(error) => {
+                    // A broken transport cannot receive queued edit results.
+                    // Cancel unstarted calls before joining active handlers;
+                    // normal EOF still drains every accepted request.
+                    cancellation.stop();
+                    return Err(error.into());
+                }
+            };
+            sender.send(line).context("MCP request workers stopped")?;
+            if failure.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
+                break;
+            }
+        }
+        drop(sender);
+        Ok(())
+    })?;
+    match failure.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Start the session handler using the immediate parent as owner.
@@ -56,9 +253,9 @@ pub fn spawn_parent_watchdog() -> Result<()> {
     crate::lifecycle::spawn_session_handler(None)
 }
 
-fn handle_json_rpc_line(runtime: &Runtime, line: &str) -> Result<Option<Value>> {
+fn handle_json_rpc_line(runtime: &Runtimes, line: &str) -> Result<Option<Value>> {
     Ok(match serde_json::from_str::<Value>(line) {
-        Ok(request) => handle_request(runtime, request)?,
+        Ok(request) => handle_request_with_runtimes(runtime, request)?,
         Err(error) => Some(json_rpc_error(
             None,
             -32700,
@@ -88,8 +285,50 @@ const HTTP_IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Total budget for receiving one request (line, headers and body). The
 /// per-read timeout alone lets a client dripping one byte every few seconds
 /// hold a connection for minutes; past this deadline it gets 408. Each
-/// connection runs on its own thread, so a slow client only delays itself.
+/// connection occupies one bounded worker slot rather than allocating a thread.
 const HTTP_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+
+struct HttpRuntimes {
+    current: RwLock<Arc<Runtimes>>,
+    catalog: RwLock<()>,
+}
+
+impl HttpRuntimes {
+    fn new(runtime: Runtime) -> Self {
+        Self {
+            current: RwLock::new(Arc::new(Runtimes::new(runtime))),
+            catalog: RwLock::new(()),
+        }
+    }
+
+    fn snapshot(&self) -> Arc<Runtimes> {
+        Arc::clone(&self.current.read().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    fn administer(&self, path: &str, body: &[u8], stream: &mut impl Write) -> Result<()> {
+        // An admitted indexed call may refresh with its captured configuration.
+        // Finish it before changing the catalog, or its later pruning could
+        // delete a repository that this mutation has already acknowledged.
+        let _mutation = self.catalog.write().unwrap_or_else(|p| p.into_inner());
+        let previous = self.snapshot();
+        let mut candidate = previous.primary.clone();
+        let mut response = Vec::new();
+        match path {
+            "/repos/add" => handle_repos_add(&mut candidate, body, &mut response)?,
+            "/repos/remove" => handle_repos_remove(&mut candidate, body, &mut response)?,
+            _ => unreachable!("only catalog mutation routes administer configuration"),
+        }
+        if serde_json::to_value(&candidate.config)? != serde_json::to_value(&previous.config)? {
+            let mut current = self.current.write().unwrap_or_else(|p| p.into_inner());
+            *current = Arc::new(Runtimes::new(candidate));
+        }
+        // Publish before acknowledging success: a client sending its next
+        // request after the response must observe the updated configuration.
+        stream.write_all(&response)?;
+        stream.flush()?;
+        Ok(())
+    }
+}
 
 pub fn serve_http(runtime: Runtime, bind: &str, port: u16, allowed_hosts: &[String]) -> Result<()> {
     let bind_addr: IpAddr = bind
@@ -99,18 +338,32 @@ pub fn serve_http(runtime: Runtime, bind: &str, port: u16, allowed_hosts: &[Stri
         .with_context(|| format!("failed to bind http server on {bind}:{port}"))?;
     let bound_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
     eprintln!("tsindex http server listening on http://{bind}:{bound_port}");
-    let runtime = Arc::new(Mutex::new(runtime));
+    let runtime = Arc::new(HttpRuntimes::new(runtime));
     let allowed_hosts = Arc::new(allowed_hosts.to_vec());
-    for stream in listener.incoming() {
-        let stream = stream?;
+    let (sender, receiver) = mpsc::sync_channel::<TcpStream>(MAX_QUEUED_REQUESTS);
+    let receiver = Arc::new(Mutex::new(receiver));
+    for _ in 0..MAX_CONCURRENT_REQUESTS {
         let runtime = Arc::clone(&runtime);
         let allowed_hosts = Arc::clone(&allowed_hosts);
+        let receiver = Arc::clone(&receiver);
         thread::spawn(move || {
-            if let Err(error) = handle_http_connection(&runtime, stream, bound_port, &allowed_hosts)
-            {
-                eprintln!("http request failed: {error:#}");
+            loop {
+                let stream = receiver.lock().unwrap_or_else(|p| p.into_inner()).recv();
+                let Ok(stream) = stream else { break };
+                if let Err(error) =
+                    handle_http_connection(&runtime, stream, bound_port, &allowed_hosts)
+                {
+                    eprintln!("http request failed: {error:#}");
+                }
             }
         });
+    }
+    // Slow clients occupy bounded worker slots and a bounded accepted-socket
+    // queue, rather than allocating a new thread for every connection.
+    for stream in listener.incoming() {
+        sender
+            .send(stream?)
+            .context("HTTP request workers stopped")?;
     }
     Ok(())
 }
@@ -119,7 +372,7 @@ pub fn serve_http(runtime: Runtime, bind: &str, port: u16, allowed_hosts: &[Stri
 /// socket politely. The request is read without holding the runtime lock, so
 /// a slow client does not block other connections' tool calls.
 fn handle_http_connection(
-    runtime: &Mutex<Runtime>,
+    runtime: &HttpRuntimes,
     mut stream: TcpStream,
     bound_port: u16,
     allowed_hosts: &[String],
@@ -142,10 +395,20 @@ fn handle_http_connection(
 }
 
 fn serve_http_request(
-    runtime: &Mutex<Runtime>,
+    runtime: &HttpRuntimes,
     stream: &mut TcpStream,
     bound_port: u16,
     allowed_hosts: &[String],
+) -> Result<()> {
+    serve_http_request_with_dispatch(runtime, stream, bound_port, allowed_hosts, call_tool)
+}
+
+fn serve_http_request_with_dispatch(
+    runtimes: &HttpRuntimes,
+    stream: &mut TcpStream,
+    bound_port: u16,
+    allowed_hosts: &[String],
+    dispatch: impl Fn(&Runtimes, &str, Value, bool) -> Result<Value>,
 ) -> Result<()> {
     let deadline = Instant::now() + HTTP_REQUEST_DEADLINE;
     let mut reader = io::BufReader::new(stream.try_clone()?);
@@ -272,10 +535,39 @@ fn serve_http_request(
         }
         body.extend_from_slice(&chunk[..n]);
     }
-    let mut runtime = runtime
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let runtime = &mut *runtime;
+    if method == "POST" && matches!(path, "/repos/add" | "/repos/remove") {
+        return runtimes.administer(path, &body, stream);
+    }
+    let tool_request = if method == "POST" && path == "/tools/call" {
+        match serde_json::from_slice::<HttpCallRequest>(&body) {
+            Ok(request) => Some(request),
+            Err(error) => {
+                return write_http_response(
+                    stream,
+                    400,
+                    json!({ "error": format!("invalid JSON request: {error:#}") }),
+                );
+            }
+        }
+    } else {
+        None
+    };
+    // Acquire admission BEFORE capturing a runtime, and retain it through any
+    // refresh or rebuild. Shared admission keeps indexed worktrees concurrent;
+    // exclusive catalog mutations cannot be undone by an older configuration.
+    // Live queries only read primary candidates or refresh private linked
+    // indexes, so they and metadata routes remain available during either wait.
+    let _catalog = if (method == "POST" && path == "/repos/rebuild")
+        || tool_request
+            .as_ref()
+            .is_some_and(|request| request.name != "query")
+    {
+        Some(runtimes.catalog.read().unwrap_or_else(|p| p.into_inner()))
+    } else {
+        None
+    };
+    let runtime = runtimes.snapshot();
+    let runtime = &*runtime;
 
     let payload = match (method, path) {
         ("GET", "/health") => json!({ "ok": true }),
@@ -296,27 +588,12 @@ fn serve_http_request(
             Err(e) => return write_http_internal_error(stream, &e),
         },
         ("POST", "/repos/rebuild") => {
-            return handle_repos_rebuild(runtime, &body, stream);
-        }
-        ("POST", "/repos/add") => {
-            return handle_repos_add(runtime, &body, stream);
-        }
-        ("POST", "/repos/remove") => {
-            return handle_repos_remove(runtime, &body, stream);
+            return handle_repos_rebuild(&mut runtime.primary.clone(), &body, stream);
         }
         ("POST", "/tools/list") => tool_list(false),
         ("POST", "/tools/call") => {
-            let request: HttpCallRequest = match serde_json::from_slice(&body) {
-                Ok(request) => request,
-                Err(error) => {
-                    return write_http_response(
-                        stream,
-                        400,
-                        json!({ "error": format!("invalid JSON request: {error:#}") }),
-                    );
-                }
-            };
-            match call_tool(
+            let request = tool_request.expect("tool request parsed before runtime capture");
+            match dispatch(
                 runtime,
                 &request.name,
                 request.arguments.unwrap_or_default(),
@@ -423,14 +700,14 @@ fn write_http_request_timeout(stream: &mut TcpStream) -> Result<()> {
     )
 }
 
-fn write_http_response(stream: &mut TcpStream, status: u16, body: Value) -> Result<()> {
+fn write_http_response(stream: &mut impl Write, status: u16, body: Value) -> Result<()> {
     let payload = serde_json::to_vec(&body)?;
     write_http_bytes_response(stream, status, "application/json", &payload)
 }
 
 /// 5xx bodies stay generic: the full error chain names database paths,
 /// workspace roots, and git output, which belong in the server log only.
-fn write_http_internal_error(stream: &mut TcpStream, error: &anyhow::Error) -> Result<()> {
+fn write_http_internal_error(stream: &mut impl Write, error: &anyhow::Error) -> Result<()> {
     eprintln!("http request failed: {error:#}");
     write_http_response(stream, 500, json!({ "error": "internal error" }))
 }
@@ -445,7 +722,7 @@ fn write_http_text_response(
 }
 
 fn write_http_bytes_response(
-    stream: &mut TcpStream,
+    stream: &mut impl Write,
     status: u16,
     content_type: &str,
     payload: &[u8],
@@ -475,6 +752,10 @@ fn write_http_bytes_response(
 /// Public so integration tests can assert on the exact wire payload the
 /// MCP client receives (e.g. the dropped `structuredContent` duplicate).
 pub fn handle_request(runtime: &Runtime, request: Value) -> Result<Option<Value>> {
+    handle_request_with_runtimes(&Runtimes::new(runtime.clone()), request)
+}
+
+pub fn handle_request_with_runtimes(runtime: &Runtimes, request: Value) -> Result<Option<Value>> {
     let id = request.get("id").cloned();
     let Some(method) = request.get("method").and_then(Value::as_str) else {
         return Ok(Some(json_rpc_error(id, -32600, "missing method")));
@@ -618,7 +899,7 @@ fn tool_list(writable: bool) -> Value {
 /// (invalid params) / HTTP 400 instead of an internal-error code, letting
 /// clients tell "I passed the wrong thing" from "the server broke".
 #[derive(Debug)]
-struct InvalidParams(String);
+pub(crate) struct InvalidParams(pub(crate) String);
 
 impl std::fmt::Display for InvalidParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -640,7 +921,60 @@ fn is_invalid_params(error: &anyhow::Error) -> bool {
     error.downcast_ref::<InvalidParams>().is_some()
 }
 
-fn call_tool(runtime: &Runtime, name: &str, arguments: Value, writable: bool) -> Result<Value> {
+fn call_tool(
+    runtimes: &Runtimes,
+    name: &str,
+    mut arguments: Value,
+    writable: bool,
+) -> Result<Value> {
+    let repo = match arguments.get("repo") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(repo)) => Some(repo.as_str()),
+        Some(_) => return Err(InvalidParams("repo must be a string".into()).into()),
+    };
+    // Live primary queries must reach their unready-index fallback without
+    // waiting for a full refresh of unrelated sources. Indexed and editing
+    // tools still establish freshness through the ordinary resolver.
+    let (runtime, repo) = if name == "query" {
+        runtimes.resolve_live_query(repo)?
+    } else {
+        runtimes.resolve(repo)?
+    };
+    if let Some(repo) = repo {
+        arguments["repo"] = Value::String(repo);
+    }
+    let mut result = dispatch_tool(&runtime, name, arguments, writable)?;
+    // Keep returned repo identifiers usable as inputs even when a basename
+    // collision disambiguates an existing index's stored repo name.
+    let aliases = runtimes.repo_aliases(&runtime)?;
+    if !aliases.is_empty() {
+        rewrite_repo_names(&mut result, &aliases);
+    }
+    Ok(result)
+}
+
+fn rewrite_repo_names(value: &mut Value, aliases: &std::collections::HashMap<String, String>) {
+    match value {
+        Value::Object(fields) => {
+            if let Some(repo) = fields.get_mut("repo")
+                && let Some(alias) = repo.as_str().and_then(|name| aliases.get(name))
+            {
+                *repo = Value::String(alias.clone());
+            }
+            for value in fields.values_mut() {
+                rewrite_repo_names(value, aliases);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                rewrite_repo_names(value, aliases);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn dispatch_tool(runtime: &Runtime, name: &str, arguments: Value, writable: bool) -> Result<Value> {
     let result = match name {
         "get_symbol" => {
             let args: GetSymbolArgs = tool_args(arguments)?;
@@ -713,28 +1047,7 @@ fn call_tool(runtime: &Runtime, name: &str, arguments: Value, writable: bool) ->
 }
 
 fn handle_repos_list(runtime: &Runtime) -> Result<Value> {
-    let workspaces = runtime.workspaces()?;
-    let conn = rusqlite::Connection::open(&runtime.db_path).ok();
-    let repos: Vec<Value> = workspaces
-        .into_iter()
-        .map(|w| {
-            let indexed = conn.as_ref().is_some_and(|c| {
-                c.query_row(
-                    "SELECT COUNT(*) FROM files f JOIN repos r ON r.id = f.repo_id WHERE r.name = ?1",
-                    [&w.name],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap_or(0)
-                    > 0
-            });
-            json!({
-                "name": w.name,
-                "path": w.root.to_string_lossy(),
-                "indexed": indexed,
-            })
-        })
-        .collect();
-    Ok(json!({ "repos": repos }))
+    Ok(json!({ "repos": Runtimes::new(runtime.clone()).list()? }))
 }
 
 fn handle_dashboard_data(runtime: &Runtime) -> Result<Value> {
@@ -743,7 +1056,7 @@ fn handle_dashboard_data(runtime: &Runtime) -> Result<Value> {
     let adoption = dashboard_adoption(runtime);
     let configuration = dashboard_configuration(runtime);
     let features = dashboard_features(runtime, None)?;
-    let conn = match rusqlite::Connection::open(&runtime.db_path) {
+    let conn = match crate::overlay::read_connection(&runtime.db_path) {
         Ok(conn) => conn,
         Err(_) => {
             let economics = with_realized_savings(dashboard_economics(0, 0), &runtime.root);
@@ -1787,7 +2100,7 @@ fn handle_repos_rebuild(runtime: &mut Runtime, body: &[u8], stream: &mut TcpStre
     )
 }
 
-fn handle_repos_add(runtime: &mut Runtime, body: &[u8], stream: &mut TcpStream) -> Result<()> {
+fn handle_repos_add(runtime: &mut Runtime, body: &[u8], stream: &mut impl Write) -> Result<()> {
     let request: AddRepoRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
@@ -1911,7 +2224,7 @@ fn handle_repos_add(runtime: &mut Runtime, body: &[u8], stream: &mut TcpStream) 
     )
 }
 
-fn handle_repos_remove(runtime: &mut Runtime, body: &[u8], stream: &mut TcpStream) -> Result<()> {
+fn handle_repos_remove(runtime: &mut Runtime, body: &[u8], stream: &mut impl Write) -> Result<()> {
     let request: RemoveRepoRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
@@ -1963,10 +2276,12 @@ fn handle_repos_remove(runtime: &mut Runtime, body: &[u8], stream: &mut TcpStrea
         return write_http_internal_error(stream, &anyhow!("failed to remove repo directory: {e}"));
     }
 
-    runtime.config.repos.retain(|r| r.name != request.repo);
-    if let Err(e) = runtime.config.write(&runtime.root) {
+    let mut config = runtime.config.clone();
+    config.repos.retain(|r| r.name != request.repo);
+    if let Err(e) = config.write(&runtime.root) {
         return write_http_internal_error(stream, &anyhow!("failed to write config: {e:#}"));
     }
+    runtime.config = config;
 
     write_http_response(stream, 200, json!({ "ok": true, "removed": request.repo }))
 }
@@ -2038,6 +2353,496 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::config::{TsIndexConfig, db_path};
+
+    struct ResponseWriter {
+        bytes: Vec<u8>,
+        responses: mpsc::Sender<Value>,
+    }
+
+    impl Write for ResponseWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            let response = serde_json::from_slice(&self.bytes)?;
+            self.responses
+                .send(response)
+                .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+            self.bytes.clear();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn mcp_transport_answers_another_request_while_one_handler_waits() -> Result<()> {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        let input = io::Cursor::new(b"{\"id\":1}\n{\"id\":2}\n");
+        let server = thread::spawn(move || {
+            let release_rx = Mutex::new(release_rx);
+            serve_mcp_transport(
+                input,
+                ResponseWriter {
+                    bytes: Vec::new(),
+                    responses: response_tx,
+                },
+                |line| {
+                    let request: Value = serde_json::from_str(line)?;
+                    if request["id"] == 1 {
+                        entered_tx.send(())?;
+                        release_rx.lock().unwrap().recv()?;
+                    }
+                    Ok(Some(
+                        json!({"jsonrpc":"2.0", "id":request["id"], "result":{}}),
+                    ))
+                },
+                Arc::new(TransportCancellation::default()),
+            )
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2))?;
+        let independent = response_rx.recv_timeout(Duration::from_secs(2));
+        // Always release the handler and join before asserting: a failed
+        // scheduling contract must not strand a test thread indefinitely.
+        release_tx.send(())?;
+        server.join().expect("transport thread panicked")?;
+        let response = independent.context("request 2 waited behind blocked request 1")?;
+        assert_eq!(response["id"], 2);
+        let drained = response_rx.recv_timeout(Duration::from_secs(2))?;
+        assert_eq!(drained["id"], 1, "EOF must drain the accepted slow request");
+        assert!(response_rx.try_recv().is_err(), "every ID is answered once");
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_transport_bounds_active_handlers_and_drains_every_accepted_id() -> Result<()> {
+        use std::sync::atomic::AtomicUsize;
+        const REQUESTS: usize = 40;
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
+        let input: String = (0..REQUESTS)
+            .map(|id| format!("{{\"id\":{id}}}\n"))
+            .collect();
+        let active_worker = Arc::clone(&active);
+        let maximum_worker = Arc::clone(&maximum);
+        let server = thread::spawn(move || {
+            let release_rx = Mutex::new(release_rx);
+            serve_mcp_transport(
+                io::Cursor::new(input),
+                ResponseWriter {
+                    bytes: Vec::new(),
+                    responses: response_tx,
+                },
+                |line| {
+                    let request: Value = serde_json::from_str(line)?;
+                    let count = active_worker.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum_worker.fetch_max(count, Ordering::SeqCst);
+                    entered_tx.send(())?;
+                    release_rx.lock().unwrap().recv()?;
+                    active_worker.fetch_sub(1, Ordering::SeqCst);
+                    Ok(Some(json!({"id":request["id"], "result":{}})))
+                },
+                Arc::new(TransportCancellation::default()),
+            )
+        });
+        let mut initial = 0;
+        for _ in 0..4 {
+            if entered_rx.recv_timeout(Duration::from_secs(2)).is_ok() {
+                initial += 1;
+            } else {
+                break;
+            }
+        }
+        let unexpected = entered_rx.recv_timeout(Duration::from_millis(50)).is_ok();
+        for _ in 0..REQUESTS {
+            release_tx.send(())?;
+        }
+        server.join().expect("transport thread panicked")?;
+        assert_eq!(
+            initial, 4,
+            "four blocked handlers should occupy the worker budget"
+        );
+        assert!(
+            !unexpected,
+            "queued requests must not allocate extra handlers"
+        );
+        assert_eq!(maximum.load(Ordering::SeqCst), 4);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        let mut ids: Vec<u64> = response_rx
+            .try_iter()
+            .map(|response| response["id"].as_u64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            (0..40).collect::<Vec<_>>(),
+            "EOF must preserve every accepted ID exactly once"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_transport_cancels_queued_requests_after_an_input_error() -> Result<()> {
+        use std::sync::atomic::AtomicUsize;
+
+        struct FailingInput {
+            input: io::Cursor<Vec<u8>>,
+            entered: mpsc::Receiver<()>,
+            failed: mpsc::Sender<()>,
+        }
+        impl Drop for FailingInput {
+            fn drop(&mut self) {
+                let _ = self.failed.send(());
+            }
+        }
+        impl Read for FailingInput {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                let available = self.fill_buf()?;
+                let count = available.len().min(output.len());
+                output[..count].copy_from_slice(&available[..count]);
+                self.consume(count);
+                Ok(count)
+            }
+        }
+        impl BufRead for FailingInput {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                if self.input.position() == self.input.get_ref().len() as u64 {
+                    // Fail with four accepted handlers still running, so every
+                    // later queued call would start only after the input failed.
+                    for _ in 0..4 {
+                        self.entered
+                            .recv_timeout(Duration::from_secs(2))
+                            .map_err(io::Error::other)?;
+                    }
+                    return Err(io::Error::other("scripted input failure"));
+                }
+                self.input.fill_buf()
+            }
+
+            fn consume(&mut self, count: usize) {
+                self.input.consume(count);
+            }
+        }
+
+        const REQUESTS: usize = 12;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (failed_tx, failed_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let dispatched_worker = Arc::clone(&dispatched);
+        let cancellation = Arc::new(TransportCancellation::default());
+        let input = (0..REQUESTS)
+            .map(|id| format!("{{\"id\":{id}}}\n"))
+            .collect::<String>();
+        let server = thread::spawn(move || {
+            let release_rx = Mutex::new(release_rx);
+            serve_mcp_transport(
+                FailingInput {
+                    input: io::Cursor::new(input.into_bytes()),
+                    entered: entered_rx,
+                    failed: failed_tx,
+                },
+                io::sink(),
+                |_| {
+                    dispatched_worker.fetch_add(1, Ordering::SeqCst);
+                    let _ = entered_tx.send(());
+                    release_rx.lock().unwrap().recv()?;
+                    Ok(None)
+                },
+                cancellation,
+            )
+        });
+        let input_failed = failed_rx.recv_timeout(Duration::from_secs(2));
+        // The reader drops when the main loop handles its error, before the
+        // scoped workers join. Then let every active handler finish cleanly.
+        for _ in 0..REQUESTS {
+            let _ = release_tx.send(());
+        }
+        let result = server.join().expect("transport thread panicked");
+        input_failed?;
+        let error = result.expect_err("a real input error must end the session");
+        assert!(format!("{error:#}").contains("scripted input failure"));
+        assert_eq!(
+            dispatched.load(Ordering::SeqCst),
+            4,
+            "failed input must cancel queued calls before they can edit files"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn http_health_progresses_while_another_tool_handler_waits() -> Result<()> {
+        assert_independent_http_progress(false)
+    }
+
+    #[test]
+    fn http_indexed_calls_progress_while_another_tool_handler_waits() -> Result<()> {
+        assert_independent_http_progress(true)
+    }
+
+    fn assert_independent_http_progress(indexed_call: bool) -> Result<()> {
+        let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/transport-fixtures");
+        fs::create_dir_all(&artifacts)?;
+        let temp = tempfile::tempdir_in(artifacts)?;
+        let runtime = Runtime::new(
+            temp.path().to_path_buf(),
+            db_path(temp.path()),
+            TsIndexConfig::default(),
+            Vec::new(),
+        );
+        let state = Arc::new(HttpRuntimes::new(runtime));
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = thread::spawn(move || -> Result<()> {
+            let (mut first, _) = listener.accept()?;
+            let first_state = Arc::clone(&state);
+            let blocked = thread::spawn(move || {
+                serve_http_request_with_dispatch(
+                    &first_state,
+                    &mut first,
+                    port,
+                    &[],
+                    |_, _, _, _| {
+                        entered_tx.send(())?;
+                        release_rx.recv()?;
+                        Ok(json!({"finished":true}))
+                    },
+                )
+            });
+            let (mut second, _) = listener.accept()?;
+            serve_http_request_with_dispatch(&state, &mut second, port, &[], |_, _, _, _| {
+                Ok(json!({"ok":true}))
+            })?;
+            drop(second);
+            blocked.join().expect("blocked HTTP worker panicked")?;
+            Ok(())
+        });
+        let mut first = TcpStream::connect(("127.0.0.1", port))?;
+        let body = r#"{"name":"blocked","arguments":{}}"#;
+        write!(
+            first,
+            "POST /tools/call HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )?;
+        first.flush()?;
+        entered_rx.recv_timeout(Duration::from_secs(2))?;
+        let independent = (|| -> Result<String> {
+            let mut second = TcpStream::connect(("127.0.0.1", port))?;
+            second.set_read_timeout(Some(Duration::from_secs(2)))?;
+            if indexed_call {
+                write!(
+                    second,
+                    "POST /tools/call HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )?;
+            } else {
+                write!(
+                    second,
+                    "GET /health HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"
+                )?;
+            }
+            second.flush()?;
+            second.shutdown(Shutdown::Write)?;
+            let mut response = String::new();
+            second.read_to_string(&mut response)?;
+            Ok(response)
+        })();
+        release_tx.send(())?;
+        first.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let mut completed = String::new();
+        let completed_result = first.read_to_string(&mut completed);
+        drop(first);
+        server.join().expect("HTTP transport thread panicked")?;
+        completed_result?;
+        let independent = independent.context("independent request waited behind blocked tool")?;
+        assert!(independent.starts_with("HTTP/1.1 200"));
+        assert!(independent.contains(r#""ok":true"#));
+        assert!(completed.contains(r#""finished":true"#));
+        Ok(())
+    }
+
+    #[test]
+    fn http_catalog_change_is_published_before_its_acknowledgment() -> Result<()> {
+        struct Acknowledgment<'a> {
+            state: &'a HttpRuntimes,
+            bytes: Vec<u8>,
+            saw_old_configuration: bool,
+        }
+        impl Write for Acknowledgment<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.saw_old_configuration |= self
+                    .state
+                    .snapshot()
+                    .config
+                    .repos
+                    .iter()
+                    .any(|repo| repo.name == "removed");
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/transport-fixtures");
+        fs::create_dir_all(&artifacts)?;
+        let temp = tempfile::tempdir_in(artifacts)?;
+        fs::create_dir(temp.path().join("removed"))?;
+        let config = TsIndexConfig {
+            repos: vec![RepoConfig {
+                name: "removed".into(),
+                path: "removed".into(),
+                languages: Vec::new(),
+                ignore: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let state = HttpRuntimes::new(Runtime::new(
+            temp.path().to_path_buf(),
+            db_path(temp.path()),
+            config,
+            Vec::new(),
+        ));
+        let mut acknowledgment = Acknowledgment {
+            state: &state,
+            bytes: Vec::new(),
+            saw_old_configuration: false,
+        };
+        state.administer(
+            "/repos/remove",
+            br#"{"repo":"removed"}"#,
+            &mut acknowledgment,
+        )?;
+        assert!(
+            !acknowledgment.saw_old_configuration,
+            "a successful response must follow registry publication"
+        );
+        assert!(String::from_utf8(acknowledgment.bytes)?.contains(r#""removed":"removed""#));
+        assert!(!temp.path().join("removed").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn http_catalog_changes_wait_for_indexed_calls_and_rebuilds_but_not_queries() -> Result<()> {
+        let post = |path: &str, body: Value| {
+            let body = body.to_string();
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost:{{port}}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        for path in ["/tools/call", "/repos/rebuild"] {
+            let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/transport-fixtures");
+            fs::create_dir_all(&artifacts)?;
+            let temp = tempfile::tempdir_in(artifacts)?;
+            fs::create_dir(temp.path().join("removed"))?;
+            fs::write(
+                temp.path().join("removed/a.py"),
+                "def live_symbol():\n    pass\n",
+            )?;
+            let config = TsIndexConfig {
+                repos: vec![RepoConfig {
+                    name: "removed".into(),
+                    path: "removed".into(),
+                    languages: vec!["python".into()],
+                    ignore: vec![],
+                }],
+                ..Default::default()
+            };
+            let runtime = Runtime::new(
+                temp.path().to_path_buf(),
+                db_path(temp.path()),
+                config,
+                vec![],
+            );
+            runtime.build(false, None)?;
+            crate::maintenance::register_primary(&runtime, false);
+            fs::remove_file(crate::maintenance::refresh_marker_path(&runtime.db_path))?;
+            let writer = crate::maintenance::FileLease::acquire(
+                crate::maintenance::writer_lease_path(&runtime.db_path),
+                Duration::from_secs(1),
+            )?;
+            let state = Arc::new(HttpRuntimes::new(runtime));
+            let state_worker = Arc::clone(&state);
+            let body = if path == "/tools/call" {
+                json!({"name":"get_symbol", "arguments":{"name":"live_symbol"}})
+            } else {
+                json!({"repo":"removed", "fetch":false})
+            };
+            let request = post(path, body);
+            let older = thread::spawn(move || http_roundtrip_with_state(state_worker, &request));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let admitted = loop {
+                if state.catalog.try_write().is_err() {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                thread::sleep(Duration::from_millis(1));
+            };
+            let state_worker = Arc::clone(&state);
+            let removal = post("/repos/remove", json!({"repo":"removed"}));
+            let (removed_tx, removed_rx) = mpsc::channel();
+            let remove = thread::spawn(move || {
+                let result = http_roundtrip_with_state(state_worker, &removal);
+                let _ = removed_tx.send(result);
+            });
+            let premature_removal = removed_rx.recv_timeout(Duration::from_millis(150)).ok();
+            let state_worker = Arc::clone(&state);
+            let query = post(
+                "/tools/call",
+                json!({"name":"query", "arguments":{
+                    "repo":"removed", "language":"python",
+                    "query":"(function_definition name: (identifier) @name)"
+                }}),
+            );
+            let (queried_tx, queried_rx) = mpsc::channel();
+            let live = thread::spawn(move || {
+                let result = http_roundtrip_with_state(state_worker, &query);
+                let _ = queried_tx.send(result);
+            });
+            let live_before_release = queried_rx.recv_timeout(Duration::from_secs(2));
+            let health = http_roundtrip_with_state(
+                Arc::clone(&state),
+                "GET /health HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n",
+            );
+            // Always release the stalled writer and join every request before
+            // asserting, including when a regression blocks queries or removes
+            // their sources too early.
+            drop(writer);
+            let old_result = older.join().expect("indexed HTTP worker panicked");
+            remove.join().expect("HTTP removal worker panicked");
+            live.join().expect("live HTTP worker panicked");
+            let removal_waited = premature_removal.is_none();
+            let removed = match premature_removal {
+                Some(result) => result,
+                None => removed_rx.recv()?,
+            };
+            assert!(admitted, "{path} did not establish catalog admission");
+            assert!(removal_waited, "removal overtook {path}");
+            let live_result =
+                live_before_release.context("live query waited for catalog mutation")??;
+            assert!(live_result.starts_with("HTTP/1.1 200"), "{live_result}");
+            assert!(live_result.contains("live_symbol"), "{live_result}");
+            let health = health?;
+            assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+            let old_result = old_result?;
+            assert!(old_result.starts_with("HTTP/1.1 200"), "{old_result}");
+            let removed = removed?;
+            assert!(removed.starts_with("HTTP/1.1 200"), "{removed}");
+            assert!(!temp.path().join("removed").exists());
+            assert!(state.snapshot().config.repos.is_empty());
+        }
+        Ok(())
+    }
 
     fn tool_names(list: &Value) -> Vec<String> {
         list["tools"]
@@ -2342,7 +3147,7 @@ mod tests {
         );
 
         let error = call_tool(
-            &runtime,
+            &Runtimes::new(runtime),
             "replace_symbol",
             json!({ "file": "x.py", "name": "f", "new_body": "" }),
             false,
@@ -2433,7 +3238,7 @@ mod tests {
             Vec::new(),
         );
 
-        let response = handle_json_rpc_line(&runtime, "{not json")?
+        let response = handle_json_rpc_line(&Runtimes::new(runtime), "{not json")?
             .expect("malformed JSON should return a JSON-RPC response");
 
         assert_eq!(response["id"], Value::Null);
@@ -2690,7 +3495,7 @@ mod tests {
 
         let server = std::thread::spawn(move || -> Result<()> {
             let (stream, _) = listener.accept()?;
-            handle_http_connection(&Mutex::new(runtime), stream, bound_port, &[])?;
+            handle_http_connection(&HttpRuntimes::new(runtime), stream, bound_port, &[])?;
             Ok(())
         });
 
@@ -2735,16 +3540,33 @@ mod tests {
         input.push(b'\n');
 
         let mut output = Vec::new();
-        serve_mcp_io(&runtime, io::Cursor::new(input), &mut output)?;
+        serve_mcp_io(
+            &runtime,
+            io::Cursor::new(input),
+            &mut output,
+            Arc::new(TransportCancellation::default()),
+        )?;
 
         let responses: Vec<Value> = String::from_utf8(output)?
             .lines()
             .map(serde_json::from_str)
             .collect::<std::result::Result<_, _>>()?;
         assert_eq!(responses.len(), 3, "bad line must answer, not end the loop");
-        assert_eq!(responses[0]["id"], 1);
-        assert_eq!(responses[1]["error"]["code"], -32700);
-        assert_eq!(responses[2]["id"], 2);
+        assert!(
+            responses
+                .iter()
+                .any(|response| response["id"] == 1 && response.get("result").is_some())
+        );
+        assert!(
+            responses
+                .iter()
+                .any(|response| response["id"] == 2 && response.get("result").is_some())
+        );
+        assert!(
+            responses
+                .iter()
+                .any(|response| response["id"].is_null() && response["error"]["code"] == -32700)
+        );
         Ok(())
     }
 
@@ -2794,6 +3616,64 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn http_dashboard_reads_the_complete_overlay_catalog() -> Result<()> {
+        let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/dashboard-fixtures");
+        fs::create_dir_all(&artifacts)?;
+        let directory = tempfile::tempdir_in(artifacts)?;
+        let main = directory.path().join("main");
+        let linked = directory.path().join("alpha");
+        let metadata = main.join(".git/worktrees/alpha");
+        fs::create_dir_all(&metadata)?;
+        fs::create_dir(&linked)?;
+        fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", metadata.display()),
+        )?;
+        fs::write(metadata.join("commondir"), "../..\n")?;
+        fs::write(
+            metadata.join("gitdir"),
+            format!("{}\n", linked.join(".git").display()),
+        )?;
+        for root in [&main, &linked] {
+            fs::write(
+                root.join("shared.py"),
+                "def shared():\n    return common()\n",
+            )?;
+            fs::write(
+                root.join("change.py"),
+                "def original():\n    return before()\n",
+            )?;
+        }
+        let mut config = TsIndexConfig::default();
+        config.languages.include = vec!["python".into()];
+        config.write(&main)?;
+        Runtime::new(main.clone(), db_path(&main), config.clone(), vec![]).build(false, None)?;
+        fs::write(
+            linked.join("change.py"),
+            "def private():\n    return local()\n",
+        )?;
+        let checkout = crate::worktrees::discover(&linked)?
+            .into_iter()
+            .find(|checkout| checkout.path == linked)
+            .unwrap();
+        let runtime = crate::worktrees::open_checkout(&checkout, &config, vec![])?;
+        runtime.build(true, None)?;
+        let response = http_roundtrip_with_runtime(
+            runtime,
+            "GET /dashboard/data HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n",
+        )?;
+        assert!(
+            status_line(&response).starts_with("HTTP/1.1 200 "),
+            "{response}"
+        );
+        let payload: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap())?;
+        assert_eq!(payload["totals"]["files"], 2);
+        assert_eq!(payload["totals"]["symbols"], 2);
+        assert!(payload["totals"]["refs"].as_u64().unwrap() >= 2);
+        Ok(())
+    }
+
     /// Send one raw HTTP request to a fresh server and return the response
     /// text. Runs the real `handle_http_connection` over a loopback socket.
     fn http_roundtrip(request: &str) -> Result<String> {
@@ -2805,11 +3685,19 @@ mod tests {
             Vec::new(),
         );
         runtime.initialize()?;
+        http_roundtrip_with_runtime(runtime, request)
+    }
+
+    fn http_roundtrip_with_runtime(runtime: Runtime, request: &str) -> Result<String> {
+        http_roundtrip_with_state(Arc::new(HttpRuntimes::new(runtime)), request)
+    }
+
+    fn http_roundtrip_with_state(runtime: Arc<HttpRuntimes>, request: &str) -> Result<String> {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let bound_port = listener.local_addr()?.port();
         let server = std::thread::spawn(move || -> Result<()> {
             let (stream, _) = listener.accept()?;
-            handle_http_connection(&Mutex::new(runtime), stream, bound_port, &[])?;
+            handle_http_connection(&runtime, stream, bound_port, &[])?;
             Ok(())
         });
         let mut client = TcpStream::connect(("127.0.0.1", bound_port))?;
@@ -2831,6 +3719,23 @@ mod tests {
 
     fn status_line(response: &str) -> &str {
         response.lines().next().unwrap_or_default()
+    }
+
+    #[test]
+    fn http_unknown_repo_is_invalid_params_and_lists_known_repos() -> Result<()> {
+        let body = r#"{"name":"get_symbol","arguments":{"name":"target","repo":"does-not-exist"}}"#;
+        let response = http_roundtrip(&format!(
+            "POST /tools/call HTTP/1.1\r\nHost: localhost:{{port}}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ))?;
+        assert!(
+            status_line(&response).starts_with("HTTP/1.1 400 "),
+            "{response}"
+        );
+        assert!(response.contains("unknown repo"));
+        assert!(response.contains("known repos:"));
+        assert!(response.contains("indexed=false"));
+        Ok(())
     }
 
     #[test]
@@ -3004,7 +3909,7 @@ mod tests {
         let bound_port = listener.local_addr()?.port();
         let server = std::thread::spawn(move || -> Result<()> {
             let (stream, _) = listener.accept()?;
-            handle_http_connection(&Mutex::new(runtime), stream, bound_port, &[])?;
+            handle_http_connection(&HttpRuntimes::new(runtime), stream, bound_port, &[])?;
             Ok(())
         });
         let mut client = TcpStream::connect(("127.0.0.1", bound_port))?;

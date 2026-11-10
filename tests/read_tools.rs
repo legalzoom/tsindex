@@ -87,6 +87,7 @@ fn outline_args(file: &str, limit: Option<usize>, offset: Option<usize>) -> Outl
 
 fn query_args(query: &str, limit: Option<usize>, offset: Option<usize>) -> QueryArgs {
     QueryArgs {
+        languages: Vec::new(),
         language: "python".to_string(),
         repo: None,
         query: query.to_string(),

@@ -3,6 +3,7 @@ use std::fs;
 #[cfg(test)]
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -21,7 +22,7 @@ use crate::detect::detect_languages;
 use crate::ignore_inputs::{IgnoreInputs, existing_parent as existing_watch_parent};
 use crate::lang::{LanguageSpec, detect_language_from_file, lookup_language};
 use crate::model::{
-    EnclosingHit, EnclosingSymbolResponse, FileOutlineResponse, FileRefCount,
+    Diagnostic, EnclosingHit, EnclosingSymbolResponse, FileOutlineResponse, FileRefCount,
     FindReferencesResponse, GetSymbolResponse, IndexedSymbol, NameRefCount, OutlineSymbol,
     QueryCapture as RawQueryCapture, QueryResponse, RangePoint, RefCountsResponse, ReferenceGroup,
     ReferenceMatch, ReferenceRow, ReplaceSymbolResponse, RepoInfo, RepoLanguageReport, SourceRange,
@@ -30,7 +31,7 @@ use crate::model::{
 use crate::watch::under_any;
 use crate::watch::{ChangeReceiver, WatchRegistry, changes};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Runtime {
     pub root: PathBuf,
     pub db_path: PathBuf,
@@ -46,7 +47,26 @@ pub struct Runtime {
     /// additive read-path migration could not run (e.g. a read-only
     /// filesystem). Reads then project `0 AS partial` instead of `f.partial`
     /// so a v3 index stays readable; `partial` simply reports `false`.
-    legacy_partial: std::cell::Cell<bool>,
+    legacy_partial: AtomicBool,
+    pub(crate) private_stage: bool,
+}
+
+impl Clone for Runtime {
+    fn clone(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+            db_path: self.db_path.clone(),
+            config: self.config.clone(),
+            languages: self.languages.clone(),
+            jobs: self.jobs,
+            prune_repos: self.prune_repos,
+            // A request receives its own compatibility projection flag. Sharing
+            // it across clones could mix a failed legacy migration in one read
+            // with a successful migration in another concurrent request.
+            legacy_partial: AtomicBool::new(self.legacy_partial.load(Ordering::Relaxed)),
+            private_stage: self.private_stage,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -190,7 +210,10 @@ pub struct FindReferencesArgs {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryArgs {
+    #[serde(default)]
     pub language: String,
+    #[serde(default)]
+    pub languages: Vec<String>,
     #[serde(default)]
     pub repo: Option<String>,
     pub query: String,
@@ -321,7 +344,7 @@ fn resolve_body_limit(config: &ServerConfig, requested: Option<usize>) -> Option
 // when an extractor change (e.g. expanding ranges to include decorators)
 // alters what gets stored, the version bumps so existing indexes get a
 // "run `tsindex build` to refresh" warning rather than silent drift.
-const SCHEMA_VERSION: i64 = 5;
+pub(crate) const SCHEMA_VERSION: i64 = 5;
 
 impl Runtime {
     pub fn new(
@@ -337,7 +360,8 @@ impl Runtime {
             languages,
             jobs: 1,
             prune_repos: true,
-            legacy_partial: std::cell::Cell::new(false),
+            legacy_partial: AtomicBool::new(false),
+            private_stage: false,
         }
     }
 
@@ -365,11 +389,35 @@ impl Runtime {
     }
 
     pub fn build(&self, incremental: bool, only_repo: Option<&str>) -> Result<BuildStats> {
+        fs::create_dir_all(
+            self.db_path
+                .parent()
+                .ok_or_else(|| anyhow!("index has no parent"))?,
+        )?;
+        let staging = self.private_stage || crate::overlay::is_staging(&self.db_path)?;
+        // The lease covers observation, parsing and publication across CLI and
+        // server processes. Private stage files already belong to this writer.
+        let _writer = if staging {
+            None
+        } else {
+            Some(crate::maintenance::FileLease::acquire(
+                crate::maintenance::writer_lease_path(&self.db_path),
+                Duration::from_secs(30),
+            )?)
+        };
         self.initialize()?;
+        if !staging && crate::overlay::is_overlay(&self.db_path)? {
+            let result = crate::overlay::refresh(self, incremental, only_repo)?;
+            if result.failed == 0 && only_repo.is_none() {
+                crate::maintenance::record_refresh(self)?;
+            }
+            return Ok(result);
+        }
         let mut conn = Connection::open(&self.db_path)
             .with_context(|| format!("failed to open {}", self.db_path.display()))?;
         let all_workspaces = self.workspaces()?;
         create_schema(&conn, &all_workspaces)?;
+        crate::overlay::attach_views(&conn)?;
         if self.prune_repos && only_repo.is_none() {
             prune_missing_repos(&conn, &self.configured_repo_names())?;
         }
@@ -382,6 +430,9 @@ impl Runtime {
             // is left as-is (a fresh DB stays not-ready, an existing index
             // keeps serving its last complete state).
             let _ = conn.execute("UPDATE index_state SET refreshing = 0 WHERE id = 1", []);
+        }
+        if !staging && only_repo.is_none() && result.as_ref().is_ok_and(|stats| stats.failed == 0) {
+            crate::maintenance::record_refresh(self)?;
         }
         result
     }
@@ -469,8 +520,8 @@ impl Runtime {
                     )?;
                     processed_so_far += batch.len();
                     eprintln!(
-                        "  [{}] indexed={} skipped={} failed={}",
-                        processed_so_far, stats.indexed, stats.skipped, stats.failed
+                        "  [{}] indexed={} touched={} skipped={} failed={}",
+                        processed_so_far, stats.indexed, stats.touched, stats.skipped, stats.failed
                     );
                     batch.clear();
                 }
@@ -488,8 +539,8 @@ impl Runtime {
             )?;
             processed_so_far += batch.len();
             eprintln!(
-                "  [{}] indexed={} skipped={} failed={}",
-                processed_so_far, stats.indexed, stats.skipped, stats.failed
+                "  [{}] indexed={} touched={} skipped={} failed={}",
+                processed_so_far, stats.indexed, stats.touched, stats.skipped, stats.failed
             );
         }
 
@@ -501,11 +552,11 @@ impl Runtime {
             // in `create_schema` keeps the stale-schema warning alive until a
             // rebuild has actually happened. A `--repo` or `--languages`
             // scoped build leaves other rows untouched, so it must not stamp.
-            set_user_version(conn, SCHEMA_VERSION)?;
+            set_user_version(conn, crate::overlay::disk_version(conn)?)?;
         }
         eprintln!(
-            "build complete: {} indexed, {} skipped, {} failed",
-            stats.indexed, stats.skipped, stats.failed
+            "build complete: {} indexed, {} touched, {} skipped, {} failed",
+            stats.indexed, stats.touched, stats.skipped, stats.failed
         );
         Ok(stats)
     }
@@ -526,9 +577,12 @@ impl Runtime {
     /// same include/exclude decisions as `walk_source_files`.
     ///
     /// Paths outside every configured workspace are ignored. Returns the same
-    /// `BuildStats` shape as `build` (indexed / skipped / failed counts; deleted
+    /// `BuildStats` shape as `build` (indexed / touched / skipped / failed counts; deleted
     /// files are not counted in any of those fields).
     pub fn update_paths(&self, changed: &[PathBuf]) -> Result<BuildStats> {
+        if crate::overlay::is_overlay(&self.db_path)? {
+            return self.build(true, None);
+        }
         self.initialize()?;
         self.update_paths_cached(changed, &mut None)
     }
@@ -559,6 +613,13 @@ impl Runtime {
         workspaces: &[Workspace],
         inputs: &IgnoreInputs,
     ) -> Result<BuildStats> {
+        if crate::overlay::is_overlay(&self.db_path)? {
+            return self.build(true, None);
+        }
+        let _writer = crate::maintenance::FileLease::acquire(
+            crate::maintenance::writer_lease_path(&self.db_path),
+            Duration::from_secs(30),
+        )?;
         // Schema bootstrap happens once in `watch()`/`update_paths`, not per
         // batch: `create_schema` upserts repos and stamps pragmas, which would
         // take a write lock on every debounced event even when nothing changed.
@@ -646,7 +707,13 @@ impl Runtime {
                 existing_jobs
                     .par_iter()
                     .map(|job| {
-                        process_file_job(job, true, named.contains(job.path.as_path()), &existing)
+                        process_file_job(
+                            job,
+                            true,
+                            named.contains(job.path.as_path()),
+                            &existing,
+                            None,
+                        )
                     })
                     .collect::<Result<Vec<_>>>()
             })?;
@@ -705,7 +772,9 @@ impl Runtime {
             let mut to_upsert = Vec::new();
             for result in results {
                 match result {
-                    ProcessedFile::Indexed { .. } => to_upsert.push(result),
+                    ProcessedFile::Indexed { .. } | ProcessedFile::Touched { .. } => {
+                        to_upsert.push(result)
+                    }
                     ProcessedFile::Unchanged { .. } => stats.skipped += 1,
                     ProcessedFile::ParseFailed {
                         workspace_name,
@@ -745,6 +814,18 @@ impl Runtime {
             }
 
             for result in to_upsert {
+                if let ProcessedFile::Touched {
+                    repo_id,
+                    ref relative,
+                    mtime_ns,
+                    byte_size,
+                    reuse_base,
+                } = result
+                {
+                    update_file_metadata(&tx, repo_id, relative, mtime_ns, byte_size, reuse_base)?;
+                    stats.touched += 1;
+                    continue;
+                }
                 if let ProcessedFile::Indexed {
                     repo_id,
                     relative,
@@ -763,12 +844,19 @@ impl Runtime {
                 }
             }
 
+            // A targeted publication does not prove a complete catalog scan.
+            // Advance its generation so shared full-refresh markers cannot
+            // hide another file whose watcher notification was lost.
+            tx.execute(
+                "UPDATE index_state SET generation = generation + 1 WHERE id = 1",
+                [],
+            )?;
             tx.commit()?;
         }
 
         eprintln!(
-            "update complete: {} indexed, {} deleted, {} failed",
-            touched, deleted, stats.failed
+            "update complete: {} indexed, {} touched, {} deleted, {} failed",
+            touched, stats.touched, deleted, stats.failed
         );
         Ok(stats)
     }
@@ -1129,13 +1217,18 @@ impl Runtime {
             Connection::open_with_flags(
                 &self.db_path,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | rusqlite::OpenFlags::SQLITE_OPEN_URI,
             )
             .with_context(|| format!("failed to open {}", self.db_path.display()))
         };
         let mut conn = open()?;
-        check_schema_version_for_reads(&conn)?;
-        self.legacy_partial.set(false);
+        if crate::overlay::table_exists(&conn, "overlay_meta")? {
+            crate::overlay::validate_format(&conn)?;
+        } else {
+            check_schema_version_for_reads(&conn)?;
+        }
+        self.legacy_partial.store(false, Ordering::Relaxed);
         if table_exists(&conn, "files")? && !table_has_column(&conn, "files", "partial")? {
             drop(conn);
             match add_files_partial_column(&self.db_path) {
@@ -1148,7 +1241,7 @@ impl Runtime {
                 // serve, degrade: project `0 AS partial` so the SELECT parses
                 // without the column and `partial` reports false.
                 Err(AddPartialError::NotWritable) => {
-                    self.legacy_partial.set(true);
+                    self.legacy_partial.store(true, Ordering::Relaxed);
                     conn = open()?;
                 }
                 // A genuine migration failure (corruption, unexpected SQL
@@ -1156,6 +1249,8 @@ impl Runtime {
                 Err(AddPartialError::Migration(error)) => return Err(error),
             }
         }
+        conn.execute_batch("BEGIN DEFERRED")?;
+        crate::overlay::attach_views(&conn)?;
         ensure_index_ready(&conn)?;
         Ok(conn)
     }
@@ -1165,7 +1260,7 @@ impl Runtime {
     /// that couldn't be migrated (see `legacy_partial`). The alias keeps the
     /// column at the same ordinal so `indexed_symbol_from_row` is unchanged.
     fn partial_projection(&self) -> &'static str {
-        if self.legacy_partial.get() {
+        if self.legacy_partial.load(Ordering::Relaxed) {
             "0 AS partial"
         } else {
             "f.partial"
@@ -1174,11 +1269,21 @@ impl Runtime {
 
     pub fn get_symbol(&self, args: GetSymbolArgs) -> Result<GetSymbolResponse> {
         let conn = self.open_read_conn()?;
-        let matcher = args
-            .file_glob
-            .as_deref()
-            .map(build_glob_matcher)
-            .transpose()?;
+        let (matcher, mut diagnostics) =
+            self.path_filter(&conn, args.file_glob.as_deref(), args.repo.as_deref())?;
+        if let Some(kind) = &args.kind {
+            let kinds = conn
+                .prepare("SELECT DISTINCT kind FROM symbols ORDER BY kind")?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if !kinds.contains(kind) {
+                return Err(crate::mcp::InvalidParams(format!(
+                    "unknown kind {kind:?}; valid kinds: {}",
+                    kinds.join(", ")
+                ))
+                .into());
+            }
+        }
 
         // Accept a single `name` and/or a `names` list; dedupe, preserve order.
         // Batching several names into one call is the point — it turns N
@@ -1196,9 +1301,8 @@ impl Runtime {
             ));
         }
 
-        // Build `s.name IN (?, ?, ...)` then bind repo/kind twice each for the
-        // `(? IS NULL OR col = ?)` filters. All placeholders are positional in
-        // bind order: names…, repo, repo, kind, kind.
+        // Bind names followed by the optional repo filter. Apply kind after
+        // collecting candidates so a mismatch can report the kinds found.
         let placeholders = vec!["?"; names.len()].join(", ");
         let partial = self.partial_projection();
         let sql = format!(
@@ -1211,7 +1315,6 @@ impl Runtime {
             JOIN repos r ON r.id = f.repo_id
             WHERE s.name IN ({placeholders})
               AND (? IS NULL OR r.name = ?)
-              AND (? IS NULL OR s.kind = ?)
             ORDER BY s.name, r.name, f.path, s.start_row, s.start_col
             "#
         );
@@ -1220,11 +1323,8 @@ impl Runtime {
         use rusqlite::types::Value;
         let mut binds: Vec<Value> = names.iter().cloned().map(Value::Text).collect();
         let repo_value = args.repo.clone().map_or(Value::Null, Value::Text);
-        let kind_value = args.kind.clone().map_or(Value::Null, Value::Text);
         binds.push(repo_value.clone());
         binds.push(repo_value);
-        binds.push(kind_value.clone());
-        binds.push(kind_value);
 
         let mut rows = stmt.query(rusqlite::params_from_iter(binds))?;
 
@@ -1247,12 +1347,31 @@ impl Runtime {
                 let symbol = indexed_symbol_from_row(row)?;
                 if matcher
                     .as_ref()
-                    .is_some_and(|matcher| !matcher.is_match(&symbol.file))
+                    .is_some_and(|matcher| !matcher.is_match(&symbol.repo, &symbol.file))
                 {
                     continue;
                 }
                 if let Some(&bucket) = order.get(&symbol.name) {
                     buckets[bucket].push(symbol);
+                }
+            }
+        }
+
+        if let Some(kind) = &args.kind {
+            for (name, bucket) in names.iter().zip(&mut buckets) {
+                let mut kinds = std::collections::BTreeMap::new();
+                for symbol in bucket.iter() {
+                    *kinds.entry(symbol.kind.clone()).or_default() += 1;
+                }
+                bucket.retain(|symbol| &symbol.kind == kind);
+                if bucket.is_empty() && !kinds.is_empty() {
+                    let mut diagnostic = Diagnostic::new(
+                        "kind_filtered_out",
+                        format!("kind {kind:?} removed every match for {name:?}"),
+                        "Omit kind or use one of the found kinds.",
+                    );
+                    diagnostic.kinds = kinds;
+                    diagnostics.push(diagnostic);
                 }
             }
         }
@@ -1361,6 +1480,7 @@ impl Runtime {
                 .collect::<Vec<_>>();
             let truncated = !truncated_names.is_empty();
             GetSymbolResponse {
+                diagnostics: diagnostics.clone(),
                 matches,
                 truncated,
                 total,
@@ -1407,6 +1527,13 @@ impl Runtime {
     /// original file didn't already have, so a bad edit leaves the file
     /// untouched instead of corrupting it.
     pub fn replace_symbol(&self, args: ReplaceSymbolArgs) -> Result<ReplaceSymbolResponse> {
+        // Parallel requests must read after the preceding source edit has
+        // published. Hold the checkout's writer lease through read, parse and
+        // atomic rename so two replacements cannot overwrite one another.
+        let _writer = crate::maintenance::FileLease::acquire(
+            crate::maintenance::writer_lease_path(&self.db_path),
+            Duration::from_secs(30),
+        )?;
         let workspaces = self.workspaces()?;
         let workspace = match &args.repo {
             Some(repo) => workspaces
@@ -1741,6 +1868,7 @@ impl Runtime {
         let budget = self.config.server.max_response_chars;
         let next_offset = if end < total { Some(end) } else { None };
         let mut response = FileOutlineResponse {
+            diagnostics: Vec::new(),
             repo,
             file: args.file,
             language,
@@ -1826,7 +1954,12 @@ impl Runtime {
         )>,
     > {
         let conn = self.open_read_conn()?;
-        let scope = args.scope.as_deref().map(build_glob_matcher).transpose()?;
+        let workspaces = self.selected_workspaces(args.repo.as_deref())?;
+        let scope = args
+            .scope
+            .as_deref()
+            .map(|p| build_path_filter(p, &workspaces))
+            .transpose()?;
 
         // Combine `name` + `names`, dedupe, preserve order.
         let mut names: Vec<String> = Vec::new();
@@ -1883,10 +2016,10 @@ impl Runtime {
         // Apply the same in-memory filters both read paths honor.
         Ok(refs
             .into_iter()
-            .filter(|(_, _, file, _, _, _, _, context, _, _)| {
+            .filter(|(_, repo, file, _, _, _, _, context, _, _)| {
                 if scope
                     .as_ref()
-                    .is_some_and(|matcher| !matcher.is_match(file))
+                    .is_some_and(|matcher| !matcher.is_match(repo, file))
                 {
                     return false;
                 }
@@ -1908,6 +2041,9 @@ impl Runtime {
     /// (top-N by count, with `files_truncated` set) so a many-file repo can't
     /// produce an oversized response — the invariant the row path enforces.
     pub fn find_reference_counts(&self, args: FindReferencesArgs) -> Result<RefCountsResponse> {
+        let conn = self.open_read_conn()?;
+        let (_, diagnostics) =
+            self.path_filter(&conn, args.scope.as_deref(), args.repo.as_deref())?;
         let multi = args.name.iter().count() + args.names.as_ref().map_or(0, |n| n.len()) > 1;
         let rows = self.query_reference_rows(&args)?;
 
@@ -1956,6 +2092,7 @@ impl Runtime {
         // budget-shrink loops on the row-level read paths.
         let budget = self.config.server.max_response_chars;
         let build = |files: &[FileRefCount], files_truncated: bool| RefCountsResponse {
+            diagnostics: diagnostics.clone(),
             total,
             total_files,
             files_returned: files.len(),
@@ -1998,6 +2135,9 @@ impl Runtime {
     }
 
     pub fn find_references(&self, args: FindReferencesArgs) -> Result<FindReferencesResponse> {
+        let conn = self.open_read_conn()?;
+        let (_, diagnostics) =
+            self.path_filter(&conn, args.scope.as_deref(), args.repo.as_deref())?;
         // Several names => tag each ref with its name so the caller can tell
         // them apart; single-name responses stay byte-identical.
         let tag_names = args.names.as_ref().is_some_and(|n| n.len() > 1)
@@ -2132,6 +2272,7 @@ impl Runtime {
                 .collect();
             grouped.sort_by(|a, b| a.repo.cmp(&b.repo).then_with(|| a.file.cmp(&b.file)));
             FindReferencesResponse {
+                diagnostics: diagnostics.clone(),
                 total,
                 total_files,
                 returned,
@@ -2192,7 +2333,8 @@ impl Runtime {
     /// only). When `args.col` is `None` the lookup is row-only — useful
     /// for stack-trace lines and commit hunks where you have a line
     /// number but not a column. When `args.col` is `Some`, symbols are
-    /// filtered by exact `(row, col)` containment.
+    /// filtered by exact `(row, col)` containment, with a diagnostic and a
+    /// row-only retry when the column-qualified lookup is empty.
     ///
     /// Returns an error if the file isn't in the index. Returns an
     /// `Ok` with empty `matches` when the file is indexed but the
@@ -2275,7 +2417,16 @@ impl Runtime {
                         args.context_lines,
                         effective_max_body_lines,
                     )?;
-                    results.push(EnclosingHit { row, matches });
+                    let diagnostics = if matches.is_empty() {
+                        vec![no_enclosing_symbol(row)]
+                    } else {
+                        Vec::new()
+                    };
+                    results.push(EnclosingHit {
+                        row,
+                        matches,
+                        diagnostics,
+                    });
                 }
                 Ok(results)
             };
@@ -2287,6 +2438,7 @@ impl Runtime {
                 let mut guard = 0;
                 loop {
                     let response = EnclosingSymbolResponse {
+                        diagnostics: Vec::new(),
                         repo: resolved_repo.clone(),
                         file: args.file.clone(),
                         matches: Vec::new(),
@@ -2310,6 +2462,7 @@ impl Runtime {
                 }
             }
             return Ok(EnclosingSymbolResponse {
+                diagnostics: Vec::new(),
                 repo: resolved_repo,
                 file: args.file,
                 matches: Vec::new(),
@@ -2334,7 +2487,7 @@ impl Runtime {
         let mut depth_kept = depth;
         let mut guard = 0;
         loop {
-            let matches = self.enclosing_matches(
+            let mut matches = self.enclosing_matches(
                 &conn,
                 &args.file,
                 &resolved_repo,
@@ -2345,7 +2498,35 @@ impl Runtime {
                 args.context_lines,
                 effective_max_body_lines,
             )?;
+            let mut diagnostics = Vec::new();
+            if matches.is_empty()
+                && let Some(col) = args.col
+            {
+                matches = self.enclosing_matches(
+                    &conn,
+                    &args.file,
+                    &resolved_repo,
+                    internal_row,
+                    None,
+                    depth_kept,
+                    args.include_body,
+                    args.context_lines,
+                    effective_max_body_lines,
+                )?;
+                diagnostics.push(Diagnostic::new(
+                    "col_ignored",
+                    format!(
+                        "no symbol contains column {} on row {row}; retried by row",
+                        col
+                    ),
+                    "Omit col unless the line holds more than one symbol.",
+                ));
+            }
+            if matches.is_empty() {
+                diagnostics.push(no_enclosing_symbol(row));
+            }
             let response = EnclosingSymbolResponse {
+                diagnostics,
                 repo: resolved_repo.clone(),
                 file: args.file.clone(),
                 matches,
@@ -2482,21 +2663,75 @@ impl Runtime {
     }
 
     pub fn query(&self, args: QueryArgs) -> Result<QueryResponse> {
-        // Raw queries read live files (via `walk_source_files`), not the index,
-        // so they must NOT be gated on the initial build completing — a query
-        // against a brand-new or never-indexed root is still meaningful and
-        // should return live results, not "index is not ready". We only
-        // bootstrap the schema (cheap, idempotent) so the DB file is valid and
-        // no database initialization or readiness check is needed.
-        let spec = lookup_language(&args.language)
-            .ok_or_else(|| anyhow!("unsupported language {}", args.language))?;
-        let query = Query::new(&(spec.language)(), &args.query)
-            .with_context(|| format!("invalid query for {}", args.language))?;
+        let mut requested = args.languages.clone();
+        if !args.language.is_empty() {
+            requested.insert(0, args.language.clone());
+        }
+        if requested.is_empty() {
+            return Err(crate::mcp::InvalidParams(
+                "query requires language or a non-empty languages array".into(),
+            )
+            .into());
+        }
+        let mut compiled = HashMap::new();
+        let mut diagnostics = Vec::new();
+        let mut seen_languages = HashSet::new();
+        for language in &requested {
+            if !seen_languages.insert(language) {
+                continue;
+            }
+            let result = (|| -> Result<_> {
+                let spec = lookup_language(language)
+                    .ok_or_else(|| anyhow!("unsupported language {language}"))?;
+                let query = Query::new(&(spec.language)(), &args.query)
+                    .with_context(|| format!("invalid query for {language}"))?;
+                let literals = query_literals(&query, &args.query);
+                Ok((spec, query, literals))
+            })();
+            match result {
+                Ok((spec, query, literals)) => {
+                    compiled.insert(spec.id, (spec, query, literals));
+                }
+                Err(error) if args.languages.is_empty() => {
+                    return Err(crate::mcp::InvalidParams(format!("{error:#}")).into());
+                }
+                Err(error) => diagnostics.push(Diagnostic::new(
+                    "query_compile_failed",
+                    format!("{language}: {error:#}"),
+                    "Use a query supported by this language.",
+                )),
+            }
+        }
+        let workspaces = self.selected_workspaces(args.repo.as_deref())?;
         let matcher = args
             .file_glob
             .as_deref()
-            .map(build_glob_matcher)
+            .map(|p| build_path_filter(p, &workspaces))
             .transpose()?;
+        // A never-indexed root remains queryable through the live walk. A ready
+        // index supplies candidates without traversing unrelated directories.
+        let conn = if self.db_path.exists() {
+            let conn = crate::overlay::read_connection(&self.db_path)?;
+            if (table_exists(&conn, "files")?
+                || crate::overlay::table_exists(&conn, "overlay_meta")?)
+                && ensure_index_ready(&conn).is_ok()
+            {
+                Some(conn)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(conn) = &conn {
+            diagnostics.extend(
+                self.path_filter(conn, args.file_glob.as_deref(), args.repo.as_deref())?
+                    .1,
+            );
+        }
+        let mut files_scanned = 0;
+        let mut files_parsed = 0;
+        let mut filter_matched = false;
         let limit = resolve_limit(&self.config.server, args.limit);
         let offset = args.offset.unwrap_or(0);
         let capture_char_limit = self.config.server.capture_char_limit;
@@ -2513,120 +2748,163 @@ impl Runtime {
         // correct even when the timeout cuts it short.
         let mut stream_pos = 0usize;
 
-        for workspace in self.workspaces()? {
-            if truncated || timed_out {
+        for workspace in workspaces {
+            if truncated || timed_out || compiled.is_empty() {
                 break;
             }
-            if args
-                .repo
-                .as_ref()
-                .is_some_and(|repo| repo != &workspace.name)
-            {
-                continue;
+            let mut candidates = Vec::new();
+            if let Some(conn) = &conn {
+                let mut language_ids = compiled.keys().copied().collect::<Vec<_>>();
+                language_ids.sort();
+                for language in language_ids {
+                    let mut stmt = conn.prepare("SELECT f.path FROM files f JOIN repos r ON r.id = f.repo_id WHERE r.name = ?1 AND f.language = ?2 ORDER BY f.path")?;
+                    for file in stmt.query_map(params![workspace.name, language], |row| {
+                        row.get::<_, String>(0)
+                    })? {
+                        let relative = file?;
+                        if matcher
+                            .as_ref()
+                            .is_none_or(|m| m.is_match(&workspace.name, &relative))
+                        {
+                            candidates.push((
+                                workspace.root.join(&relative),
+                                relative,
+                                language.to_string(),
+                            ));
+                        }
+                    }
+                }
+            } else {
+                for path in self.walk_source_files(&workspace)? {
+                    let relative = relative_path(&workspace.root, &path);
+                    if matcher
+                        .as_ref()
+                        .is_some_and(|m| !m.is_match(&workspace.name, &relative))
+                    {
+                        continue;
+                    }
+                    filter_matched = true;
+                    if let Some(language) = detect_language_from_file(&workspace.root, &path)?
+                        && compiled.contains_key(language)
+                    {
+                        candidates.push((path, relative, language.to_string()));
+                    }
+                }
             }
-            for path in self.walk_source_files(&workspace)? {
+            candidates.sort_by(|a, b| a.1.cmp(&b.1));
+            // Bound prefetch memory while overlapping cold-file reads. Keep
+            // the collected order stable so pagination is deterministic.
+            for batch in candidates.chunks(64) {
+                if truncated || timed_out {
+                    break;
+                }
                 if started.elapsed() > timeout {
                     timed_out = true;
                     break;
                 }
-                let Some(language_id) = detect_language_from_file(&workspace.root, &path)? else {
-                    continue;
-                };
-                if language_id != spec.id {
-                    continue;
-                }
-                let relative = relative_path(&workspace.root, &path);
-                if matcher
-                    .as_ref()
-                    .is_some_and(|matcher| !matcher.is_match(&relative))
-                {
-                    continue;
-                }
-                // Match build's file gate: skip oversized files outright, and
-                // let one unreadable file degrade the response to `partial`
-                // instead of failing the whole query.
-                if fs::metadata(&path).is_ok_and(|meta| meta.len() > MAX_FILE_SIZE) {
-                    continue;
-                }
-                let source = match fs::read(&path) {
-                    Ok(source) => source,
-                    Err(error) => {
-                        eprintln!("warning: query skipped {}: {error}", path.display());
-                        partial = true;
-                        continue;
-                    }
-                };
-                if is_binary(&source) {
-                    continue;
-                }
-                let parsed = parse_tree(&spec, &source)?;
-                // Track this file's parse-recovery state, but only fold it into
-                // the response `partial` when a capture from this file is
-                // actually returned — otherwise a malformed file that matched
-                // nothing would flag the whole response partial for no reason
-                // visible to the caller.
-                let file_has_error = parsed.root_node().has_error();
-                let mut emitted_from_file = false;
-                let mut cursor = QueryCursor::new();
-                let names = query.capture_names();
-                let mut capture_iter =
-                    cursor.captures(&query, parsed.root_node(), source.as_slice());
-                while let Some(capture) = capture_iter.next() {
+                let sources: Vec<_> = batch
+                    .par_iter()
+                    .map(|(path, _, language)| {
+                        read_query_source(path, &compiled[language.as_str()].2)
+                    })
+                    .collect();
+                files_scanned += batch.len();
+                for ((path, relative, language), source) in batch.iter().zip(sources) {
                     if started.elapsed() > timeout {
                         timed_out = true;
                         break;
                     }
-                    let (matched, index) = capture;
-                    let QueryCapture { node, .. } = matched.captures[*index];
-                    let name = names[matched.captures[*index].index as usize].to_string();
-                    if args.capture.as_ref().is_some_and(|needle| needle != &name) {
-                        continue;
-                    }
-                    // Advance the stream position for every matched capture
-                    // so the offset window is stable across the whole walk,
-                    // not per file.
-                    if stream_pos < offset {
+                    let source = match source {
+                        Ok(Some(source)) => source,
+                        Ok(None) => continue,
+                        Err(error) => {
+                            eprintln!("warning: query skipped {}: {error}", path.display());
+                            partial = true;
+                            continue;
+                        }
+                    };
+                    let (spec, query, _) = &compiled[language.as_str()];
+                    files_parsed += 1;
+                    let parsed = parse_tree(spec, &source)?;
+                    // Track this file's parse-recovery state, but only fold it into
+                    // the response `partial` when a capture from this file is
+                    // actually returned — otherwise a malformed file that matched
+                    // nothing would flag the whole response partial for no reason
+                    // visible to the caller.
+                    let file_has_error = parsed.root_node().has_error();
+                    let mut emitted_from_file = false;
+                    let mut cursor = QueryCursor::new();
+                    let names = query.capture_names();
+                    let mut capture_iter =
+                        cursor.captures(query, parsed.root_node(), source.as_slice());
+                    while let Some(capture) = capture_iter.next() {
+                        if started.elapsed() > timeout {
+                            timed_out = true;
+                            break;
+                        }
+                        let (matched, index) = capture;
+                        let QueryCapture { node, .. } = matched.captures[*index];
+                        let name = names[matched.captures[*index].index as usize].to_string();
+                        if args.capture.as_ref().is_some_and(|needle| needle != &name) {
+                            continue;
+                        }
+                        // Advance the stream position for every matched capture
+                        // so the offset window is stable across the whole walk,
+                        // not per file.
+                        if stream_pos < offset {
+                            stream_pos += 1;
+                            continue;
+                        }
+                        if captures.len() >= limit {
+                            // This match exists past the window — stop emitting.
+                            truncated = true;
+                            break;
+                        }
+                        let raw_text = node.utf8_text(&source).unwrap_or_default().to_string();
+                        // Cap the capture text at `capture_char_limit` chars so a
+                        // single huge capture (e.g. a whole-file string) can't
+                        // dominate the response. The cap counts Unicode scalar
+                        // values, not bytes, and marks the capture `text_truncated`
+                        // so the caller knows it was trimmed.
+                        let (text, text_truncated) = truncate_chars(&raw_text, capture_char_limit);
+                        captures.push(RawQueryCapture {
+                            repo: workspace.name.clone(),
+                            name,
+                            text,
+                            file: relative.clone(),
+                            range: SourceRange {
+                                start: RangePoint(
+                                    node.start_position().row,
+                                    node.start_position().column,
+                                ),
+                                end: RangePoint(
+                                    node.end_position().row,
+                                    node.end_position().column,
+                                ),
+                            },
+                            text_truncated,
+                        });
+                        emitted_from_file = true;
                         stream_pos += 1;
-                        continue;
                     }
-                    if captures.len() >= limit {
-                        // This match exists past the window — stop emitting.
-                        truncated = true;
+                    // Only fold this file's parse-recovery flag in when it
+                    // actually contributed a returned capture.
+                    if emitted_from_file {
+                        partial |= file_has_error;
+                    }
+                    if truncated || timed_out {
                         break;
                     }
-                    let raw_text = node.utf8_text(&source).unwrap_or_default().to_string();
-                    // Cap the capture text at `capture_char_limit` chars so a
-                    // single huge capture (e.g. a whole-file string) can't
-                    // dominate the response. The cap counts Unicode scalar
-                    // values, not bytes, and marks the capture `text_truncated`
-                    // so the caller knows it was trimmed.
-                    let (text, text_truncated) = truncate_chars(&raw_text, capture_char_limit);
-                    captures.push(RawQueryCapture {
-                        repo: workspace.name.clone(),
-                        name,
-                        text,
-                        file: relative.clone(),
-                        range: SourceRange {
-                            start: RangePoint(
-                                node.start_position().row,
-                                node.start_position().column,
-                            ),
-                            end: RangePoint(node.end_position().row, node.end_position().column),
-                        },
-                        text_truncated,
-                    });
-                    emitted_from_file = true;
-                    stream_pos += 1;
-                }
-                // Only fold this file's parse-recovery flag in when it
-                // actually contributed a returned capture.
-                if emitted_from_file {
-                    partial |= file_has_error;
-                }
-                if truncated || timed_out {
-                    break;
                 }
             }
+        }
+
+        if conn.is_none()
+            && !compiled.is_empty()
+            && !filter_matched
+            && let Some(pattern) = &args.file_glob
+        {
+            diagnostics.push(filter_no_files(pattern));
         }
 
         // A timeout that fires before this page emitted anything would hand
@@ -2636,7 +2914,7 @@ impl Runtime {
         if timed_out && captures.is_empty() {
             return Err(anyhow!(
                 "query timed out before reaching offset {offset} (no captures emitted \
-                 within {} ms); raise `query_timeout_ms` or narrow with `file_glob`",
+                 within {} ms; files_scanned={files_scanned}); raise `query_timeout_ms` or narrow with `file_glob`",
                 self.config.server.query_timeout_ms
             ));
         }
@@ -2651,7 +2929,11 @@ impl Runtime {
         let build = |captures: Vec<RawQueryCapture>, truncated: bool| {
             let next_offset = truncated.then_some(offset + captures.len());
             QueryResponse {
+                diagnostics: diagnostics.clone(),
                 language: args.language.clone(),
+                languages: args.languages.clone(),
+                files_scanned,
+                files_parsed,
                 warning: crate::model::truncation_warning(captures.len(), None, next_offset, None),
                 captures,
                 truncated,
@@ -2734,6 +3016,41 @@ impl Runtime {
         Ok(workspaces)
     }
 
+    fn selected_workspaces(&self, repo: Option<&str>) -> Result<Vec<Workspace>> {
+        Ok(self
+            .workspaces()?
+            .into_iter()
+            .filter(|workspace| repo.is_none_or(|repo| repo == workspace.name))
+            .collect())
+    }
+
+    fn path_filter(
+        &self,
+        conn: &Connection,
+        pattern: Option<&str>,
+        repo: Option<&str>,
+    ) -> Result<(Option<PathFilter>, Vec<Diagnostic>)> {
+        let Some(pattern) = pattern else {
+            return Ok((None, Vec::new()));
+        };
+        let filter = build_path_filter(pattern, &self.selected_workspaces(repo)?)?;
+        let mut stmt = conn.prepare("SELECT r.name, f.path FROM files f JOIN repos r ON r.id = f.repo_id WHERE (?1 IS NULL OR r.name = ?1)")?;
+        let mut rows = stmt.query([repo])?;
+        let mut matched = false;
+        while let Some(row) = rows.next()? {
+            if filter.is_match(&row.get::<_, String>(0)?, &row.get::<_, String>(1)?) {
+                matched = true;
+                break;
+            }
+        }
+        let diagnostics = if matched {
+            Vec::new()
+        } else {
+            vec![filter_no_files(pattern)]
+        };
+        Ok((Some(filter), diagnostics))
+    }
+
     fn watch_input_directories(&self, ignore_inputs: &IgnoreInputs) -> HashSet<PathBuf> {
         let mut inputs = ignore_inputs.directories();
         let configured_roots = if self.config.repos.is_empty() {
@@ -2804,7 +3121,7 @@ impl Runtime {
     /// Walks prune these so a nested repo's files are indexed only under the
     /// repo that owns them (deepest root wins, matching `best_workspace_for_path`).
     fn other_workspace_roots(&self, workspace: &Workspace) -> Result<HashSet<PathBuf>> {
-        Ok(foreign_workspace_roots(workspace, &self.workspaces()?))
+        foreign_workspace_roots(workspace, &self.workspaces()?)
     }
 
     pub fn source_path(&self, repo: &str, file: &str) -> Result<PathBuf> {
@@ -2897,6 +3214,7 @@ impl Runtime {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BuildStats {
     pub indexed: usize,
+    pub touched: usize,
     pub skipped: usize,
     pub failed: usize,
 }
@@ -2946,6 +3264,13 @@ struct FileJob {
 }
 
 enum ProcessedFile {
+    Touched {
+        repo_id: i64,
+        relative: String,
+        mtime_ns: i64,
+        byte_size: i64,
+        reuse_base: bool,
+    },
     Indexed {
         repo_id: i64,
         relative: String,
@@ -3047,6 +3372,7 @@ fn prefetch_file_state_for_chunk(conn: &Connection, chunk: &[FileJob]) -> Result
                 let byte_size: i64 = row.get(4)?;
                 repo_map.insert(path, (language, sha, mtime_ns, byte_size));
             }
+            crate::overlay::supplement_file_states(conn, repo_id, repo_map, path_batch)?;
         }
     }
     Ok(map)
@@ -3078,16 +3404,24 @@ fn process_batch(
     } else {
         HashMap::new()
     };
+    // Private stages reconcile a complete checkout. Hashing prevents equal
+    // timestamps and lengths in different worktrees from aliasing identities.
+    let verify_content = crate::overlay::is_staging_connection(conn)?;
+    let base =
+        crate::overlay::base_file_states(conn, batch.iter().map(|job| job.relative.as_str()))?;
     let results: Vec<ProcessedFile> = pool.install(|| {
         batch
             .par_iter()
-            .map(|job| process_file_job(job, incremental, false, &existing))
+            .map(|job| process_file_job(job, incremental, verify_content, &existing, Some(&base)))
             .collect::<Result<Vec<_>>>()
     })?;
 
-    let has_writes = results
-        .iter()
-        .any(|r| matches!(r, ProcessedFile::Indexed { .. }));
+    let has_writes = results.iter().any(|r| {
+        matches!(
+            r,
+            ProcessedFile::Indexed { .. } | ProcessedFile::Touched { .. }
+        )
+    });
     let tx = if has_writes {
         Some(conn.transaction_with_behavior(TransactionBehavior::Immediate)?)
     } else {
@@ -3095,6 +3429,24 @@ fn process_batch(
     };
     for result in results {
         match result {
+            ProcessedFile::Touched {
+                repo_id,
+                relative,
+                mtime_ns,
+                byte_size,
+                reuse_base,
+            } => {
+                update_file_metadata(
+                    tx.as_ref().unwrap(),
+                    repo_id,
+                    &relative,
+                    mtime_ns,
+                    byte_size,
+                    reuse_base,
+                )?;
+                active_paths.entry(repo_id).or_default().insert(relative);
+                stats.touched += 1;
+            }
             ProcessedFile::Indexed {
                 repo_id,
                 relative,
@@ -3153,11 +3505,35 @@ fn process_batch(
     Ok(())
 }
 
+fn update_file_metadata(
+    conn: &Connection,
+    repo_id: i64,
+    path: &str,
+    mtime_ns: i64,
+    byte_size: i64,
+    reuse_base: bool,
+) -> Result<()> {
+    if reuse_base {
+        return crate::overlay::restore_base(conn, path, mtime_ns, byte_size);
+    }
+    let changed = conn.execute(
+        "UPDATE main.files SET mtime_ns = ?1, byte_size = ?2 WHERE repo_id = ?3 AND path = ?4",
+        params![mtime_ns, byte_size, repo_id, path],
+    )?;
+    if changed == 0 && crate::overlay::table_exists(conn, "overlay_meta")? {
+        crate::overlay::observe_base_file(conn, path, mtime_ns, byte_size)?;
+    } else {
+        crate::overlay::touch_file_directory(conn, path, mtime_ns, byte_size)?;
+    }
+    Ok(())
+}
+
 fn process_file_job(
     job: &FileJob,
     incremental: bool,
     force_hash: bool,
     existing: &StoredFileStates,
+    base: Option<&HashMap<String, (String, String)>>,
 ) -> Result<ProcessedFile> {
     let unreadable = |error: std::io::Error| ProcessedFile::Unreadable {
         repo_id: job.repo_id,
@@ -3225,11 +3601,36 @@ fn process_file_job(
     if let Some((lang, existing_sha, existing_mtime, _)) = stored
         && *lang == job.spec.id
         && *existing_sha == sha
-        && *existing_mtime == mtime_ns
+        // -1 is a schema-upgrade sentinel: those files MUST be re-extracted.
+        && *existing_mtime >= 0
     {
+        if *existing_mtime != mtime_ns {
+            return Ok(ProcessedFile::Touched {
+                repo_id: job.repo_id,
+                relative: job.relative.clone(),
+                mtime_ns,
+                byte_size: metadata.len() as i64,
+                reuse_base: false,
+            });
+        }
         return Ok(ProcessedFile::Unchanged {
             repo_id: job.repo_id,
             relative: job.relative.clone(),
+        });
+    }
+
+    if base
+        .and_then(|states| states.get(&job.relative))
+        .is_some_and(|(language, base_sha)| language == job.spec.id && base_sha == &sha)
+    {
+        // Restoring a private delta to known base bytes needs only a shadow
+        // removal and local observation. Reuse its extraction before parsing.
+        return Ok(ProcessedFile::Touched {
+            repo_id: job.repo_id,
+            relative: job.relative.clone(),
+            mtime_ns,
+            byte_size: metadata.len() as i64,
+            reuse_base: true,
         });
     }
 
@@ -3330,9 +3731,23 @@ fn indexed_symbol_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedS
 }
 
 fn create_schema(conn: &Connection, workspaces: &[Workspace]) -> Result<()> {
+    if crate::overlay::table_exists(conn, "overlay_meta")? {
+        crate::overlay::validate_format(conn)?;
+        if !crate::overlay::is_staging_connection(conn)? {
+            // Published overlays change only through the complete Backup
+            // transaction. In particular, never create ordinary `files`
+            // tables that an older reader could confuse with a full index.
+            return Ok(());
+        }
+    }
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    let stale = migrate_schema(conn, workspaces)?;
+    let stale = if crate::overlay::table_exists(conn, "overlay_meta")? {
+        crate::overlay::validate_format(conn)?;
+        false
+    } else {
+        migrate_schema(conn, workspaces)?
+    };
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS repos (
@@ -3407,7 +3822,7 @@ fn create_schema(conn: &Connection, workspaces: &[Workspace]) -> Result<()> {
     // A stale index keeps its old version (so reads keep warning) until
     // `build` has re-extracted every file and stamps the current one.
     if !stale {
-        set_user_version(conn, SCHEMA_VERSION)?;
+        set_user_version(conn, crate::overlay::disk_version(conn)?)?;
     }
     Ok(())
 }
@@ -3631,7 +4046,7 @@ fn emit_stale_schema_warning_once(pre_migrate_version: i64) {
 /// hasn't changed on disk, the rebuild is the only difference — no
 /// wasted re-hash.
 fn mark_all_files_stale(conn: &Connection) -> Result<()> {
-    conn.execute("UPDATE files SET mtime_ns = -1", [])?;
+    conn.execute("UPDATE main.files SET mtime_ns = -1", [])?;
     Ok(())
 }
 
@@ -3709,7 +4124,7 @@ fn migrate_legacy_files_table(conn: &Connection, workspaces: &[Workspace]) -> Re
         )?;
         conn.execute(
             r#"
-            INSERT INTO files(id, repo_id, path, language, sha, mtime_ns, byte_size)
+            INSERT INTO main.files(id, repo_id, path, language, sha, mtime_ns, byte_size)
             SELECT id, ?1, path, language, sha, mtime_ns, byte_size
             FROM files_legacy
             "#,
@@ -3866,7 +4281,7 @@ fn delete_file_rows_or_prefix(conn: &Connection, repo_id: i64, relative: &str) -
     // a single statement instead of one DELETE per matched row.
     let deleted = conn.execute(
         r#"
-        DELETE FROM files
+        DELETE FROM main.files
         WHERE repo_id = ?1
           AND (path = ?2 OR substr(path, 1, length(?3)) = ?3)
         "#,
@@ -3886,9 +4301,12 @@ fn upsert_file(
     byte_size: i64,
     mut parsed: ParsedFile,
 ) -> Result<()> {
+    if crate::overlay::reuse_base(conn, path, language, sha, mtime_ns, byte_size)? {
+        return Ok(());
+    }
     conn.execute(
         r#"
-        INSERT INTO files(repo_id, path, language, sha, mtime_ns, byte_size, partial)
+        INSERT INTO main.files(repo_id, path, language, sha, mtime_ns, byte_size, partial)
         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
         ON CONFLICT(repo_id, path) DO UPDATE SET
           language = excluded.language,
@@ -3908,12 +4326,12 @@ fn upsert_file(
         ],
     )?;
     let file_id: i64 = conn.query_row(
-        "SELECT id FROM files WHERE repo_id = ?1 AND path = ?2",
+        "SELECT id FROM main.files WHERE repo_id = ?1 AND path = ?2",
         params![repo_id, path],
         |row| row.get(0),
     )?;
-    conn.execute("DELETE FROM symbols WHERE file_id = ?1", [file_id])?;
-    conn.execute("DELETE FROM refs WHERE file_id = ?1", [file_id])?;
+    conn.execute("DELETE FROM main.symbols WHERE file_id = ?1", [file_id])?;
+    conn.execute("DELETE FROM main.refs WHERE file_id = ?1", [file_id])?;
 
     parsed.symbols.sort_by_key(|symbol| {
         (
@@ -3927,7 +4345,7 @@ fn upsert_file(
     for (symbol, qualified) in parsed.symbols.into_iter().zip(qualified) {
         conn.execute(
             r#"
-            INSERT INTO symbols(
+            INSERT INTO main.symbols(
               file_id, kind, name, qualified, start_row, start_col, end_row, end_col, signature, docstring
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             "#,
@@ -3949,7 +4367,7 @@ fn upsert_file(
     for reference in parsed.refs {
         conn.execute(
             r#"
-            INSERT INTO refs(file_id, name, start_row, start_col, end_row, end_col, context)
+            INSERT INTO main.refs(file_id, name, start_row, start_col, end_row, end_col, context)
             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
             "#,
             params![
@@ -3963,7 +4381,7 @@ fn upsert_file(
             ],
         )?;
     }
-    Ok(())
+    crate::overlay::sync_private_file_directory(conn, path)
 }
 
 fn purge_stale_files(
@@ -4004,7 +4422,8 @@ fn purge_stale_files(
             None => true,
         };
         if !source_exists || (!is_active && in_purge_scope) {
-            conn.execute("DELETE FROM files WHERE id = ?1", [file_id])?;
+            crate::overlay::hide_path(conn, &path)?;
+            conn.execute("DELETE FROM main.files WHERE id = ?1", [file_id])?;
         }
     }
     Ok(())
@@ -4466,8 +4885,197 @@ fn is_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(1024).any(|byte| *byte == 0)
 }
 
-fn build_glob_matcher(pattern: &str) -> Result<GlobMatcher> {
-    Ok(Glob::new(pattern)?.compile_matcher())
+enum PathPattern {
+    Literal(String),
+    Glob(GlobMatcher),
+}
+
+fn read_query_source(path: &Path, literals: &[Vec<String>]) -> std::io::Result<Option<Vec<u8>>> {
+    if fs::metadata(path)?.len() > MAX_FILE_SIZE {
+        return Ok(None);
+    }
+    let source = fs::read(path)?;
+    // Patterns are alternatives; literals within a pattern are conjunctive.
+    if is_binary(&source)
+        || !literals.iter().any(|pattern| {
+            pattern
+                .iter()
+                .all(|literal| memchr::memmem::find(&source, literal.as_bytes()).is_some())
+        })
+    {
+        return Ok(None);
+    }
+    Ok(Some(source))
+}
+
+/// Required literals per alternative query pattern. Only mandatory captures
+/// can prefilter: equality on an absent optional capture is vacuously true.
+fn query_literals(query: &Query, source: &str) -> Vec<Vec<String>> {
+    (0..query.pattern_count())
+        .map(|pattern| {
+            let text =
+                &source[query.start_byte_for_pattern(pattern)..query.end_byte_for_pattern(pattern)];
+            let mut tokens = Vec::new();
+            let mut chars = text.char_indices().peekable();
+            while let Some((start, ch)) = chars.next() {
+                match ch {
+                    ';' => while chars.next().is_some_and(|(_, c)| c != '\n') {},
+                    c if c.is_whitespace() => {}
+                    '(' | ')' => tokens.push(&text[start..start + 1]),
+                    '"' => {
+                        while let Some((end, c)) = chars.next() {
+                            if c == '\\' {
+                                chars.next();
+                            } else if c == '"' {
+                                tokens.push(&text[start..end + 1]);
+                                break;
+                            }
+                        }
+                    }
+                    _ => {
+                        while chars
+                            .peek()
+                            .is_some_and(|(_, c)| !c.is_whitespace() && !"();\"".contains(*c))
+                        {
+                            chars.next();
+                        }
+                        let end = chars.peek().map_or(text.len(), |(i, _)| *i);
+                        tokens.push(&text[start..end]);
+                    }
+                }
+            }
+            tokens
+                .windows(5)
+                .filter_map(|tokens| {
+                    if tokens[0] != "(" || tokens[1] != "#eq?" || tokens[4] != ")" {
+                        return None;
+                    }
+                    let capture = query.capture_index_for_name(tokens[2].strip_prefix('@')?)?;
+                    if !matches!(
+                        query.capture_quantifiers(pattern)[capture as usize],
+                        tree_sitter::CaptureQuantifier::One
+                            | tree_sitter::CaptureQuantifier::OneOrMore
+                    ) {
+                        return None;
+                    }
+                    let literal = tokens[3].strip_prefix('"')?.strip_suffix('"')?;
+                    let mut decoded = String::new();
+                    let mut chars = literal.chars();
+                    while let Some(ch) = chars.next() {
+                        decoded.push(if ch == '\\' {
+                            // Match tree-sitter's query string decoding (query.c).
+                            match chars.next()? {
+                                'n' => '\n',
+                                'r' => '\r',
+                                't' => '\t',
+                                '0' => '\0',
+                                c => c,
+                            }
+                        } else {
+                            ch
+                        });
+                    }
+                    Some(decoded)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+struct PathFilter {
+    patterns: HashMap<String, PathPattern>,
+}
+
+fn filter_no_files(pattern: &str) -> Diagnostic {
+    Diagnostic::new(
+        "filter_matched_no_files",
+        format!("path filter {pattern:?} matched no indexed files"),
+        "Check the path and selected repo, or omit the filter.",
+    )
+}
+
+fn no_enclosing_symbol(row: usize) -> Diagnostic {
+    Diagnostic::new(
+        "no_enclosing_symbol",
+        format!("row {row} is at top level; no enclosing symbol was found"),
+        "Check the row or use list_file_outline to find nearby symbols.",
+    )
+}
+
+impl PathFilter {
+    fn is_match(&self, repo: &str, file: &str) -> bool {
+        match self.patterns.get(repo) {
+            Some(PathPattern::Literal(path)) => {
+                path.is_empty()
+                    || file == path
+                    || file
+                        .strip_prefix(path)
+                        .is_some_and(|tail| tail.starts_with('/'))
+            }
+            Some(PathPattern::Glob(glob)) => glob.is_match(file),
+            None => false,
+        }
+    }
+}
+
+fn build_path_filter(pattern: &str, workspaces: &[Workspace]) -> Result<PathFilter> {
+    let mut normalized = PathBuf::new();
+    for component in Path::new(pattern).components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(crate::mcp::InvalidParams(format!(
+                        "path filter {pattern:?} escapes the workspace root"
+                    ))
+                    .into());
+                }
+            }
+            component => normalized.push(component),
+        }
+    }
+    let mut patterns = HashMap::new();
+    if normalized.is_absolute()
+        && let Some((ancestor, canonical)) = normalized.ancestors().find_map(|path| {
+            path.canonicalize()
+                .ok()
+                .map(|canonical| (path.to_path_buf(), canonical))
+        })
+    {
+        normalized = canonical.join(normalized.strip_prefix(ancestor)?);
+    }
+    for workspace in workspaces {
+        let relative = if normalized.is_absolute() {
+            let Ok(relative) = normalized.strip_prefix(&workspace.root) else {
+                continue;
+            };
+            relative
+        } else {
+            &normalized
+        };
+        let relative = relative.to_string_lossy().into_owned();
+        #[cfg(windows)]
+        let relative = relative.replace('\\', "/");
+        let filter = if relative.contains(['*', '?', '[', '{']) {
+            PathPattern::Glob(
+                Glob::new(&relative)
+                    .map_err(|e| {
+                        crate::mcp::InvalidParams(format!("invalid path filter {pattern:?}: {e}"))
+                    })?
+                    .compile_matcher(),
+            )
+        } else {
+            PathPattern::Literal(relative)
+        };
+        patterns.insert(workspace.name.clone(), filter);
+    }
+    if normalized.is_absolute() && patterns.is_empty() {
+        return Err(crate::mcp::InvalidParams(format!(
+            "absolute path filter {pattern:?} is outside the selected workspace roots"
+        ))
+        .into());
+    }
+    Ok(PathFilter { patterns })
 }
 
 /// Options that govern how a symbol body is sliced out of its source file.
@@ -5115,12 +5723,22 @@ fn workspace_walk_builder(workspace: &Workspace) -> WalkBuilder {
 /// Walks prune these so a nested repo's files are indexed and watched only
 /// under the repo that owns them (deepest root wins, matching
 /// `best_workspace_for_path`).
-fn foreign_workspace_roots(workspace: &Workspace, workspaces: &[Workspace]) -> HashSet<PathBuf> {
-    workspaces
+fn foreign_workspace_roots(
+    workspace: &Workspace,
+    workspaces: &[Workspace],
+) -> Result<HashSet<PathBuf>> {
+    let mut roots: HashSet<_> = workspaces
         .iter()
         .filter(|other| other.root != workspace.root)
         .map(|other| other.root.clone())
-        .collect()
+        .collect();
+    roots.extend(
+        crate::worktrees::discover(&workspace.root)?
+            .into_iter()
+            .filter(|checkout| checkout.path != workspace.root)
+            .map(|checkout| checkout.path),
+    );
+    Ok(roots)
 }
 
 /// `inotify_add_watch` failed with ENOSPC: the per-user watch budget is spent.
@@ -5313,7 +5931,7 @@ fn register_watch_directories(
     // `filter_entry` demands a `'static + Send + Sync` closure, so it owns
     // copies of everything it consults.
     let db_dir = db_dir.to_path_buf();
-    let foreign_roots = foreign_workspace_roots(workspace, workspaces);
+    let foreign_roots = foreign_workspace_roots(workspace, workspaces)?;
     let workspaces = workspaces.to_vec();
     let targets: HashSet<_> = targets.iter().cloned().collect();
     let subtrees = targets.clone();
@@ -7854,7 +8472,7 @@ def handler_{index}():
         // mtime+size fast path.
         let existing = stored("not-the-real-sha", mtime_ns);
         assert!(matches!(
-            process_file_job(&job, true, false, &existing)?,
+            process_file_job(&job, true, false, &existing, None)?,
             ProcessedFile::Unchanged { .. }
         ));
 
@@ -7862,7 +8480,7 @@ def handler_{index}():
         // to the content check and re-extract.
         let existing = stored("not-the-real-sha", -1);
         assert!(matches!(
-            process_file_job(&job, true, false, &existing)?,
+            process_file_job(&job, true, false, &existing, None)?,
             ProcessedFile::Indexed { .. }
         ));
         Ok(())

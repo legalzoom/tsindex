@@ -39,7 +39,9 @@ See [SECURITY.md](SECURITY.md) for verification details.
 
 ### From source
 
-Requires the Rust toolchain. If you don't have one, install via [rustup](https://rustup.rs):
+Source builds require Rust 1.89 or later. The checkout pins the tested toolchain
+in [rust-toolchain.toml](rust-toolchain.toml). Install Rust with
+[rustup](https://rustup.rs) if needed:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -104,10 +106,13 @@ present and shows the matching tsindex MCP command for the current root.
 
 The skill startup scripts do not install persistent watchers. By default they
 run `tsindex --root <target> update` as an eager warm-up and exit.
-`tsindex --root <target> serve --mcp` runs its own in-process watcher for the
-lifetime of the server (startup refresh, then filesystem notifications), so MCP
-sessions stay fresh without an external `watch`. Use `TSINDEX_START_MODE=watch`
-only when you want a foreground watcher for CLI-only sessions that never start
+`tsindex --root <target> serve --mcp` coordinates an in-process watcher with
+other servers using the same index and configuration. One owner receives
+filesystem notifications; every automatic server also reconciles on demand
+before reads when the last complete refresh is older than
+`worktree_refresh_ms`. This keeps missed notifications and watcher exhaustion
+from leaving an indefinitely stale index. Use `TSINDEX_START_MODE=watch` only
+when you want a foreground watcher for CLI-only sessions that never start
 `serve --mcp`.
 
 Watch startup rejects unsupported language filters even for configured clones
@@ -141,10 +146,13 @@ Notifications are coalesced into distinct changed paths over bounded two-second
 windows, including while indexing is busy. Reads are discarded; writable closes
 and queue-overflow rescans are retained. Unreadable or vanished child
 directories and optional input probes are skipped; a source-root registration
-failure or an exhausted inotify watch limit stops startup. Other platforms keep
-their native recursive watcher (FSEvents on macOS). `--no-refresh serve --mcp`
-disables automatic refresh and watching when you need a server that only reads
-an existing index.
+failure or an exhausted inotify watch limit stops that watcher attempt.
+Automatic MCP servers retry watching and use on-demand refresh in the meantime;
+if reconciliation fails, the request reports that freshness is unavailable.
+Other platforms keep their native recursive watcher (FSEvents on macOS).
+`--no-refresh serve --mcp` disables primary automatic refresh and watching when
+you need a server that only reads an existing primary index. Explicit linked
+checkout requests still reconcile their own indexes on demand.
 
 ---
 
@@ -190,18 +198,21 @@ configured repo(s), compares files against the existing index, indexes new or
 changed files, skips unchanged files, and purges rows for files that were
 deleted or are no longer indexable. Index-backed CLI commands (`symbol`,
 `outline`, `enclosing`, and `refs`) read the existing SQLite index; they do not
-refresh it on every query. `query` is the exception: it reads live source files,
-not the index, so it works without a prior `build` and does not gate on the
-initial index completing.
+refresh it on every query. `query` reads live source contents using indexed
+file candidates when the index is ready. Before the first build it falls back
+to a live walk, so it remains usable without a prior `build`.
 
-`serve` (HTTP) runs one incremental refresh at startup so sessions begin from a
-fresh index; keep `watch` running alongside it for long-lived HTTP sessions.
-`serve --mcp` instead runs a watcher in-process for the lifetime of the server:
-it performs the startup refresh in the background (so the MCP `initialize`
-handshake is not delayed by a large catalog) and then keeps the index fresh from
-filesystem notifications, so no separate `watch` is needed. Pass `--no-refresh`
-to skip the startup refresh; under `--mcp` this also disables the in-process
-watcher, so the index is then only as fresh as the last `build`/`update`.
+`serve` (HTTP) refreshes at startup and reconciles before later reads when the
+last successful full refresh is older than `worktree_refresh_ms` (2000 ms by
+default). `serve --mcp` additionally coordinates a watcher with compatible
+servers using the same database. Its startup runs in the background so the MCP
+`initialize` handshake remains responsive; indexed reads establish freshness
+before returning. Primary live `query` requests bypass full-index
+reconciliation, including when startup is blocked or unrelated sources fail.
+Watch notifications reduce latency, while periodic on-demand
+reconciliation covers missing watches. Failed reconciliation returns an
+explicit freshness error. Pass `--no-refresh` to disable primary automatic
+maintenance; its index then reflects the last explicit `build`/`update`.
 
 Watch for changes and refresh the index on save:
 
@@ -239,6 +250,79 @@ tsindex --root /path/to/catalog refs authenticate_user --repo auth
 tsindex --root /path/to/catalog query '(function_definition name: (identifier) @fn)' --language python --repo auth
 ```
 
+## Linked Git worktrees
+
+MCP and HTTP servers discover linked worktrees from Git metadata, including
+worktrees created after startup. In a linked worktree, pass
+`repo=<worktree directory name>` or its absolute root. Omitting `repo` keeps
+queries in the server's primary catalog; results are never merged across
+checkouts. Unknown names return an error listing known repos and index status.
+
+The primary keeps its materialized index. A fresh linked checkout stores a
+small private overlay in its own `.tsindex/index.db` and refers to a shared,
+immutable snapshot under the main checkout's `.tsindex/bases/`. Identical files
+reuse that snapshot's symbols and references; changed files replace the whole
+file's extraction, and deletion or exclusion hides the base file. Overlays pin
+the base's persisted identity, so replacing its pathname cannot silently change
+an older checkout's index. First use still walks and checks local content, so
+a dirty primary cannot supply another
+checkout's bodies. Bodies and edits always use the selected checkout's source.
+
+Each overlay also stores an indexed directory of its effective file metadata.
+Symbol and reference lookups join that directory by logical file ID, avoiding
+a complete file-list merge for each query. Symbols and references remain shared
+with the base. The directory is derived state: an older overlay writer makes
+its generation stale, so readers fall back to merged files until it is rebuilt.
+See the [directory measurement](docs/benchmarks/worktree-file-directory.md) for
+the lookup, refresh, and storage tradeoff.
+
+Publishing a refresh replaces the private overlay atomically; active readers
+retain their earlier complete SQLite snapshot. Worktrees ingest independently,
+including across server processes. MCP and HTTP dispatch use bounded worker
+pools, so another request can progress while one checkout is refreshing.
+Unused worktrees get no index or watcher. Additional worktrees refresh on
+demand at most once every `worktree_refresh_ms` (default 2000 ms); requests wait
+up to 30 seconds for a refresh and can retry if it is still running. Compatible
+processes reuse successful refresh markers within that interval, preserving the
+original refresh age.
+
+Only changed extraction is parsed, but overlay reconciliation checks content
+hashes across the complete logical checkout, including unchanged scans. This
+adds latency: the [synthetic measurement](docs/benchmarks/worktree-overlays.md)
+used about twice as long for first use while saving storage. A source changing
+during preparation discards the stage and returns an error asking the caller to retry.
+An encountered source-read or extraction failure also blocks freshness success;
+managed reads fail until a complete refresh succeeds. Continuous external edits
+can therefore require retries. The primary's `--no-refresh` opt-out remains
+available. An index generation is not an atomic snapshot of the live filesystem.
+
+Sharing applies to a fresh, single-checkout configuration with a ready main
+index. If that source is not ready, contains schema-stale extraction, or cannot
+publish a shared base on first use, the checkout builds a standalone index so
+it can still serve requests. That index remains
+materialized when the main index later becomes ready. Existing materialized
+worktree indexes also remain usable without automatic conversion, and multi-repo
+catalogs retain materialized storage. Missing or incompatible bases recover by
+rebuilding the selected checkout separately.
+An explicit `--db` pointing at an overlay from another configuration refuses a
+recovery that would discard its existing repositories. Use a separate database
+destination for that root.
+Bases are fixed snapshots and are retained: automatic rebasing, compaction,
+and deletion are future work. The first base adds one full copy next to the
+primary, so savings grow with checkout count and shared content. Downgrading
+to a binary without overlay support requires rebuilding these derived caches.
+See the [execution trace](docs/specs/worktree-index-overlays.md) and
+[architecture](docs/ARCHITECTURE.md) for lifecycle and compatibility details.
+
+Names that collide use `<basename>@<git-worktree-id>`; the main checkout uses
+`@main`. `tsindex worktrees --json` lists the resolved names, paths, index status,
+and last update times. The HTTP `/repos` endpoint includes the same worktrees.
+
+```bash
+tsindex --root /path/to/main worktrees
+tsindex --root /path/to/main worktrees --json
+```
+
 ---
 
 ## CLI commands
@@ -252,7 +336,8 @@ tsindex --root /path/to/catalog query '(function_definition name: (identifier) @
 - `outline`: Returns the structure of one file without dumping the full file. Pass `--body-for <name>` (repeatable) to inline selected symbol bodies in the same call.
 - `enclosing`: Finds the symbol range that contains a file position. Accepts several rows to resolve a whole stack trace / hunk set in one call.
 - `refs`: Finds syntactic identifier occurrences (not binding-aware semantic references), batched and paginated.
-- `query`: Runs a raw tree-sitter query for one language.
+- `query`: Runs a raw tree-sitter query for one or more languages.
+- `worktrees`: Lists checkout names, paths, index status, and last update times.
 - `repos`: Lists, adds, and removes repos in the catalog.
 - `serve`: Starts the MCP or HTTP server.
 
@@ -281,11 +366,11 @@ tsindex query '(function_definition name: (identifier) @fn)' --language python -
 - `--root`: Workspace root to index or query.
 - `--db`: Override the SQLite database path.
 - `--languages <lang>`: Restrict work to one or more explicit languages
-  (repeatable). `query` has its own required `--language <lang>` selecting the
-  grammar to run the pattern with.
+  (repeatable). `query` accepts either `--language <lang>` or repeated
+  `--languages <lang>` options to query several grammars.
 - `--json`: Emit JSON output for CLI commands.
-- `--no-refresh`: Skip the one-time incremental refresh before `serve` starts
-  (and, under `serve --mcp`, the in-process watcher).
+- `--no-refresh`: Disable automatic primary refresh before and during `serve`
+  (and the MCP watcher). Explicit linked checkout requests still reconcile.
 
 Several query commands also support `--repo` to restrict results to one configured repo.
 
@@ -397,6 +482,7 @@ Server limits are configurable under
 [server]
 http_port = 7337
 query_timeout_ms = 2000
+worktree_refresh_ms = 2000
 default_result_limit = 200
 max_result_limit = 300
 default_body_line_limit = 120
@@ -430,6 +516,21 @@ During the initial background build, the indexed read tools (`get_symbol`,
 `index is not ready` error instead of treating an incomplete index as an
 authoritative empty result. `query` is exempt — it reads live files, so it
 returns results immediately even before the first build finishes.
+
+Read responses include `diagnostics` only when a valid request needs attention.
+A bare `scope` or `file_glob` accepts a file or directory, including `./dir`,
+`dir/`, and absolute paths inside the selected repository. A typo that matches
+no indexed files emits `filter_matched_no_files`. `get_symbol` rejects unknown
+kinds and reports `kind_filtered_out` with the found kind counts when a kind
+removes every candidate for a requested name. `enclosing_symbol` always emits
+`matches`; an empty column lookup retries by row with `col_ignored`, and a
+top-level row reports `no_enclosing_symbol`. Omit `col` unless needed.
+
+MCP `query` accepts `languages: ["typescript", "tsx"]` alongside `language`.
+Compilation failures in a language array emit `query_compile_failed` while
+other languages continue. Indexed candidates and required equality literals
+avoid unrelated parsing. Responses report `files_scanned` and `files_parsed`;
+timeout errors also report `files_scanned`.
 
 Raw `query` responses set `truncated` when execution stops before all captures are returned. If this
 was caused by the configured query timeout instead of the result limit, the response also includes
@@ -475,6 +576,12 @@ check is not authentication**: a non-loopback bind exposes the read API and the
 `POST /repos/*` mutation endpoints to anyone who can reach the port and set a
 matching `Host` header. Keep the default loopback bind unless the network path
 is already access-controlled.
+
+Catalog additions and removals wait for admitted indexed calls and rebuilds to
+finish, so an older refresh cannot undo a successful catalog change. Indexed
+calls run concurrently with one another. They and rebuilds wait while an add
+or remove is in progress, including cloning. Live syntax queries and metadata
+routes bypass catalog admission but still share the bounded HTTP worker pool.
 
 Available routes:
 
@@ -529,11 +636,23 @@ Build a separate index with each binary, and use a repository whose contents
 you are permitted to process. The output measures bytes and approximate token
 counts, not model accuracy, billing, or realized savings.
 
+`bench/worktree_overlays.py` compares fresh copied indexes with shared overlays
+using real Git worktrees and MCP reads. It reports first-use latency, unchanged
+reconciliation, later one-file ingestion, and total SQLite storage including
+the primary, shared base, private indexes, and sidecars. Both binaries should
+use the same build profile. See its `--help` and the
+[measurement notes](docs/benchmarks/worktree-overlays.md).
+
 ---
 
 ## Developing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution and validation guidance.
+
+Research behind worktree storage overlays is collected in the
+[overlay research](docs/research/worktree-index-overlays-prior-art.md).
+The implementation's execution and baseline tests are described in the
+[overlay trace](docs/specs/worktree-index-overlays.md).
 
 For iterative work, run the CLI through Cargo so you don't have to reinstall on every change:
 

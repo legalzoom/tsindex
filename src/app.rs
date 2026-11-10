@@ -91,6 +91,8 @@ pub enum Command {
     Query(QueryCommand),
     #[command(about = "List, add, or remove repos in the multi-repo catalog.")]
     Repos(ReposCommand),
+    #[command(about = "List Git worktrees and their index status without indexing them.")]
+    Worktrees,
     #[command(about = "Start the MCP server or the HTTP JSON server.")]
     Serve(ServeCommand),
 }
@@ -359,7 +361,8 @@ pub struct QueryCommand {
     query: String,
     #[arg(
         long,
-        help = "Language to run the query against, such as python or typescript."
+        default_value = "",
+        help = "Language to run the query against, such as python or typescript; or use --languages."
     )]
     language: String,
     #[arg(long, help = "Limit query execution to one configured repo.")]
@@ -475,8 +478,8 @@ pub fn run() -> Result<()> {
                 print_json(&build_stats_json(&stats))
             } else {
                 println!(
-                    "updated index: {} changed, {} unchanged, {} failed",
-                    stats.indexed, stats.skipped, stats.failed
+                    "updated index: {} changed, {} touched, {} unchanged, {} failed",
+                    stats.indexed, stats.touched, stats.skipped, stats.failed
                 );
                 Ok(())
             }
@@ -579,10 +582,10 @@ pub fn run() -> Result<()> {
             print_json(&response)
         }),
         Command::Query(ref command) => with_runtime(&cli, |runtime| {
-            // `query` reads live files, not the index, so it does not refresh
-            // the index first (unlike the indexed read commands). This keeps a
-            // raw query usable against a brand-new root without a prior build.
+            // Ready indexes supply candidates; never-indexed roots use a live
+            // walk. In either case captures come from current file contents.
             let response = runtime.query(QueryArgs {
+                languages: cli.languages.clone(),
                 language: command.language.clone(),
                 repo: command.repo.clone(),
                 query: command.query.clone(),
@@ -594,6 +597,23 @@ pub fn run() -> Result<()> {
             print_json(&response)
         }),
         Command::Repos(ref command) => manage_repos(&cli, command),
+        Command::Worktrees => with_runtime(&cli, |runtime| {
+            let repos = crate::worktrees::Runtimes::new(runtime).list()?;
+            if cli.json {
+                return print_json(&repos);
+            }
+            for repo in repos {
+                println!(
+                    "{}\t{}\tindexed={}\tupdated_at={}",
+                    repo.name,
+                    repo.path.display(),
+                    repo.indexed,
+                    repo.updated_at
+                        .map_or_else(|| "never".into(), |time| time.to_string())
+                );
+            }
+            Ok(())
+        }),
         Command::Serve(ref command) => with_runtime(&cli, |runtime| {
             let runtime = runtime.with_jobs(0);
             if command.mcp {
@@ -601,6 +621,9 @@ pub fn run() -> Result<()> {
                 return serve_mcp(runtime);
             }
             refresh_if_needed(&cli, &runtime)?;
+            if !cli.no_refresh {
+                crate::maintenance::register_primary(&runtime, false);
+            }
             // `--mcp` returned above; everything else (`--http` or no mode at
             // all) serves the HTTP dashboard.
             let port = command.port.unwrap_or(runtime.config.server.http_port);
@@ -612,6 +635,7 @@ pub fn run() -> Result<()> {
 fn build_stats_json(stats: &BuildStats) -> serde_json::Value {
     json!({
         "indexed": stats.indexed,
+        "touched": stats.touched,
         "skipped": stats.skipped,
         "failed": stats.failed,
     })
@@ -715,6 +739,33 @@ fn check_full_build_failures(stats: &BuildStats) -> Result<()> {
 
 fn with_runtime(cli: &Cli, f: impl FnOnce(Runtime) -> Result<()>) -> Result<()> {
     let root = resolve_root(cli.root.as_deref())?;
+    if cli.db.is_none()
+        && !db_path(&root).exists()
+        && !matches!(cli.command, Command::Worktrees)
+        && let Some(checkout) = crate::worktrees::discover(&root)?
+            .into_iter()
+            .find(|checkout| checkout.path == root && checkout.path != checkout.main_root)
+    {
+        let config = TsIndexConfig::load_or_default(&checkout.main_root)?;
+        let languages = cli.languages.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("tsindex-checkout-startup".into())
+            .spawn(move || {
+                let result = (|| -> Result<Runtime> {
+                    let runtime = crate::worktrees::open_checkout(&checkout, &config, languages)?;
+                    let stats = runtime.build(true, None)?;
+                    check_full_build_failures(&stats)?;
+                    Ok(runtime)
+                })();
+                let _ = tx.send(result);
+            })
+            .context("failed to start worktree index worker; retry shortly")?;
+        let runtime = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .context("worktree index is not ready after 30 s; retry shortly")??;
+        return f(runtime);
+    }
     let config = TsIndexConfig::load_or_default(&root)?;
     let db = cli.db.clone().unwrap_or_else(|| db_path(&root));
     // A `--db` override may point at another catalog's index; never let this
@@ -730,8 +781,8 @@ fn refresh_if_needed(cli: &Cli, runtime: &Runtime) -> Result<()> {
     }
     let stats = runtime.build(true, None)?;
     eprintln!(
-        "refreshed index: {} changed, {} unchanged, {} failed",
-        stats.indexed, stats.skipped, stats.failed
+        "refreshed index: {} changed, {} touched, {} unchanged, {} failed",
+        stats.indexed, stats.touched, stats.skipped, stats.failed
     );
     Ok(())
 }
@@ -745,33 +796,12 @@ fn refresh_if_needed(cli: &Cli, runtime: &Runtime) -> Result<()> {
 /// brand-new root return empty results instead of "no such table" while the
 /// first build runs.
 fn spawn_background_watch(cli: &Cli, runtime: &Runtime) -> Result<()> {
-    // Bootstrap the schema even under --no-refresh: the flag opts out of
-    // refreshing the index, not of having a database, and skipping it would
-    // turn every query on a brand-new root into "no such table".
+    // Schema bootstrap stays synchronous so initialization never exposes a
+    // missing database while the first maintained refresh runs in the background.
     runtime.initialize()?;
-    if cli.no_refresh {
-        return Ok(());
+    if !cli.no_refresh {
+        crate::maintenance::register_primary(runtime, true);
     }
-    let runtime = runtime.clone();
-    std::thread::spawn(move || {
-        // The startup build inside `watch()` can lose a lock race with a
-        // concurrent `tsindex build`/second server or hit a transient I/O
-        // error; a one-shot failure would leave this session serving a stale
-        // index for its whole lifetime. Retry a few times before giving up.
-        const ATTEMPTS: u32 = 5;
-        for attempt in 1..=ATTEMPTS {
-            match runtime.watch() {
-                Ok(()) => return,
-                Err(e) if attempt < ATTEMPTS => {
-                    eprintln!(
-                        "warning: background index watch failed (attempt {attempt}/{ATTEMPTS}): {e:#}"
-                    );
-                    std::thread::sleep(std::time::Duration::from_secs(2 * u64::from(attempt)));
-                }
-                Err(e) => eprintln!("warning: background index watch failed; giving up: {e:#}"),
-            }
-        }
-    });
     Ok(())
 }
 
@@ -951,12 +981,14 @@ mod tests {
     #[test]
     fn full_build_with_failures_is_an_error() {
         let ok = BuildStats {
+            touched: 0,
             indexed: 1,
             skipped: 0,
             failed: 0,
         };
         assert!(check_full_build_failures(&ok).is_ok());
         let failed = BuildStats {
+            touched: 0,
             indexed: 1,
             skipped: 0,
             failed: 2,
@@ -968,13 +1000,14 @@ mod tests {
     #[test]
     fn build_json_reports_failed_count() {
         let stats = BuildStats {
+            touched: 0,
             indexed: 1,
             skipped: 2,
             failed: 3,
         };
         assert_eq!(
             build_stats_json(&stats),
-            json!({ "indexed": 1, "skipped": 2, "failed": 3 })
+            json!({ "indexed": 1, "touched": 0, "skipped": 2, "failed": 3 })
         );
     }
 

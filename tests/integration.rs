@@ -323,6 +323,7 @@ def test_authenticate_user():
     assert!(refs.total >= 2);
 
     let query = runtime.query(QueryArgs {
+        languages: Vec::new(),
         language: "python".to_string(),
         repo: None,
         query: "(function_definition name: (identifier) @fn)".to_string(),
@@ -602,7 +603,7 @@ fn incremental_build_purges_ignored_file() -> Result<()> {
         name: Some("authenticate_user".to_string()),
         names: None,
         repo: None,
-        kind: Some("function".to_string()),
+        kind: None, // No kinds remain after the only indexed file is ignored.
         file_glob: None,
         include_body: false,
         context_lines: 0,
@@ -697,6 +698,7 @@ fn query_is_not_truncated_when_result_count_equals_limit() -> Result<()> {
     runtime.build(false, None)?;
 
     let query = runtime.query(QueryArgs {
+        languages: Vec::new(),
         language: "python".to_string(),
         repo: None,
         query: "(function_definition name: (identifier) @fn)".to_string(),
@@ -4457,6 +4459,7 @@ fn query_ignores_parse_errors_from_files_without_returned_captures() -> Result<(
     );
 
     let response = runtime.query(QueryArgs {
+        languages: Vec::new(),
         language: "python".into(),
         repo: None,
         query: "(function_definition name: (identifier) @fn)".into(),

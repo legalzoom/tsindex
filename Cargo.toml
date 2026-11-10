@@ -2,7 +2,7 @@
 name = "tsindex"
 version = "1.9.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Local tree-sitter code navigation for CLI and MCP clients"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/legalzoom/tsindex"
@@ -15,8 +15,10 @@ globset = "0.4"
 ignore = "0.4"
 rayon = "1.10"
 libc = "0.2"
+memchr = "=2.8.0"
 notify = "8.2"
-rusqlite = { version = "0.32", features = ["bundled"] }
+# Preserve the existing fallible SQL count conversions with the patched bindings.
+rusqlite = { version = "0.41.1", features = ["bundled", "backup", "fallible_uint"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

@@ -1,6 +1,26 @@
 use serde::Serialize;
 use serde::ser::{SerializeSeq, Serializer};
 
+#[derive(Debug, Clone, Serialize)]
+pub struct Diagnostic {
+    pub code: String,
+    pub message: String,
+    pub hint: String,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub kinds: std::collections::BTreeMap<String, usize>,
+}
+
+impl Diagnostic {
+    pub fn new(code: &str, message: impl Into<String>, hint: &str) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            hint: hint.into(),
+            kinds: Default::default(),
+        }
+    }
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -115,6 +135,7 @@ pub struct SymbolMatch {
 
 #[derive(Debug, Clone)]
 pub struct GetSymbolResponse {
+    pub diagnostics: Vec<Diagnostic>,
     pub matches: Vec<SymbolMatch>,
     pub truncated: bool,
     pub total: usize,
@@ -198,6 +219,8 @@ impl Serialize for GetSymbolResponse {
 
         #[derive(Serialize)]
         struct Wire<'a> {
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            diagnostics: &'a Vec<Diagnostic>,
             #[serde(skip_serializing_if = "Option::is_none")]
             repo: Option<&'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -214,6 +237,7 @@ impl Serialize for GetSymbolResponse {
         }
 
         Wire {
+            diagnostics: &self.diagnostics,
             repo: repo.as_deref(),
             language: language.as_deref(),
             matches: self
@@ -238,9 +262,8 @@ impl Serialize for GetSymbolResponse {
 
 #[derive(Debug, Clone)]
 pub struct EnclosingSymbolResponse {
-    /// Repo containing the file. Empty when no enclosing symbol was
-    /// found (the file may still exist in the index — the position
-    /// just sits outside any captured symbol's range).
+    pub diagnostics: Vec<Diagnostic>,
+    /// Repo containing the indexed file, even when no symbol encloses the row.
     pub repo: String,
     /// The repository-relative file path that was queried.
     pub file: String,
@@ -281,11 +304,12 @@ impl Serialize for EnclosingSymbolResponse {
 
         #[derive(Serialize)]
         struct Wire<'a> {
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            diagnostics: &'a Vec<Diagnostic>,
             repo: &'a str,
             file: &'a str,
             #[serde(skip_serializing_if = "Option::is_none")]
             language: Option<&'a str>,
-            #[serde(skip_serializing_if = "Vec::is_empty")]
             matches: Vec<WireSymbolMatch<'a>>,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             results: Vec<WireEnclosingHit<'a>>,
@@ -301,11 +325,14 @@ impl Serialize for EnclosingSymbolResponse {
 
         #[derive(Serialize)]
         struct WireEnclosingHit<'a> {
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            diagnostics: &'a Vec<Diagnostic>,
             row: usize,
             matches: Vec<WireSymbolMatch<'a>>,
         }
 
         Wire {
+            diagnostics: &self.diagnostics,
             repo: &self.repo,
             file: &self.file,
             language: language.as_deref(),
@@ -318,6 +345,7 @@ impl Serialize for EnclosingSymbolResponse {
                 .results
                 .iter()
                 .map(|hit| WireEnclosingHit {
+                    diagnostics: &hit.diagnostics,
                     row: hit.row,
                     matches: hit
                         .matches
@@ -342,6 +370,8 @@ impl Serialize for EnclosingSymbolResponse {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EnclosingHit {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<Diagnostic>,
     /// The 1-based row this entry answers (echoed from the request).
     pub row: usize,
     /// Symbols enclosing that row, ordered outermost → innermost.
@@ -389,6 +419,8 @@ pub struct OutlineSymbol {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FileOutlineResponse {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<Diagnostic>,
     pub repo: String,
     pub file: String,
     pub language: String,
@@ -463,6 +495,8 @@ pub struct FileRefCount {
 /// row-level payload.
 #[derive(Debug, Clone, Serialize)]
 pub struct RefCountsResponse {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<Diagnostic>,
     /// Total references across all requested names, post-filter. Always exact
     /// (computed over the full set, independent of the `files` array cap).
     pub total: usize,
@@ -508,6 +542,7 @@ pub struct NameRefCount {
 
 #[derive(Debug, Clone)]
 pub struct FindReferencesResponse {
+    pub diagnostics: Vec<Diagnostic>,
     pub total: usize,
     /// Distinct `(repo, file)` pairs across the full result set for ALL
     /// requested names combined, computed pre-pagination. For a multi-name
@@ -546,6 +581,8 @@ impl Serialize for FindReferencesResponse {
 
         #[derive(Serialize)]
         struct Wire<'a> {
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            diagnostics: &'a Vec<Diagnostic>,
             total: usize,
             total_files: usize,
             returned: usize,
@@ -604,6 +641,7 @@ impl Serialize for FindReferencesResponse {
         }
 
         Wire {
+            diagnostics: &self.diagnostics,
             total: self.total,
             total_files: self.total_files,
             returned: self.returned,
@@ -702,7 +740,13 @@ pub struct QueryCapture {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryResponse {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<Diagnostic>,
     pub language: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub languages: Vec<String>,
+    pub files_scanned: usize,
+    pub files_parsed: usize,
     pub captures: Vec<QueryCapture>,
     pub truncated: bool,
     #[serde(skip_serializing_if = "is_false", default)]
@@ -840,6 +884,7 @@ mod tests {
         // Two matches in the same repo+language, different files: repo/language
         // appear once at the top, not on either match; file stays per-match.
         let response = GetSymbolResponse {
+            diagnostics: Vec::new(),
             matches: vec![
                 match_in("r", "rust", "a.rs", "f"),
                 match_in("r", "rust", "b.rs", "g"),
@@ -866,6 +911,7 @@ mod tests {
     fn get_symbol_keeps_repo_per_match_when_repos_differ() {
         // Cross-repo results can't hoist: each match keeps its own repo.
         let response = GetSymbolResponse {
+            diagnostics: Vec::new(),
             matches: vec![
                 match_in("r1", "rust", "a.rs", "f"),
                 match_in("r2", "rust", "b.rs", "f"),
@@ -887,6 +933,7 @@ mod tests {
     #[test]
     fn enclosing_drops_redundant_per_match_repo_file_language() {
         let response = EnclosingSymbolResponse {
+            diagnostics: Vec::new(),
             repo: "r".into(),
             file: "a.rs".into(),
             matches: vec![match_in("r", "rust", "a.rs", "outer")],
@@ -912,6 +959,7 @@ mod tests {
     #[test]
     fn find_references_hoists_shared_repo_across_groups() {
         let response = FindReferencesResponse {
+            diagnostics: Vec::new(),
             total: 2,
             total_files: 2,
             returned: 0,
@@ -944,6 +992,7 @@ mod tests {
         // The static caveat now lives in the find_references tool description,
         // not in every response body.
         let response = FindReferencesResponse {
+            diagnostics: Vec::new(),
             total: 0,
             total_files: 0,
             returned: 0,

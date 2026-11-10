@@ -893,6 +893,39 @@ fn copied_refresh_markers_cannot_prove_another_database_is_fresh() -> Result<()>
 }
 
 #[test]
+#[cfg(unix)]
+fn non_utf8_database_paths_support_refresh_and_watcher_ownership() -> Result<()> {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let (_directory, root) = fixture()?;
+    let mut config = TsIndexConfig::load(&root)?;
+    config.server.worktree_refresh_ms = 60_000;
+    let database = root
+        .join(".tsindex")
+        .join(OsString::from_vec(b"index-\xff".to_vec()))
+        .join("cache.db");
+    let runtime = Runtime::new(root.clone(), database, config, vec![]);
+    runtime.build(false, None)?;
+    let watcher = FileLease::acquire(
+        maintenance::watcher_lease_path(&runtime)?,
+        Duration::from_secs(1),
+    )?;
+    maintenance::register_primary(&runtime, false);
+    let runtimes = Runtimes::new(runtime);
+    assert_eq!(
+        symbol(
+            &runtimes,
+            root.to_str().context("UTF-8 root")?,
+            "before_edit"
+        )?["total"],
+        1
+    );
+    drop(watcher);
+    Ok(())
+}
+
+#[test]
 fn same_stem_databases_have_independent_watcher_ownership() -> Result<()> {
     let (_directory, root) = fixture()?;
     let config = TsIndexConfig::load(&root)?;

@@ -136,10 +136,12 @@ struct RefreshMarker {
 }
 
 fn configuration(runtime: &Runtime) -> Result<String> {
+    let database = key(&runtime.db_path);
     let input = serde_json::to_vec(&(
         // Generations are local to one database. A copied or misplaced marker
         // must not certify another index with an equal generation number.
-        key(&runtime.db_path),
+        // Native path bytes also preserve valid non-UTF-8 database filenames.
+        database.as_os_str().as_encoded_bytes(),
         &runtime.root,
         &runtime.config,
         &runtime.languages,

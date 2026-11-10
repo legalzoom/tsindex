@@ -3,6 +3,7 @@ use std::fs;
 #[cfg(test)]
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -30,7 +31,7 @@ use crate::model::{
 use crate::watch::under_any;
 use crate::watch::{ChangeReceiver, WatchRegistry, changes};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Runtime {
     pub root: PathBuf,
     pub db_path: PathBuf,
@@ -46,7 +47,26 @@ pub struct Runtime {
     /// additive read-path migration could not run (e.g. a read-only
     /// filesystem). Reads then project `0 AS partial` instead of `f.partial`
     /// so a v3 index stays readable; `partial` simply reports `false`.
-    legacy_partial: std::cell::Cell<bool>,
+    legacy_partial: AtomicBool,
+    pub(crate) private_stage: bool,
+}
+
+impl Clone for Runtime {
+    fn clone(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+            db_path: self.db_path.clone(),
+            config: self.config.clone(),
+            languages: self.languages.clone(),
+            jobs: self.jobs,
+            prune_repos: self.prune_repos,
+            // A request receives its own compatibility projection flag. Sharing
+            // it across clones could mix a failed legacy migration in one read
+            // with a successful migration in another concurrent request.
+            legacy_partial: AtomicBool::new(self.legacy_partial.load(Ordering::Relaxed)),
+            private_stage: self.private_stage,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -324,7 +344,7 @@ fn resolve_body_limit(config: &ServerConfig, requested: Option<usize>) -> Option
 // when an extractor change (e.g. expanding ranges to include decorators)
 // alters what gets stored, the version bumps so existing indexes get a
 // "run `tsindex build` to refresh" warning rather than silent drift.
-const SCHEMA_VERSION: i64 = 5;
+pub(crate) const SCHEMA_VERSION: i64 = 5;
 
 impl Runtime {
     pub fn new(
@@ -340,7 +360,8 @@ impl Runtime {
             languages,
             jobs: 1,
             prune_repos: true,
-            legacy_partial: std::cell::Cell::new(false),
+            legacy_partial: AtomicBool::new(false),
+            private_stage: false,
         }
     }
 
@@ -368,11 +389,35 @@ impl Runtime {
     }
 
     pub fn build(&self, incremental: bool, only_repo: Option<&str>) -> Result<BuildStats> {
+        fs::create_dir_all(
+            self.db_path
+                .parent()
+                .ok_or_else(|| anyhow!("index has no parent"))?,
+        )?;
+        let staging = self.private_stage || crate::overlay::is_staging(&self.db_path)?;
+        // The lease covers observation, parsing and publication across CLI and
+        // server processes. Private stage files already belong to this writer.
+        let _writer = if staging {
+            None
+        } else {
+            Some(crate::maintenance::FileLease::acquire(
+                crate::maintenance::writer_lease_path(&self.db_path),
+                Duration::from_secs(30),
+            )?)
+        };
         self.initialize()?;
+        if !staging && crate::overlay::is_overlay(&self.db_path)? {
+            let result = crate::overlay::refresh(self, incremental, only_repo)?;
+            if result.failed == 0 && only_repo.is_none() {
+                crate::maintenance::record_refresh(self)?;
+            }
+            return Ok(result);
+        }
         let mut conn = Connection::open(&self.db_path)
             .with_context(|| format!("failed to open {}", self.db_path.display()))?;
         let all_workspaces = self.workspaces()?;
         create_schema(&conn, &all_workspaces)?;
+        crate::overlay::attach_views(&conn)?;
         if self.prune_repos && only_repo.is_none() {
             prune_missing_repos(&conn, &self.configured_repo_names())?;
         }
@@ -385,6 +430,9 @@ impl Runtime {
             // is left as-is (a fresh DB stays not-ready, an existing index
             // keeps serving its last complete state).
             let _ = conn.execute("UPDATE index_state SET refreshing = 0 WHERE id = 1", []);
+        }
+        if !staging && only_repo.is_none() && result.as_ref().is_ok_and(|stats| stats.failed == 0) {
+            crate::maintenance::record_refresh(self)?;
         }
         result
     }
@@ -504,7 +552,7 @@ impl Runtime {
             // in `create_schema` keeps the stale-schema warning alive until a
             // rebuild has actually happened. A `--repo` or `--languages`
             // scoped build leaves other rows untouched, so it must not stamp.
-            set_user_version(conn, SCHEMA_VERSION)?;
+            set_user_version(conn, crate::overlay::disk_version(conn)?)?;
         }
         eprintln!(
             "build complete: {} indexed, {} touched, {} skipped, {} failed",
@@ -532,6 +580,9 @@ impl Runtime {
     /// `BuildStats` shape as `build` (indexed / touched / skipped / failed counts; deleted
     /// files are not counted in any of those fields).
     pub fn update_paths(&self, changed: &[PathBuf]) -> Result<BuildStats> {
+        if crate::overlay::is_overlay(&self.db_path)? {
+            return self.build(true, None);
+        }
         self.initialize()?;
         self.update_paths_cached(changed, &mut None)
     }
@@ -562,6 +613,13 @@ impl Runtime {
         workspaces: &[Workspace],
         inputs: &IgnoreInputs,
     ) -> Result<BuildStats> {
+        if crate::overlay::is_overlay(&self.db_path)? {
+            return self.build(true, None);
+        }
+        let _writer = crate::maintenance::FileLease::acquire(
+            crate::maintenance::writer_lease_path(&self.db_path),
+            Duration::from_secs(30),
+        )?;
         // Schema bootstrap happens once in `watch()`/`update_paths`, not per
         // batch: `create_schema` upserts repos and stamps pragmas, which would
         // take a write lock on every debounced event even when nothing changed.
@@ -649,7 +707,13 @@ impl Runtime {
                 existing_jobs
                     .par_iter()
                     .map(|job| {
-                        process_file_job(job, true, named.contains(job.path.as_path()), &existing)
+                        process_file_job(
+                            job,
+                            true,
+                            named.contains(job.path.as_path()),
+                            &existing,
+                            None,
+                        )
                     })
                     .collect::<Result<Vec<_>>>()
             })?;
@@ -755,9 +819,10 @@ impl Runtime {
                     ref relative,
                     mtime_ns,
                     byte_size,
+                    reuse_base,
                 } = result
                 {
-                    update_file_metadata(&tx, repo_id, relative, mtime_ns, byte_size)?;
+                    update_file_metadata(&tx, repo_id, relative, mtime_ns, byte_size, reuse_base)?;
                     stats.touched += 1;
                     continue;
                 }
@@ -779,6 +844,13 @@ impl Runtime {
                 }
             }
 
+            // A targeted publication does not prove a complete catalog scan.
+            // Advance its generation so shared full-refresh markers cannot
+            // hide another file whose watcher notification was lost.
+            tx.execute(
+                "UPDATE index_state SET generation = generation + 1 WHERE id = 1",
+                [],
+            )?;
             tx.commit()?;
         }
 
@@ -1145,13 +1217,18 @@ impl Runtime {
             Connection::open_with_flags(
                 &self.db_path,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | rusqlite::OpenFlags::SQLITE_OPEN_URI,
             )
             .with_context(|| format!("failed to open {}", self.db_path.display()))
         };
         let mut conn = open()?;
-        check_schema_version_for_reads(&conn)?;
-        self.legacy_partial.set(false);
+        if crate::overlay::table_exists(&conn, "overlay_meta")? {
+            crate::overlay::validate_format(&conn)?;
+        } else {
+            check_schema_version_for_reads(&conn)?;
+        }
+        self.legacy_partial.store(false, Ordering::Relaxed);
         if table_exists(&conn, "files")? && !table_has_column(&conn, "files", "partial")? {
             drop(conn);
             match add_files_partial_column(&self.db_path) {
@@ -1164,7 +1241,7 @@ impl Runtime {
                 // serve, degrade: project `0 AS partial` so the SELECT parses
                 // without the column and `partial` reports false.
                 Err(AddPartialError::NotWritable) => {
-                    self.legacy_partial.set(true);
+                    self.legacy_partial.store(true, Ordering::Relaxed);
                     conn = open()?;
                 }
                 // A genuine migration failure (corruption, unexpected SQL
@@ -1172,6 +1249,8 @@ impl Runtime {
                 Err(AddPartialError::Migration(error)) => return Err(error),
             }
         }
+        conn.execute_batch("BEGIN DEFERRED")?;
+        crate::overlay::attach_views(&conn)?;
         ensure_index_ready(&conn)?;
         Ok(conn)
     }
@@ -1181,7 +1260,7 @@ impl Runtime {
     /// that couldn't be migrated (see `legacy_partial`). The alias keeps the
     /// column at the same ordinal so `indexed_symbol_from_row` is unchanged.
     fn partial_projection(&self) -> &'static str {
-        if self.legacy_partial.get() {
+        if self.legacy_partial.load(Ordering::Relaxed) {
             "0 AS partial"
         } else {
             "f.partial"
@@ -1448,6 +1527,13 @@ impl Runtime {
     /// original file didn't already have, so a bad edit leaves the file
     /// untouched instead of corrupting it.
     pub fn replace_symbol(&self, args: ReplaceSymbolArgs) -> Result<ReplaceSymbolResponse> {
+        // Parallel requests must read after the preceding source edit has
+        // published. Hold the checkout's writer lease through read, parse and
+        // atomic rename so two replacements cannot overwrite one another.
+        let _writer = crate::maintenance::FileLease::acquire(
+            crate::maintenance::writer_lease_path(&self.db_path),
+            Duration::from_secs(30),
+        )?;
         let workspaces = self.workspaces()?;
         let workspace = match &args.repo {
             Some(repo) => workspaces
@@ -2625,11 +2711,11 @@ impl Runtime {
         // A never-indexed root remains queryable through the live walk. A ready
         // index supplies candidates without traversing unrelated directories.
         let conn = if self.db_path.exists() {
-            let conn = Connection::open_with_flags(
-                &self.db_path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            )?;
-            if table_exists(&conn, "files")? && ensure_index_ready(&conn).is_ok() {
+            let conn = crate::overlay::read_connection(&self.db_path)?;
+            if (table_exists(&conn, "files")?
+                || crate::overlay::table_exists(&conn, "overlay_meta")?)
+                && ensure_index_ready(&conn).is_ok()
+            {
                 Some(conn)
             } else {
                 None
@@ -3183,6 +3269,7 @@ enum ProcessedFile {
         relative: String,
         mtime_ns: i64,
         byte_size: i64,
+        reuse_base: bool,
     },
     Indexed {
         repo_id: i64,
@@ -3285,6 +3372,7 @@ fn prefetch_file_state_for_chunk(conn: &Connection, chunk: &[FileJob]) -> Result
                 let byte_size: i64 = row.get(4)?;
                 repo_map.insert(path, (language, sha, mtime_ns, byte_size));
             }
+            crate::overlay::supplement_file_states(conn, repo_id, repo_map, path_batch)?;
         }
     }
     Ok(map)
@@ -3316,10 +3404,15 @@ fn process_batch(
     } else {
         HashMap::new()
     };
+    // Private stages reconcile a complete checkout. Hashing prevents equal
+    // timestamps and lengths in different worktrees from aliasing identities.
+    let verify_content = crate::overlay::is_staging_connection(conn)?;
+    let base =
+        crate::overlay::base_file_states(conn, batch.iter().map(|job| job.relative.as_str()))?;
     let results: Vec<ProcessedFile> = pool.install(|| {
         batch
             .par_iter()
-            .map(|job| process_file_job(job, incremental, false, &existing))
+            .map(|job| process_file_job(job, incremental, verify_content, &existing, Some(&base)))
             .collect::<Result<Vec<_>>>()
     })?;
 
@@ -3341,6 +3434,7 @@ fn process_batch(
                 relative,
                 mtime_ns,
                 byte_size,
+                reuse_base,
             } => {
                 update_file_metadata(
                     tx.as_ref().unwrap(),
@@ -3348,6 +3442,7 @@ fn process_batch(
                     &relative,
                     mtime_ns,
                     byte_size,
+                    reuse_base,
                 )?;
                 active_paths.entry(repo_id).or_default().insert(relative);
                 stats.touched += 1;
@@ -3416,11 +3511,20 @@ fn update_file_metadata(
     path: &str,
     mtime_ns: i64,
     byte_size: i64,
+    reuse_base: bool,
 ) -> Result<()> {
-    conn.execute(
-        "UPDATE files SET mtime_ns = ?1, byte_size = ?2 WHERE repo_id = ?3 AND path = ?4",
+    if reuse_base {
+        return crate::overlay::restore_base(conn, path, mtime_ns, byte_size);
+    }
+    let changed = conn.execute(
+        "UPDATE main.files SET mtime_ns = ?1, byte_size = ?2 WHERE repo_id = ?3 AND path = ?4",
         params![mtime_ns, byte_size, repo_id, path],
     )?;
+    if changed == 0 && crate::overlay::table_exists(conn, "overlay_meta")? {
+        crate::overlay::observe_base_file(conn, path, mtime_ns, byte_size)?;
+    } else {
+        crate::overlay::touch_file_directory(conn, path, mtime_ns, byte_size)?;
+    }
     Ok(())
 }
 
@@ -3429,6 +3533,7 @@ fn process_file_job(
     incremental: bool,
     force_hash: bool,
     existing: &StoredFileStates,
+    base: Option<&HashMap<String, (String, String)>>,
 ) -> Result<ProcessedFile> {
     let unreadable = |error: std::io::Error| ProcessedFile::Unreadable {
         repo_id: job.repo_id,
@@ -3505,11 +3610,27 @@ fn process_file_job(
                 relative: job.relative.clone(),
                 mtime_ns,
                 byte_size: metadata.len() as i64,
+                reuse_base: false,
             });
         }
         return Ok(ProcessedFile::Unchanged {
             repo_id: job.repo_id,
             relative: job.relative.clone(),
+        });
+    }
+
+    if base
+        .and_then(|states| states.get(&job.relative))
+        .is_some_and(|(language, base_sha)| language == job.spec.id && base_sha == &sha)
+    {
+        // Restoring a private delta to known base bytes needs only a shadow
+        // removal and local observation. Reuse its extraction before parsing.
+        return Ok(ProcessedFile::Touched {
+            repo_id: job.repo_id,
+            relative: job.relative.clone(),
+            mtime_ns,
+            byte_size: metadata.len() as i64,
+            reuse_base: true,
         });
     }
 
@@ -3610,9 +3731,23 @@ fn indexed_symbol_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedS
 }
 
 fn create_schema(conn: &Connection, workspaces: &[Workspace]) -> Result<()> {
+    if crate::overlay::table_exists(conn, "overlay_meta")? {
+        crate::overlay::validate_format(conn)?;
+        if !crate::overlay::is_staging_connection(conn)? {
+            // Published overlays change only through the complete Backup
+            // transaction. In particular, never create ordinary `files`
+            // tables that an older reader could confuse with a full index.
+            return Ok(());
+        }
+    }
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    let stale = migrate_schema(conn, workspaces)?;
+    let stale = if crate::overlay::table_exists(conn, "overlay_meta")? {
+        crate::overlay::validate_format(conn)?;
+        false
+    } else {
+        migrate_schema(conn, workspaces)?
+    };
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS repos (
@@ -3687,7 +3822,7 @@ fn create_schema(conn: &Connection, workspaces: &[Workspace]) -> Result<()> {
     // A stale index keeps its old version (so reads keep warning) until
     // `build` has re-extracted every file and stamps the current one.
     if !stale {
-        set_user_version(conn, SCHEMA_VERSION)?;
+        set_user_version(conn, crate::overlay::disk_version(conn)?)?;
     }
     Ok(())
 }
@@ -3911,7 +4046,7 @@ fn emit_stale_schema_warning_once(pre_migrate_version: i64) {
 /// hasn't changed on disk, the rebuild is the only difference — no
 /// wasted re-hash.
 fn mark_all_files_stale(conn: &Connection) -> Result<()> {
-    conn.execute("UPDATE files SET mtime_ns = -1", [])?;
+    conn.execute("UPDATE main.files SET mtime_ns = -1", [])?;
     Ok(())
 }
 
@@ -3989,7 +4124,7 @@ fn migrate_legacy_files_table(conn: &Connection, workspaces: &[Workspace]) -> Re
         )?;
         conn.execute(
             r#"
-            INSERT INTO files(id, repo_id, path, language, sha, mtime_ns, byte_size)
+            INSERT INTO main.files(id, repo_id, path, language, sha, mtime_ns, byte_size)
             SELECT id, ?1, path, language, sha, mtime_ns, byte_size
             FROM files_legacy
             "#,
@@ -4146,7 +4281,7 @@ fn delete_file_rows_or_prefix(conn: &Connection, repo_id: i64, relative: &str) -
     // a single statement instead of one DELETE per matched row.
     let deleted = conn.execute(
         r#"
-        DELETE FROM files
+        DELETE FROM main.files
         WHERE repo_id = ?1
           AND (path = ?2 OR substr(path, 1, length(?3)) = ?3)
         "#,
@@ -4166,9 +4301,12 @@ fn upsert_file(
     byte_size: i64,
     mut parsed: ParsedFile,
 ) -> Result<()> {
+    if crate::overlay::reuse_base(conn, path, language, sha, mtime_ns, byte_size)? {
+        return Ok(());
+    }
     conn.execute(
         r#"
-        INSERT INTO files(repo_id, path, language, sha, mtime_ns, byte_size, partial)
+        INSERT INTO main.files(repo_id, path, language, sha, mtime_ns, byte_size, partial)
         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
         ON CONFLICT(repo_id, path) DO UPDATE SET
           language = excluded.language,
@@ -4188,12 +4326,12 @@ fn upsert_file(
         ],
     )?;
     let file_id: i64 = conn.query_row(
-        "SELECT id FROM files WHERE repo_id = ?1 AND path = ?2",
+        "SELECT id FROM main.files WHERE repo_id = ?1 AND path = ?2",
         params![repo_id, path],
         |row| row.get(0),
     )?;
-    conn.execute("DELETE FROM symbols WHERE file_id = ?1", [file_id])?;
-    conn.execute("DELETE FROM refs WHERE file_id = ?1", [file_id])?;
+    conn.execute("DELETE FROM main.symbols WHERE file_id = ?1", [file_id])?;
+    conn.execute("DELETE FROM main.refs WHERE file_id = ?1", [file_id])?;
 
     parsed.symbols.sort_by_key(|symbol| {
         (
@@ -4207,7 +4345,7 @@ fn upsert_file(
     for (symbol, qualified) in parsed.symbols.into_iter().zip(qualified) {
         conn.execute(
             r#"
-            INSERT INTO symbols(
+            INSERT INTO main.symbols(
               file_id, kind, name, qualified, start_row, start_col, end_row, end_col, signature, docstring
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             "#,
@@ -4229,7 +4367,7 @@ fn upsert_file(
     for reference in parsed.refs {
         conn.execute(
             r#"
-            INSERT INTO refs(file_id, name, start_row, start_col, end_row, end_col, context)
+            INSERT INTO main.refs(file_id, name, start_row, start_col, end_row, end_col, context)
             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
             "#,
             params![
@@ -4243,7 +4381,7 @@ fn upsert_file(
             ],
         )?;
     }
-    Ok(())
+    crate::overlay::sync_private_file_directory(conn, path)
 }
 
 fn purge_stale_files(
@@ -4284,7 +4422,8 @@ fn purge_stale_files(
             None => true,
         };
         if !source_exists || (!is_active && in_purge_scope) {
-            conn.execute("DELETE FROM files WHERE id = ?1", [file_id])?;
+            crate::overlay::hide_path(conn, &path)?;
+            conn.execute("DELETE FROM main.files WHERE id = ?1", [file_id])?;
         }
     }
     Ok(())
@@ -8333,7 +8472,7 @@ def handler_{index}():
         // mtime+size fast path.
         let existing = stored("not-the-real-sha", mtime_ns);
         assert!(matches!(
-            process_file_job(&job, true, false, &existing)?,
+            process_file_job(&job, true, false, &existing, None)?,
             ProcessedFile::Unchanged { .. }
         ));
 
@@ -8341,7 +8480,7 @@ def handler_{index}():
         // to the content check and re-extract.
         let existing = stored("not-the-real-sha", -1);
         assert!(matches!(
-            process_file_job(&job, true, false, &existing)?,
+            process_file_job(&job, true, false, &existing, None)?,
             ProcessedFile::Indexed { .. }
         ));
         Ok(())

@@ -1271,20 +1271,6 @@ impl Runtime {
         let conn = self.open_read_conn()?;
         let (matcher, mut diagnostics) =
             self.path_filter(&conn, args.file_glob.as_deref(), args.repo.as_deref())?;
-        if let Some(kind) = &args.kind {
-            let kinds = conn
-                .prepare("SELECT DISTINCT kind FROM symbols ORDER BY kind")?
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            if !kinds.contains(kind) {
-                return Err(crate::mcp::InvalidParams(format!(
-                    "unknown kind {kind:?}; valid kinds: {}",
-                    kinds.join(", ")
-                ))
-                .into());
-            }
-        }
-
         // Accept a single `name` and/or a `names` list; dedupe, preserve order.
         // Batching several names into one call is the point — it turns N
         // round-trips into one.
@@ -1358,6 +1344,26 @@ impl Runtime {
         }
 
         if let Some(kind) = &args.kind {
+            // A matching candidate proves the kind is valid without scanning
+            // the index. On a miss, check existence and only enumerate the
+            // valid kinds when constructing an unknown-kind error.
+            if !buckets.iter().flatten().any(|symbol| &symbol.kind == kind)
+                && !conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM symbols WHERE kind = ?1)",
+                    [kind],
+                    |row| row.get::<_, bool>(0),
+                )?
+            {
+                let kinds = conn
+                    .prepare("SELECT DISTINCT kind FROM symbols ORDER BY kind")?
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                return Err(crate::mcp::InvalidParams(format!(
+                    "unknown kind {kind:?}; valid kinds: {}",
+                    kinds.join(", ")
+                ))
+                .into());
+            }
             for (name, bucket) in names.iter().zip(&mut buckets) {
                 let mut kinds = std::collections::BTreeMap::new();
                 for symbol in bucket.iter() {
@@ -1934,10 +1940,11 @@ impl Runtime {
     /// `(name, repo, file, start_row, start_col, end_row, end_col, context, sha,
     /// partial)`. Shared by `find_references` (row-level detail) and
     /// `find_reference_counts` (aggregate-only) so both see the identical
-    /// filtered set.
+    /// filtered set, using the caller's diagnostic read snapshot.
     #[allow(clippy::type_complexity)]
     fn query_reference_rows(
         &self,
+        conn: &Connection,
         args: &FindReferencesArgs,
     ) -> Result<
         Vec<(
@@ -1953,7 +1960,6 @@ impl Runtime {
             bool,
         )>,
     > {
-        let conn = self.open_read_conn()?;
         let workspaces = self.selected_workspaces(args.repo.as_deref())?;
         let scope = args
             .scope
@@ -2045,7 +2051,7 @@ impl Runtime {
         let (_, diagnostics) =
             self.path_filter(&conn, args.scope.as_deref(), args.repo.as_deref())?;
         let multi = args.name.iter().count() + args.names.as_ref().map_or(0, |n| n.len()) > 1;
-        let rows = self.query_reference_rows(&args)?;
+        let rows = self.query_reference_rows(&conn, &args)?;
 
         let total = rows.len();
         // Staleness signal: any contributing file parse-recovered during
@@ -2145,7 +2151,7 @@ impl Runtime {
 
         // Shared query + filters (scope / exclude_tests / include_declarations)
         // live in `query_reference_rows`; the rows arrive pre-filtered.
-        let refs = self.query_reference_rows(&args)?;
+        let refs = self.query_reference_rows(&conn, &args)?;
 
         // Build the flat, ordered reference list (the query already orders by
         // name, repo, file, row, col). Each row carries its repo/file, so the
@@ -7941,6 +7947,41 @@ def handler_{index}():
             find("beta").expect("beta in outline").body.is_none(),
             "unrequested name's body should stay None"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn reference_rows_share_the_diagnostic_read_snapshot() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.rs");
+        fs::write(&path, include_str!("config.rs"))?;
+        let runtime = unfiltered_runtime(dir.path());
+        runtime.build(false, None)?;
+        let args: FindReferencesArgs = serde_json::from_value(serde_json::json!({
+            "names": ["ServerConfig"],
+            "scope": "config.rs",
+            "include_declarations": true
+        }))?;
+
+        let conn = runtime.open_read_conn()?;
+        let (_, diagnostics) =
+            runtime.path_filter(&conn, args.scope.as_deref(), args.repo.as_deref())?;
+        assert!(diagnostics.is_empty());
+        let before = runtime.query_reference_rows(&conn, &args)?;
+        assert!(!before.is_empty());
+
+        fs::remove_file(&path)?;
+        runtime.update_paths(&[path])?;
+        let after = runtime.query_reference_rows(&conn, &args)?;
+        assert_eq!(after, before, "rows must use the diagnostic snapshot");
+        drop(conn);
+
+        let fresh = runtime.find_reference_counts(args.clone())?;
+        assert_eq!(fresh.total, 0);
+        assert_eq!(fresh.diagnostics[0].code, "filter_matched_no_files");
+        let fresh = runtime.find_references(args)?;
+        assert_eq!(fresh.total, 0);
+        assert_eq!(fresh.diagnostics[0].code, "filter_matched_no_files");
         Ok(())
     }
 

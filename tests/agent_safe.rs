@@ -107,6 +107,16 @@ fn kind_errors_distinguish_unknown_kinds_from_filtered_names() -> Result<()> {
         "class Other:\n    pass\ndef target():\n    pass\n",
     )?;
     let runtime = runtime(dir.path())?;
+    let response = symbol(&runtime, json!({"kind":"function"}))?;
+    assert_eq!(response["total"], 1);
+    assert!(response.get("diagnostics").is_none());
+    let response = symbol(
+        &runtime,
+        json!({"name":"Other", "names":["target", "absent"], "kind":"function"}),
+    )?;
+    assert_eq!(response["total"], 1);
+    assert_eq!(response["matches"][0]["name"], "target");
+    assert_eq!(response["diagnostics"][0]["kinds"]["class"], 1);
     let response = rpc(
         &runtime,
         "get_symbol",
@@ -125,6 +135,24 @@ fn kind_errors_distinguish_unknown_kinds_from_filtered_names() -> Result<()> {
     assert_eq!(response["diagnostics"][0]["kinds"]["function"], 1);
     let response = symbol(&runtime, json!({"name":"absent", "kind":"class"}))?;
     assert!(response.get("diagnostics").is_none());
+    let response = symbol(&runtime, json!({"kind":"function", "file_glob":"missing"}))?;
+    assert_eq!(response["total"], 0);
+    assert_eq!(
+        response["diagnostics"][0]["code"],
+        "filter_matched_no_files"
+    );
+    let response = rpc(
+        &runtime,
+        "get_symbol",
+        json!({"name":"absent", "kind":"imaginary", "file_glob":"missing"}),
+    )?;
+    assert_eq!(response["error"]["code"], -32602);
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("class, function")
+    );
     Ok(())
 }
 

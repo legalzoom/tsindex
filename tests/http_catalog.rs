@@ -169,10 +169,10 @@ fn an_older_http_refresh_cannot_undo_an_acknowledged_add() -> Result<()> {
         thread::sleep(Duration::from_millis(10));
     };
     let database = db_path(&catalog);
-    let refresh: PathBuf = database.with_extension("refresh.lock");
+    let refresh: PathBuf = tsindex::maintenance::refresh_lease_path(&database);
     let lease = FileLease::acquire(&refresh, Duration::from_secs(1))?;
     // Invalidate startup's marker without changing the default refresh interval.
-    fs::remove_file(database.with_extension("refresh-state"))?;
+    fs::remove_file(tsindex::maintenance::refresh_marker_path(&database))?;
     let older = thread::spawn(move || {
         request(
             port,

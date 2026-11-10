@@ -95,13 +95,28 @@ impl FileLease {
 }
 
 pub fn writer_lease_path(db_path: &Path) -> PathBuf {
+    // Keep the original writer-lock name so older overlay binaries still
+    // serialize writes with this version. Same-stem custom databases may
+    // contend on this lock, but never share freshness or watcher ownership.
     db_path.with_extension("ingest.lock")
 }
 
+fn sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut path = db_path.as_os_str().to_os_string();
+    path.push(".");
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
 pub fn watcher_lease_path(runtime: &Runtime) -> Result<PathBuf> {
-    Ok(runtime
-        .db_path
-        .with_extension(format!("watch-{}.lock", configuration(runtime)?)))
+    Ok(sidecar_path(
+        &runtime.db_path,
+        &format!("watch-{}.lock", configuration(runtime)?),
+    ))
+}
+
+pub fn refresh_lease_path(db_path: &Path) -> PathBuf {
+    sidecar_path(db_path, "refresh.lock")
 }
 
 struct Primary {
@@ -122,6 +137,9 @@ struct RefreshMarker {
 
 fn configuration(runtime: &Runtime) -> Result<String> {
     let input = serde_json::to_vec(&(
+        // Generations are local to one database. A copied or misplaced marker
+        // must not certify another index with an equal generation number.
+        key(&runtime.db_path),
         &runtime.root,
         &runtime.config,
         &runtime.languages,
@@ -143,10 +161,10 @@ fn generation(runtime: &Runtime) -> Result<i64> {
     )?)
 }
 
-fn marker_path(runtime: &Runtime) -> PathBuf {
+pub fn refresh_marker_path(db_path: &Path) -> PathBuf {
     // Direct Runtime users need not have generated .tsindex ignore rules.
     // Keep maintenance artifacts outside the source extension allowlist.
-    runtime.db_path.with_extension("refresh-state")
+    sidecar_path(db_path, "refresh-state")
 }
 
 fn marker_refreshed_at(runtime: &Runtime) -> Option<Instant> {
@@ -155,7 +173,7 @@ fn marker_refreshed_at(runtime: &Runtime) -> Option<Instant> {
         return None;
     }
     let marker: RefreshMarker =
-        serde_json::from_slice(&fs::read(marker_path(runtime)).ok()?).ok()?;
+        serde_json::from_slice(&fs::read(refresh_marker_path(&runtime.db_path)).ok()?).ok()?;
     if marker.configuration != configuration(runtime).ok()? {
         return None;
     }
@@ -184,12 +202,15 @@ pub fn record_refresh(runtime: &Runtime) -> Result<()> {
         generation: generation(runtime)?,
     };
     static NEXT_MARKER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let path = marker_path(runtime);
-    let temporary = path.with_extension(format!(
-        "refresh-{}-{}.tmp",
-        std::process::id(),
-        NEXT_MARKER.fetch_add(1, Ordering::Relaxed)
-    ));
+    let path = refresh_marker_path(&runtime.db_path);
+    let temporary = sidecar_path(
+        &path,
+        &format!(
+            "refresh-{}-{}.tmp",
+            std::process::id(),
+            NEXT_MARKER.fetch_add(1, Ordering::Relaxed)
+        ),
+    );
     let result = (|| -> Result<()> {
         let mut file = OpenOptions::new()
             .write(true)
@@ -350,7 +371,7 @@ pub fn reconcile_if_due(runtime: &Runtime) -> Result<Instant> {
     // This lease coalesces callers before Runtime::build takes the writer
     // lease. It is a different inode, so parsing does not recursively lock it.
     let _refresh = FileLease::acquire(
-        runtime.db_path.with_extension("refresh.lock"),
+        refresh_lease_path(&runtime.db_path),
         Duration::from_secs(30),
     )
     .context("index freshness unavailable: refresh coordinator is busy")?;

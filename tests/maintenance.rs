@@ -814,6 +814,113 @@ fn two_servers_share_one_linked_checkout_reconciliation() -> Result<()> {
 }
 
 #[test]
+fn same_stem_databases_do_not_share_freshness() -> Result<()> {
+    let (_directory, root) = fixture()?;
+    let mut config = TsIndexConfig::load(&root)?;
+    config.server.worktree_refresh_ms = 2000;
+    let first = Runtime::new(
+        root.clone(),
+        root.join(".tsindex/cache.db"),
+        config.clone(),
+        vec![],
+    );
+    let second = Runtime::new(
+        root.clone(),
+        root.join(".tsindex/cache.sqlite"),
+        config,
+        vec![],
+    );
+    second.build(false, None)?;
+    maintenance::register_primary(&second, false);
+    let runtimes = Runtimes::new(second);
+    let repo = root.to_str().context("UTF-8 root")?;
+    assert_eq!(symbol(&runtimes, repo, "before_edit")?["total"], 1);
+
+    // Expire this server's own cached completion before another database
+    // publishes an equally numbered generation for the same configuration.
+    thread::sleep(Duration::from_millis(2100));
+    fs::write(
+        root.join("a.py"),
+        "def independently_refreshed():\n    return 2\n",
+    )?;
+    first.build(false, None)?;
+    assert_eq!(
+        symbol(&runtimes, repo, "independently_refreshed")?["total"],
+        1
+    );
+    assert_eq!(symbol(&runtimes, repo, "before_edit")?["total"], 0);
+    Ok(())
+}
+
+#[test]
+fn copied_refresh_markers_cannot_prove_another_database_is_fresh() -> Result<()> {
+    let (_directory, root) = fixture()?;
+    let mut config = TsIndexConfig::load(&root)?;
+    config.server.worktree_refresh_ms = 60_000;
+    let first = Runtime::new(
+        root.clone(),
+        root.join(".tsindex/cache.db"),
+        config.clone(),
+        vec![],
+    );
+    let second = Runtime::new(
+        root.clone(),
+        root.join(".tsindex/cache.sqlite"),
+        config,
+        vec![],
+    );
+    second.build(false, None)?;
+    fs::write(
+        root.join("a.py"),
+        "def independently_refreshed():\n    return 2\n",
+    )?;
+    first.build(false, None)?;
+    // Matching generation numbers only identify progress inside one database.
+    // Even a misplaced but well-formed marker must not certify another index.
+    fs::copy(
+        maintenance::refresh_marker_path(&first.db_path),
+        maintenance::refresh_marker_path(&second.db_path),
+    )?;
+    maintenance::register_primary(&second, false);
+    let runtimes = Runtimes::new(second);
+    let repo = root.to_str().context("UTF-8 root")?;
+    assert_eq!(
+        symbol(&runtimes, repo, "independently_refreshed")?["total"],
+        1
+    );
+    assert_eq!(symbol(&runtimes, repo, "before_edit")?["total"], 0);
+    Ok(())
+}
+
+#[test]
+fn same_stem_databases_have_independent_watcher_ownership() -> Result<()> {
+    let (_directory, root) = fixture()?;
+    let config = TsIndexConfig::load(&root)?;
+    let first = Runtime::new(
+        root.clone(),
+        root.join(".tsindex/cache.db"),
+        config.clone(),
+        vec![],
+    );
+    let second = Runtime::new(
+        root.clone(),
+        root.join(".tsindex/cache.sqlite"),
+        config,
+        vec![],
+    );
+    let first_path = maintenance::watcher_lease_path(&first)?;
+    let first_owner = FileLease::acquire(&first_path, Duration::from_secs(1))?;
+    let second_owner = FileLease::try_acquire(maintenance::watcher_lease_path(&second)?)?;
+    assert!(
+        second_owner.is_some(),
+        "another database's watcher suppressed this one"
+    );
+    assert!(FileLease::try_acquire(first_path)?.is_none());
+    drop((first_owner, second_owner));
+    Ok(())
+}
+
+#[test]
 fn successful_reconciliation_is_shared_only_with_matching_configuration() -> Result<()> {
     let (_directory, root) = fixture()?;
     let mut config = TsIndexConfig::load(&root)?;

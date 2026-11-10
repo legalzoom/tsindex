@@ -2829,7 +2829,7 @@ mod tests {
             );
             runtime.build(false, None)?;
             crate::maintenance::register_primary(&runtime, false);
-            fs::remove_file(runtime.db_path.with_extension("refresh-state"))?;
+            fs::remove_file(crate::maintenance::refresh_marker_path(&runtime.db_path))?;
             let writer = crate::maintenance::FileLease::acquire(
                 crate::maintenance::writer_lease_path(&runtime.db_path),
                 Duration::from_secs(1),

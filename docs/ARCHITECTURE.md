@@ -152,6 +152,12 @@ runtime watchers retry, and another server can take over. HTTP uses on-demand
 maintenance without allocating a watcher. `--no-refresh` opts the primary out
 of automatic maintenance; explicit linked checkout selection still reconciles.
 
+Watcher leases, refresh coordination, and refresh markers append their suffixes
+to the complete database filename, so `cache.db` and `cache.sqlite` keep separate
+maintenance state. Marker identity also includes the canonical database path.
+The writer lease retains its original name to coordinate with older binaries;
+same-stem custom databases can contend on that lease without sharing freshness.
+
 Before a managed primary indexed read, a configuration-matched full-refresh
 marker can be reused for `worktree_refresh_ms` (default 2000 ms). Its generation
 must still match the database. A local coordinator and a cross-process lease

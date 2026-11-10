@@ -545,6 +545,11 @@ check is not authentication**: a non-loopback bind exposes the read API and the
 matching `Host` header. Keep the default loopback bind unless the network path
 is already access-controlled.
 
+Catalog additions and removals wait for admitted indexed calls and rebuilds to
+finish, so an older refresh cannot undo a successful catalog change. Indexed
+calls can still run concurrently; live syntax queries and metadata routes do
+not wait on this catalog admission lock.
+
 Available routes:
 
 - `GET /health`

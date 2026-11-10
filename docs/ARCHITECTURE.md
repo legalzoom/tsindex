@@ -187,9 +187,16 @@ differ from arrival order. EOF drains accepted requests; a transport failure
 cancels queued work. On Unix a wakeup descriptor interrupts blocked stdin when
 stdout fails. Other platforms retain blocking stdin cancellation behavior.
 HTTP snapshots the runtime registry for reads and publishes configuration
-changes before acknowledging them, without holding its configuration lock over
-tool execution. Existing host, origin, size, and read-only tool guards remain
-in the HTTP dispatch path.
+changes before acknowledging them. A separate reader/writer admission lock
+covers indexed tool calls and explicit rebuilds from before runtime capture
+through completion. These calls share admission and can run concurrently;
+catalog additions and removals require exclusive admission. An older refresh
+therefore finishes before a mutation can publish and cannot subsequently prune
+a newly acknowledged repository. The registry lock itself is released before
+tool execution. Live syntax queries and metadata routes bypass admission, so
+they remain available while a refresh or catalog mutation waits. This fence
+coordinates requests within one HTTP server. Existing host, origin, size, and
+read-only tool guards remain in the HTTP dispatch path.
 
 ## Filesystem updates
 

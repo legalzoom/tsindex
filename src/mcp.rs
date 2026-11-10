@@ -355,14 +355,14 @@ const HTTP_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 
 struct HttpRuntimes {
     current: RwLock<Arc<Runtimes>>,
-    mutations: Mutex<()>,
+    catalog: RwLock<()>,
 }
 
 impl HttpRuntimes {
     fn new(runtime: Runtime) -> Self {
         Self {
             current: RwLock::new(Arc::new(Runtimes::new(runtime))),
-            mutations: Mutex::new(()),
+            catalog: RwLock::new(()),
         }
     }
 
@@ -371,9 +371,10 @@ impl HttpRuntimes {
     }
 
     fn administer(&self, path: &str, body: &[u8], stream: &mut impl Write) -> Result<()> {
-        // Configuration changes serialize with one another, while tool calls
-        // retain their original registry snapshot and continue independently.
-        let _mutation = self.mutations.lock().unwrap_or_else(|p| p.into_inner());
+        // An admitted indexed call may refresh with its captured configuration.
+        // Finish it before changing the catalog, or its later pruning could
+        // delete a repository that this mutation has already acknowledged.
+        let _mutation = self.catalog.write().unwrap_or_else(|p| p.into_inner());
         let previous = self.snapshot();
         let mut candidate = previous.primary.clone();
         let mut response = Vec::new();
@@ -602,6 +603,34 @@ fn serve_http_request_with_dispatch(
     if method == "POST" && matches!(path, "/repos/add" | "/repos/remove") {
         return runtimes.administer(path, &body, stream);
     }
+    let tool_request = if method == "POST" && path == "/tools/call" {
+        match serde_json::from_slice::<HttpCallRequest>(&body) {
+            Ok(request) => Some(request),
+            Err(error) => {
+                return write_http_response(
+                    stream,
+                    400,
+                    json!({ "error": format!("invalid JSON request: {error:#}") }),
+                );
+            }
+        }
+    } else {
+        None
+    };
+    // Acquire admission BEFORE capturing a runtime, and retain it through any
+    // refresh or rebuild. Shared admission keeps indexed worktrees concurrent;
+    // exclusive catalog mutations cannot be undone by an older configuration.
+    // Live queries only read primary candidates or refresh private linked
+    // indexes, so they and metadata routes remain available during either wait.
+    let _catalog = if (method == "POST" && path == "/repos/rebuild")
+        || tool_request
+            .as_ref()
+            .is_some_and(|request| request.name != "query")
+    {
+        Some(runtimes.catalog.read().unwrap_or_else(|p| p.into_inner()))
+    } else {
+        None
+    };
     let runtime = runtimes.snapshot();
     let runtime = &*runtime;
 
@@ -628,16 +657,7 @@ fn serve_http_request_with_dispatch(
         }
         ("POST", "/tools/list") => tool_list(false),
         ("POST", "/tools/call") => {
-            let request: HttpCallRequest = match serde_json::from_slice(&body) {
-                Ok(request) => request,
-                Err(error) => {
-                    return write_http_response(
-                        stream,
-                        400,
-                        json!({ "error": format!("invalid JSON request: {error:#}") }),
-                    );
-                }
-            };
+            let request = tool_request.expect("tool request parsed before runtime capture");
             match dispatch(
                 runtime,
                 &request.name,
@@ -2621,6 +2641,15 @@ mod tests {
 
     #[test]
     fn http_health_progresses_while_another_tool_handler_waits() -> Result<()> {
+        assert_independent_http_progress(false)
+    }
+
+    #[test]
+    fn http_indexed_calls_progress_while_another_tool_handler_waits() -> Result<()> {
+        assert_independent_http_progress(true)
+    }
+
+    fn assert_independent_http_progress(indexed_call: bool) -> Result<()> {
         let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/transport-fixtures");
         fs::create_dir_all(&artifacts)?;
         let temp = tempfile::tempdir_in(artifacts)?;
@@ -2651,8 +2680,11 @@ mod tests {
                     },
                 )
             });
-            let (second, _) = listener.accept()?;
-            handle_http_connection(&state, second, port, &[])?;
+            let (mut second, _) = listener.accept()?;
+            serve_http_request_with_dispatch(&state, &mut second, port, &[], |_, _, _, _| {
+                Ok(json!({"ok":true}))
+            })?;
+            drop(second);
             blocked.join().expect("blocked HTTP worker panicked")?;
             Ok(())
         });
@@ -2668,10 +2700,18 @@ mod tests {
         let independent = (|| -> Result<String> {
             let mut second = TcpStream::connect(("127.0.0.1", port))?;
             second.set_read_timeout(Some(Duration::from_secs(2)))?;
-            write!(
-                second,
-                "GET /health HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"
-            )?;
+            if indexed_call {
+                write!(
+                    second,
+                    "POST /tools/call HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )?;
+            } else {
+                write!(
+                    second,
+                    "GET /health HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"
+                )?;
+            }
             second.flush()?;
             second.shutdown(Shutdown::Write)?;
             let mut response = String::new();
@@ -2685,7 +2725,7 @@ mod tests {
         drop(first);
         server.join().expect("HTTP transport thread panicked")?;
         completed_result?;
-        let independent = independent.context("health request waited behind blocked tool")?;
+        let independent = independent.context("independent request waited behind blocked tool")?;
         assert!(independent.starts_with("HTTP/1.1 200"));
         assert!(independent.contains(r#""ok":true"#));
         assert!(completed.contains(r#""finished":true"#));
@@ -2751,6 +2791,121 @@ mod tests {
         );
         assert!(String::from_utf8(acknowledgment.bytes)?.contains(r#""removed":"removed""#));
         assert!(!temp.path().join("removed").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn http_catalog_changes_wait_for_indexed_calls_and_rebuilds_but_not_queries() -> Result<()> {
+        let post = |path: &str, body: Value| {
+            let body = body.to_string();
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost:{{port}}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        for path in ["/tools/call", "/repos/rebuild"] {
+            let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/transport-fixtures");
+            fs::create_dir_all(&artifacts)?;
+            let temp = tempfile::tempdir_in(artifacts)?;
+            fs::create_dir(temp.path().join("removed"))?;
+            fs::write(
+                temp.path().join("removed/a.py"),
+                "def live_symbol():\n    pass\n",
+            )?;
+            let config = TsIndexConfig {
+                repos: vec![RepoConfig {
+                    name: "removed".into(),
+                    path: "removed".into(),
+                    languages: vec!["python".into()],
+                    ignore: vec![],
+                }],
+                ..Default::default()
+            };
+            let runtime = Runtime::new(
+                temp.path().to_path_buf(),
+                db_path(temp.path()),
+                config,
+                vec![],
+            );
+            runtime.build(false, None)?;
+            crate::maintenance::register_primary(&runtime, false);
+            fs::remove_file(runtime.db_path.with_extension("refresh-state"))?;
+            let writer = crate::maintenance::FileLease::acquire(
+                crate::maintenance::writer_lease_path(&runtime.db_path),
+                Duration::from_secs(1),
+            )?;
+            let state = Arc::new(HttpRuntimes::new(runtime));
+            let state_worker = Arc::clone(&state);
+            let body = if path == "/tools/call" {
+                json!({"name":"get_symbol", "arguments":{"name":"live_symbol"}})
+            } else {
+                json!({"repo":"removed", "fetch":false})
+            };
+            let request = post(path, body);
+            let older = thread::spawn(move || http_roundtrip_with_state(state_worker, &request));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let admitted = loop {
+                if state.catalog.try_write().is_err() {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                thread::sleep(Duration::from_millis(1));
+            };
+            let state_worker = Arc::clone(&state);
+            let removal = post("/repos/remove", json!({"repo":"removed"}));
+            let (removed_tx, removed_rx) = mpsc::channel();
+            let remove = thread::spawn(move || {
+                let result = http_roundtrip_with_state(state_worker, &removal);
+                let _ = removed_tx.send(result);
+            });
+            let premature_removal = removed_rx.recv_timeout(Duration::from_millis(150)).ok();
+            let state_worker = Arc::clone(&state);
+            let query = post(
+                "/tools/call",
+                json!({"name":"query", "arguments":{
+                    "repo":"removed", "language":"python",
+                    "query":"(function_definition name: (identifier) @name)"
+                }}),
+            );
+            let (queried_tx, queried_rx) = mpsc::channel();
+            let live = thread::spawn(move || {
+                let result = http_roundtrip_with_state(state_worker, &query);
+                let _ = queried_tx.send(result);
+            });
+            let live_before_release = queried_rx.recv_timeout(Duration::from_secs(2));
+            let health = http_roundtrip_with_state(
+                Arc::clone(&state),
+                "GET /health HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n",
+            );
+            // Always release the stalled writer and join every request before
+            // asserting, including when a regression blocks queries or removes
+            // their sources too early.
+            drop(writer);
+            let old_result = older.join().expect("indexed HTTP worker panicked");
+            remove.join().expect("HTTP removal worker panicked");
+            live.join().expect("live HTTP worker panicked");
+            let removal_waited = premature_removal.is_none();
+            let removed = match premature_removal {
+                Some(result) => result,
+                None => removed_rx.recv()?,
+            };
+            assert!(admitted, "{path} did not establish catalog admission");
+            assert!(removal_waited, "removal overtook {path}");
+            let live_result =
+                live_before_release.context("live query waited for catalog mutation")??;
+            assert!(live_result.starts_with("HTTP/1.1 200"), "{live_result}");
+            assert!(live_result.contains("live_symbol"), "{live_result}");
+            let health = health?;
+            assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+            let old_result = old_result?;
+            assert!(old_result.starts_with("HTTP/1.1 200"), "{old_result}");
+            let removed = removed?;
+            assert!(removed.starts_with("HTTP/1.1 200"), "{removed}");
+            assert!(!temp.path().join("removed").exists());
+            assert!(state.snapshot().config.repos.is_empty());
+        }
         Ok(())
     }
 
@@ -3646,11 +3801,15 @@ mod tests {
     }
 
     fn http_roundtrip_with_runtime(runtime: Runtime, request: &str) -> Result<String> {
+        http_roundtrip_with_state(Arc::new(HttpRuntimes::new(runtime)), request)
+    }
+
+    fn http_roundtrip_with_state(runtime: Arc<HttpRuntimes>, request: &str) -> Result<String> {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let bound_port = listener.local_addr()?.port();
         let server = std::thread::spawn(move || -> Result<()> {
             let (stream, _) = listener.accept()?;
-            handle_http_connection(&HttpRuntimes::new(runtime), stream, bound_port, &[])?;
+            handle_http_connection(&runtime, stream, bound_port, &[])?;
             Ok(())
         });
         let mut client = TcpStream::connect(("127.0.0.1", bound_port))?;

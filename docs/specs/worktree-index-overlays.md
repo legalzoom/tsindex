@@ -111,6 +111,13 @@ uses a runtime snapshot without retaining the configuration lock. A bounded
 pool can be occupied by several slow requests; independence is not an
 unbounded-worker guarantee.
 
+HTTP catalog mutations take exclusive admission before capturing a runtime.
+Indexed tool calls and `/repos/rebuild` share admission from before runtime
+capture through completion, allowing parallel work while preventing an older
+configuration's refresh from undoing a completed add or remove. Live queries
+and metadata routes bypass this admission lock. The fence is local to one
+HTTP server; it does not reload configurations in other running processes.
+
 ## First use pseudotrace
 
 ```text
@@ -263,6 +270,9 @@ whole-file authority, reuse on restore, missing-base recovery, incompatible
 configurations, and legacy-reader fencing. Transport tests exercise deliberate
 out-of-order completion, bounded queues, configuration publication, EOF, and
 broken output; maintenance tests cover fallback, ownership, and coordination.
+HTTP regressions retain an acknowledged real-Git add across an older blocked
+refresh and order removal after indexed reads and rebuilds, while preserving
+independent indexed dispatch, live queries, and health requests.
 
 See [measurement notes](../benchmarks/worktree-overlays.md) for the reproducible
 synthetic comparison. The test workflow runs on pull requests targeting feature

@@ -39,7 +39,9 @@ See [SECURITY.md](SECURITY.md) for verification details.
 
 ### From source
 
-Requires the Rust toolchain. If you don't have one, install via [rustup](https://rustup.rs):
+Source builds require Rust 1.89 or later. The checkout pins the tested toolchain
+in [rust-toolchain.toml](rust-toolchain.toml). Install Rust with
+[rustup](https://rustup.rs) if needed:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh

@@ -4,6 +4,7 @@ pub mod detect;
 mod ignore_inputs;
 pub mod index;
 pub mod lang;
+mod lifecycle;
 pub mod maintenance;
 pub mod mcp;
 pub mod model;

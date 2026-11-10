@@ -22,8 +22,6 @@ use crate::index::{
 
 use crate::worktrees::Runtimes;
 
-static PARENT_WATCHDOG_STARTED: AtomicBool = AtomicBool::new(false);
-
 #[derive(Default)]
 struct TransportCancellation {
     stopped: AtomicBool,
@@ -134,7 +132,7 @@ impl BufRead for CancellableStdin {
 }
 
 pub fn serve_mcp(runtime: Runtime) -> Result<()> {
-    spawn_parent_watchdog();
+    spawn_parent_watchdog()?;
     let stdout = io::stdout();
     #[cfg(unix)]
     let input = CancellableStdin::new()?;
@@ -250,72 +248,9 @@ fn serve_mcp_transport(
     }
 }
 
-pub fn spawn_parent_watchdog() {
-    if !claim_parent_watchdog_start() {
-        return;
-    }
-
-    let initial = unsafe { libc::getppid() };
-    // A parent of PID 1 at startup means init/launchd spawned us directly, or
-    // the MCP client itself is PID 1 (containers). There is no parent lifetime
-    // to track, so run without the watchdog instead of exiting immediately.
-    // Trade-off: a client that spawns us and dies before this first
-    // `getppid()` has already reparented us to 1, so that orphan lives until
-    // its transport closes. The window is microseconds and the container case
-    // is the common one, so it is accepted rather than guessed at.
-    if initial <= 1 {
-        return;
-    }
-    thread::spawn(move || {
-        loop {
-            thread::sleep(Duration::from_secs(10));
-            if check_parent_watchdog(
-                initial,
-                || unsafe { libc::getppid() },
-                |initial, current| shutdown_after_parent_exit(initial, current),
-            ) {
-                break;
-            }
-        }
-    });
-}
-
-fn claim_parent_watchdog_start() -> bool {
-    !PARENT_WATCHDOG_STARTED.swap(true, Ordering::SeqCst)
-}
-
-fn check_parent_watchdog(
-    initial: libc::pid_t,
-    get_parent: impl FnOnce() -> libc::pid_t,
-    on_exit: impl FnOnce(libc::pid_t, libc::pid_t),
-) -> bool {
-    if initial <= 1 {
-        return false;
-    }
-    let current = get_parent();
-    if current <= 1 || current != initial {
-        on_exit(initial, current);
-        return true;
-    }
-    false
-}
-
-fn shutdown_after_parent_exit(initial: libc::pid_t, current: libc::pid_t) -> ! {
-    // The parent MCP client may already have gone away, leaving stderr as a
-    // broken pipe/socket. `eprintln!` can panic on write failure; if that
-    // happens inside this watchdog thread before `exit`, only the watchdog dies
-    // and the orphaned MCP server keeps running. Keep logging best-effort so the
-    // process termination is unconditional.
-    let _ = writeln!(
-        io::stderr(),
-        "{}",
-        parent_watchdog_shutdown_message(initial, current)
-    );
-    std::process::exit(0);
-}
-
-fn parent_watchdog_shutdown_message(initial: libc::pid_t, current: libc::pid_t) -> String {
-    format!("tsindex: parent {initial} exited (now reparented to {current}); shutting down")
+/// Start the session handler using the immediate parent as owner.
+pub fn spawn_parent_watchdog() -> Result<()> {
+    crate::lifecycle::spawn_session_handler(None)
 }
 
 fn handle_json_rpc_line(runtime: &Runtimes, line: &str) -> Result<Option<Value>> {
@@ -3588,53 +3523,6 @@ mod tests {
     }
 
     #[test]
-    fn parent_watchdog_stays_alive_while_parent_is_unchanged() {
-        let exits = Arc::new(Mutex::new(Vec::new()));
-        let triggered = check_parent_watchdog(4242, || 4242, {
-            let exits = Arc::clone(&exits);
-            move |initial, current| exits.lock().unwrap().push((initial, current))
-        });
-
-        assert!(!triggered);
-        assert!(exits.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn parent_watchdog_requests_shutdown_when_reparented() {
-        let exits = Arc::new(Mutex::new(Vec::new()));
-        let triggered = check_parent_watchdog(4242, || 1, {
-            let exits = Arc::clone(&exits);
-            move |initial, current| exits.lock().unwrap().push((initial, current))
-        });
-
-        assert!(triggered);
-        assert_eq!(exits.lock().unwrap().as_slice(), &[(4242, 1)]);
-    }
-
-    #[test]
-    fn parent_watchdog_ignores_pid_1_parent_at_startup() {
-        // Launched directly by init/launchd, or the MCP client is PID 1 in a
-        // container: there is no parent lifetime to track. The old code
-        // treated this as "orphaned" and exited before `initialize`.
-        let exits = Arc::new(Mutex::new(Vec::new()));
-        let triggered = check_parent_watchdog(1, || 1, {
-            let exits = Arc::clone(&exits);
-            move |initial, current| exits.lock().unwrap().push((initial, current))
-        });
-
-        assert!(!triggered);
-        assert!(exits.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn parent_watchdog_shutdown_message_names_both_pids() {
-        assert_eq!(
-            parent_watchdog_shutdown_message(4242, 1),
-            "tsindex: parent 4242 exited (now reparented to 1); shutting down"
-        );
-    }
-
-    #[test]
     fn mcp_stdio_survives_invalid_utf8_line() -> Result<()> {
         let dir = tempdir()?;
         let runtime = Runtime::new(
@@ -4046,18 +3934,5 @@ mod tests {
         );
         assert!(!response.contains("index.db"), "path leaked: {response}");
         Ok(())
-    }
-
-    #[test]
-    fn parent_watchdog_start_claim_is_idempotent() {
-        static WATCHDOG_TEST_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = WATCHDOG_TEST_LOCK.lock().unwrap();
-
-        PARENT_WATCHDOG_STARTED.store(false, Ordering::SeqCst);
-
-        assert!(claim_parent_watchdog_start());
-        assert!(!claim_parent_watchdog_start());
-
-        PARENT_WATCHDOG_STARTED.store(false, Ordering::SeqCst);
     }
 }

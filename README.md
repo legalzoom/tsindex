@@ -382,6 +382,36 @@ Start the MCP server on stdio:
 tsindex --root /path/to/repo serve --mcp
 ```
 
+The MCP server runs a session lifecycle handler on a dedicated thread. It
+records the owning session PID and tsindex PID in stderr and checks the owner
+every **5 seconds**, exiting when that process ends. The handler starts before
+index initialization and ends with tsindex; it needs no separate daemon or PID
+file. By default, the owner is tsindex's immediate parent (normally Codex,
+Claude, or another MCP client). Launches directly under PID 1 keep running
+without inferred ownership.
+
+When a wrapper launches the server, pass the actual session process PID:
+
+```bash
+tsindex --root /path/to/repo serve --mcp --session-pid 12345
+```
+
+Use the live Codex/Claude/etc. process PID in place of `12345`. Explicit
+ownership survives wrapper exit and also works with `serve --http` and `watch`.
+HTTP remains independent unless `--session-pid` is supplied; `watch
+--exit-with-parent` monitors its immediate parent. The watcher's `--session-pid`
+replaces parent monitoring and cannot be combined with `--exit-with-parent`.
+
+On macOS and Linux, the handler also checks process start time to detect PID
+reuse and treats fully exited zombie processes as ended. On Linux, an exited
+main thread does not end ownership while worker threads remain alive, and
+process names need not be valid UTF-8. If the inferred parent cannot be
+inspected, the handler falls back to parent-PID-only tracking, without PID-reuse
+or zombie checks. An explicit owner must exist and allow process inspection or
+startup fails; this includes PID 1 when inspection is denied. A later permission
+or inspection error does not count as an exit. Normal MCP stdin EOF still stops
+the server promptly.
+
 The server exposes five read tools:
 
 - `get_symbol` — pass `names: [...]` to fetch several symbols in one call (one round-trip; results keyed by each match's `name`)

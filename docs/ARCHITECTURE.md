@@ -194,9 +194,11 @@ catalog additions and removals require exclusive admission. An older refresh
 therefore finishes before a mutation can publish and cannot subsequently prune
 a newly acknowledged repository. The registry lock itself is released before
 tool execution. Live syntax queries and metadata routes bypass admission, so
-they remain available while a refresh or catalog mutation waits. This fence
-coordinates requests within one HTTP server. Existing host, origin, size, and
-read-only tool guards remain in the HTTP dispatch path.
+they do not wait on that lock. They still share the bounded worker pool, so
+enough blocked requests can queue them as well. Indexed calls and rebuilds
+wait for an active catalog mutation, whose exclusive section includes cloning.
+This fence coordinates requests within one HTTP server. Existing host, origin,
+size, and read-only tool guards remain in the HTTP dispatch path.
 
 ## Filesystem updates
 

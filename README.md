@@ -547,8 +547,9 @@ is already access-controlled.
 
 Catalog additions and removals wait for admitted indexed calls and rebuilds to
 finish, so an older refresh cannot undo a successful catalog change. Indexed
-calls can still run concurrently; live syntax queries and metadata routes do
-not wait on this catalog admission lock.
+calls run concurrently with one another. They and rebuilds wait while an add
+or remove is in progress, including cloning. Live syntax queries and metadata
+routes bypass catalog admission but still share the bounded HTTP worker pool.
 
 Available routes:
 

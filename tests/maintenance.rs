@@ -893,7 +893,7 @@ fn copied_refresh_markers_cannot_prove_another_database_is_fresh() -> Result<()>
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn non_utf8_database_paths_support_refresh_and_watcher_ownership() -> Result<()> {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;

@@ -601,6 +601,54 @@ fn a_blocked_worktree_writer_does_not_block_another_worktree() -> Result<()> {
 }
 
 #[test]
+fn concurrent_callers_share_a_fast_due_refresh() -> Result<()> {
+    for refresh_ms in [TsIndexConfig::default().server.worktree_refresh_ms, 0] {
+        let (_directory, root) = fixture()?;
+        let checkout = linked_checkout(&root, "branch-one", "before_refresh")?;
+        for file in 0..250 {
+            fs::write(
+                checkout.join(format!("file_{file}.py")),
+                format!("def symbol_{file}():\n    pass\n"),
+            )?;
+        }
+        let mut config = TsIndexConfig::load(&root)?;
+        config.server.worktree_refresh_ms = refresh_ms;
+        let runtimes = Arc::new(Runtimes::new(Runtime::new(
+            root.clone(),
+            db_path(&root),
+            config,
+            vec![],
+        )));
+        assert_eq!(
+            symbol(&runtimes, "branch-one", "before_refresh")?["total"],
+            1
+        );
+        fs::write(checkout.join("a.py"), "def after_refresh():\n    pass\n")?;
+        thread::sleep(Duration::from_millis(refresh_ms + 10));
+
+        let start = Arc::new(std::sync::Barrier::new(4));
+        let callers: Vec<_> = (0..4)
+            .map(|_| {
+                let runtimes = Arc::clone(&runtimes);
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    symbol(&runtimes, "branch-one", "after_refresh")
+                })
+            })
+            .collect();
+        let responses: Vec<_> = callers
+            .into_iter()
+            .map(|caller| caller.join().expect("worktree caller panicked"))
+            .collect();
+        for response in responses {
+            assert_eq!(response?["total"], 1, "refresh interval {refresh_ms} ms");
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn one_waiter_receives_the_completed_refresh_and_excess_callers_retry() -> Result<()> {
     let (_directory, root) = fixture()?;
     let checkout = linked_checkout(&root, "branch-one", "shared_edit")?;
@@ -614,7 +662,7 @@ fn one_waiter_receives_the_completed_refresh_and_excess_callers_retry() -> Resul
         waiting_requests(&runtimes, &checkout, "branch-one", "shared_edit")?.into_iter();
     assert_eq!(responses.next().unwrap()?["total"], 1);
     for response in responses {
-        let error = response.expect_err("excess callers must retry without waiting");
+        let error = response.expect_err("excess callers must retry after the coalescing window");
         assert!(format!("{error:#}").contains("update is in progress; retry shortly"));
     }
     Ok(())
@@ -765,7 +813,7 @@ fn admitted_waiter_receives_a_refresh_failure_and_the_next_request_can_retry() -
         .expect_err("the waiter must observe the failed refresh");
     assert!(format!("{failure:#}").contains("invalid-maintenance-language"));
     for response in responses {
-        let error = response.expect_err("excess callers must retry without waiting");
+        let error = response.expect_err("excess callers must retry after the coalescing window");
         assert!(format!("{error:#}").contains("update is in progress; retry shortly"));
     }
     let mut config = TsIndexConfig::load(&checkout)?;

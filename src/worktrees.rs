@@ -358,20 +358,23 @@ impl Runtimes {
         let mut entry = state.entry.lock().unwrap_or_else(|p| p.into_inner());
         let refresh = Duration::from_millis(self.primary.config.server.worktree_refresh_ms);
         let due = entry.refreshed.is_none_or(|time| time.elapsed() >= refresh);
-        // At most one request may hold a worker while this checkout refreshes.
-        // The scoped guard also releases admission on timeout or failure; the
+        // Let routine refreshes coalesce before shedding excess waiters. Only
+        // one request may hold a worker beyond the short coalescing window.
+        // The scoped guard releases admission on timeout or failure while the
         // independent refresh worker continues for the next caller to join.
-        let _waiter = if entry.pending || due {
-            Some(match state.waiter.try_lock() {
-                Ok(waiter) => waiter,
-                Err(TryLockError::Poisoned(error)) => error.into_inner(),
-                Err(TryLockError::WouldBlock) => bail!(
-                    "index is not ready for worktree {}; update is in progress; retry shortly",
-                    checkout.name
-                ),
-            })
+        let waiter = if entry.pending || due {
+            match state.waiter.try_lock() {
+                Ok(waiter) => Some(waiter),
+                Err(TryLockError::Poisoned(error)) => Some(error.into_inner()),
+                Err(TryLockError::WouldBlock) => None,
+            }
         } else {
             None
+        };
+        let wait_deadline = if waiter.is_some() {
+            deadline
+        } else {
+            deadline.min(Instant::now() + Duration::from_millis(250))
         };
         if !entry.pending && due {
             let mut config = self.primary.config.clone();
@@ -459,8 +462,14 @@ impl Runtimes {
         // must not be dragged through every later refresh under sustained load.
         let joined = entry.started;
         while entry.completed < joined {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = wait_deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                if waiter.is_none() {
+                    bail!(
+                        "index is not ready for worktree {}; update is in progress; retry shortly",
+                        checkout.name
+                    );
+                }
                 bail!(
                     "index is not ready for worktree {}; update exceeded {} s; retry shortly",
                     checkout.name,

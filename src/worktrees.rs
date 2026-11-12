@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
@@ -155,6 +155,7 @@ struct WorktreeEntry {
 struct CheckoutState {
     entry: Mutex<WorktreeEntry>,
     ready: Condvar,
+    waiter: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -278,6 +279,15 @@ impl Runtimes {
         repo: Option<&str>,
         refresh_primary: bool,
     ) -> Result<(Runtime, Option<String>)> {
+        self.resolve_with_timeout(repo, refresh_primary, Duration::from_secs(30))
+    }
+
+    fn resolve_with_timeout(
+        &self,
+        repo: Option<&str>,
+        refresh_primary: bool,
+        timeout: Duration,
+    ) -> Result<(Runtime, Option<String>)> {
         let Some(repo) = repo else {
             if refresh_primary {
                 crate::maintenance::refresh_if_managed(&self.primary)?;
@@ -344,10 +354,26 @@ impl Runtimes {
         };
         // Only this checkout's condition is retained while work is pending.
         // Waiting releases its entry lock; the global registry is already free.
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + timeout;
         let mut entry = state.entry.lock().unwrap_or_else(|p| p.into_inner());
         let refresh = Duration::from_millis(self.primary.config.server.worktree_refresh_ms);
-        if !entry.pending && entry.refreshed.is_none_or(|time| time.elapsed() >= refresh) {
+        let due = entry.refreshed.is_none_or(|time| time.elapsed() >= refresh);
+        // At most one request may hold a worker while this checkout refreshes.
+        // The scoped guard also releases admission on timeout or failure; the
+        // independent refresh worker continues for the next caller to join.
+        let _waiter = if entry.pending || due {
+            Some(match state.waiter.try_lock() {
+                Ok(waiter) => waiter,
+                Err(TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(TryLockError::WouldBlock) => bail!(
+                    "index is not ready for worktree {}; update is in progress; retry shortly",
+                    checkout.name
+                ),
+            })
+        } else {
+            None
+        };
+        if !entry.pending && due {
             let mut config = self.primary.config.clone();
             if let Some(workspace) = self
                 .primary
@@ -436,8 +462,9 @@ impl Runtimes {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 bail!(
-                    "index is not ready for worktree {}; update exceeded 30 s; retry shortly",
-                    checkout.name
+                    "index is not ready for worktree {}; update exceeded {} s; retry shortly",
+                    checkout.name,
+                    timeout.as_secs()
                 );
             }
             let (next, _) = state
@@ -548,4 +575,98 @@ pub fn open_checkout(
     let runtime = Runtime::new(root.clone(), db, config, languages);
     crate::overlay::prepare(checkout, &runtime)?;
     Ok(runtime)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::maintenance::{FileLease, writer_lease_path};
+    use anyhow::{Context, ensure};
+
+    #[test]
+    fn timed_out_waiter_releases_admission_and_keeps_one_shared_refresh() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().canonicalize()?;
+        let checkout = root.join(".worktrees/branch");
+        let metadata = root.join(".git/worktrees/branch");
+        fs::create_dir_all(&checkout)?;
+        fs::create_dir_all(&metadata)?;
+        fs::write(root.join("a.py"), "def primary():\n    pass\n")?;
+        fs::write(checkout.join("a.py"), "def branch():\n    pass\n")?;
+        fs::write(
+            checkout.join(".git"),
+            format!("gitdir: {}\n", metadata.display()),
+        )?;
+        fs::write(metadata.join("commondir"), "../..\n")?;
+        fs::write(
+            metadata.join("gitdir"),
+            format!("{}\n", checkout.join(".git").display()),
+        )?;
+        let mut config = TsIndexConfig::default();
+        config.languages.include = vec!["python".into()];
+        config.server.worktree_refresh_ms = 60_000;
+        let primary = Runtime::new(root.clone(), db_path(&root), config, vec![]);
+        primary.build(false, None)?;
+        let runtimes = Arc::new(Runtimes::new(primary));
+        let writer = FileLease::acquire(
+            writer_lease_path(&db_path(&checkout)),
+            Duration::from_secs(1),
+        )?;
+        let timeout = runtimes
+            .resolve_with_timeout(Some("branch"), true, Duration::ZERO)
+            .err()
+            .context("the request should time out while its writer is blocked")?;
+        assert!(format!("{timeout:#}").contains("update exceeded 0 s; retry shortly"));
+        let state = {
+            let cache = runtimes.worktrees.lock().unwrap();
+            Arc::clone(
+                &cache
+                    .get(&checkout)
+                    .context("checkout was not cached")?
+                    .state,
+            )
+        };
+        let next_runtimes = Arc::clone(&runtimes);
+        let caller = std::thread::spawn(move || next_runtimes.resolve(Some("branch")));
+        let progress = (|| -> Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match state.waiter.try_lock() {
+                    Err(TryLockError::WouldBlock) => break,
+                    Err(TryLockError::Poisoned(_)) => bail!("waiter admission was poisoned"),
+                    Ok(_) => {}
+                }
+                ensure!(
+                    Instant::now() < deadline,
+                    "the timed-out caller retained admission"
+                );
+                std::thread::yield_now();
+            }
+            for _ in 0..3 {
+                let error = runtimes
+                    .resolve_with_timeout(Some("branch"), true, Duration::ZERO)
+                    .err()
+                    .context("an excess caller acquired admission")?;
+                ensure!(format!("{error:#}").contains("update is in progress; retry shortly"));
+            }
+            let entry = state.entry.lock().unwrap();
+            ensure!(
+                entry.pending && entry.started == 1 && entry.completed == 0,
+                "refused or timed-out callers must not start another refresh"
+            );
+            Ok(())
+        })();
+        // Release the real writer lease and reap the admitted caller even if
+        // admission or coalescing regresses.
+        drop(writer);
+        let response = caller.join().expect("checkout caller panicked");
+        progress?;
+        assert_eq!(response?.1.as_deref(), Some("branch"));
+        assert_eq!(
+            runtimes.resolve(Some("branch"))?.1.as_deref(),
+            Some("branch")
+        );
+        assert_eq!(state.entry.lock().unwrap().started, 1);
+        Ok(())
+    }
 }

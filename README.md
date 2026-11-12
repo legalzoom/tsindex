@@ -281,10 +281,12 @@ retain their earlier complete SQLite snapshot. Worktrees ingest independently,
 including across server processes. MCP and HTTP dispatch use bounded worker
 pools, so another request can progress while one checkout is refreshing.
 Unused worktrees get no index or watcher. Additional worktrees refresh on
-demand at most once every `worktree_refresh_ms` (default 2000 ms); requests wait
-up to 30 seconds for a refresh and can retry if it is still running. Compatible
-processes reuse successful refresh markers within that interval, preserving the
-original refresh age.
+demand at most once every `worktree_refresh_ms` (default 2000 ms). Concurrent
+requests join a refresh for up to 250 ms; one caller per checkout may wait up
+to 30 seconds. Excess callers must retry if the refresh is still running,
+keeping workers available for other checkouts. Compatible processes reuse
+successful refresh markers within that interval, preserving the original
+refresh age.
 
 Only changed extraction is parsed, but overlay reconciliation checks content
 hashes across the complete logical checkout, including unchanged scans. This

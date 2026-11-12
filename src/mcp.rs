@@ -179,6 +179,27 @@ fn serve_mcp_transport(
     let receiver = Mutex::new(receiver);
     let output = Mutex::new(output);
     let failure = Mutex::<Option<anyhow::Error>>::new(None);
+    let respond = |message: Vec<u8>| -> Result<()> {
+        // Invalid UTF-8 is a parse error for one message. Lossy decoding
+        // could turn corrupt arguments into valid edits.
+        let response = match String::from_utf8(message) {
+            Ok(line) if line.trim().is_empty() => return Ok(()),
+            Ok(line) => dispatch(&line)?,
+            Err(_) => Some(json_rpc_error(
+                None,
+                -32700,
+                "invalid JSON-RPC message: request is not valid UTF-8",
+            )),
+        };
+        if let Some(response) = response {
+            // Responses may complete out of order, but each full JSON-RPC
+            // line must stay intact on the shared pipe.
+            let mut output = output.lock().unwrap_or_else(|p| p.into_inner());
+            writeln!(&mut *output, "{response}")?;
+            output.flush()?;
+        }
+        Ok(())
+    };
     thread::scope(|scope| -> Result<()> {
         for _ in 0..MAX_CONCURRENT_REQUESTS {
             scope.spawn(|| {
@@ -190,27 +211,7 @@ fn serve_mcp_transport(
                     if cancellation.stopped.load(Ordering::Acquire) {
                         continue;
                     }
-                    let result = (|| -> Result<()> {
-                        // Invalid UTF-8 is a parse error for one message. Lossy
-                        // decoding could turn corrupt arguments into valid edits.
-                        let response = match String::from_utf8(message) {
-                            Ok(line) if line.trim().is_empty() => return Ok(()),
-                            Ok(line) => dispatch(&line)?,
-                            Err(_) => Some(json_rpc_error(
-                                None,
-                                -32700,
-                                "invalid JSON-RPC message: request is not valid UTF-8",
-                            )),
-                        };
-                        if let Some(response) = response {
-                            // Responses may complete out of order, but each full
-                            // JSON-RPC line must stay intact on the shared pipe.
-                            let mut output = output.lock().unwrap_or_else(|p| p.into_inner());
-                            writeln!(&mut *output, "{response}")?;
-                            output.flush()?;
-                        }
-                        Ok(())
-                    })();
+                    let result = respond(message);
                     if let Err(error) = result {
                         let mut failure = failure.lock().unwrap_or_else(|p| p.into_inner());
                         if failure.is_none() {
@@ -234,7 +235,23 @@ fn serve_mcp_transport(
                     return Err(error.into());
                 }
             };
-            sender.send(line).context("MCP request workers stopped")?;
+            // These methods only return protocol metadata. Keep already-read
+            // control requests responsive even when every tool worker waits.
+            // The bounded tool queue still applies normal input backpressure.
+            let protocol = serde_json::from_slice::<Value>(&line).is_ok_and(|request| {
+                matches!(
+                    request.get("method").and_then(Value::as_str),
+                    Some("ping" | "initialize" | "tools/list")
+                )
+            });
+            if protocol {
+                if let Err(error) = respond(line) {
+                    cancellation.stop();
+                    return Err(error);
+                }
+            } else {
+                sender.send(line).context("MCP request workers stopped")?;
+            }
             if failure.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
                 break;
             }
@@ -2372,6 +2389,95 @@ mod tests {
             self.bytes.clear();
             Ok(())
         }
+    }
+
+    #[test]
+    fn mcp_protocol_requests_bypass_busy_workers() -> Result<()> {
+        struct RequestInput {
+            chunk: io::Cursor<Vec<u8>>,
+            requests: mpsc::Receiver<Vec<u8>>,
+        }
+        impl Read for RequestInput {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                if self.chunk.position() == self.chunk.get_ref().len() as u64 {
+                    let Ok(chunk) = self.requests.recv() else {
+                        return Ok(0);
+                    };
+                    self.chunk = io::Cursor::new(chunk);
+                }
+                self.chunk.read(output)
+            }
+        }
+
+        let directory = tempdir()?;
+        let runtime = Runtime::new(
+            directory.path().into(),
+            db_path(directory.path()),
+            TsIndexConfig::default(),
+            vec![],
+        );
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
+        let slow = (0..MAX_CONCURRENT_REQUESTS)
+            .map(|id| format!("{{\"id\":{id},\"method\":\"test/wait\"}}\n"))
+            .collect::<String>();
+        requests_tx.send(slow.into_bytes())?;
+        let worker_runtime = runtime.clone();
+        let server = thread::spawn(move || {
+            let runtimes = Runtimes::new(worker_runtime);
+            let release_rx = Mutex::new(release_rx);
+            serve_mcp_transport(
+                io::BufReader::new(RequestInput {
+                    chunk: io::Cursor::new(Vec::new()),
+                    requests: requests_rx,
+                }),
+                ResponseWriter {
+                    bytes: Vec::new(),
+                    responses: response_tx,
+                },
+                |line| {
+                    let request: Value = serde_json::from_str(line)?;
+                    if request["method"] == "test/wait" {
+                        entered_tx.send(())?;
+                        release_rx.lock().unwrap().recv()?;
+                        return Ok(Some(json!({"id":request["id"], "result":{}})));
+                    }
+                    handle_request_with_runtimes(&runtimes, request)
+                },
+                Arc::new(TransportCancellation::default()),
+            )
+        });
+        let progress = (|| -> Result<()> {
+            for _ in 0..MAX_CONCURRENT_REQUESTS {
+                entered_rx.recv_timeout(Duration::from_secs(2))?;
+            }
+            let requests = ["ping", "initialize", "tools/list"]
+                .map(|method| json!({"jsonrpc":"2.0", "id":method, "method":method}));
+            let mut lines = requests
+                .iter()
+                .map(|r| format!("{r}\n"))
+                .collect::<String>();
+            lines.push_str("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n");
+            requests_tx.send(lines.into_bytes())?;
+            for request in requests {
+                let response = response_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .context("protocol request waited behind occupied workers")?;
+                anyhow::ensure!(response == handle_request(&runtime, request)?.unwrap());
+            }
+            Ok(())
+        })();
+        // Always release the blocked handlers before asserting the result.
+        drop(requests_tx);
+        for _ in 0..MAX_CONCURRENT_REQUESTS {
+            let _ = release_tx.send(());
+        }
+        server.join().expect("transport thread panicked")?;
+        progress?;
+        assert_eq!(response_rx.try_iter().count(), MAX_CONCURRENT_REQUESTS);
+        Ok(())
     }
 
     #[test]

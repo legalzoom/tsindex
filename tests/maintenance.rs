@@ -1,10 +1,10 @@
 //! Maintenance contracts at the process and lease interfaces.
 use std::fs;
-#[cfg(target_os = "linux")]
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
@@ -19,7 +19,6 @@ use tsindex::maintenance::{self, FileLease};
 use tsindex::mcp::handle_request_with_runtimes;
 use tsindex::worktrees::Runtimes;
 
-#[cfg(target_os = "linux")]
 const BIN: &str = env!("CARGO_BIN_EXE_tsindex");
 
 fn fixture() -> Result<(TempDir, PathBuf)> {
@@ -338,7 +337,7 @@ fn waiting_requests(
     let (finished, responses) = mpsc::channel();
     let mut callers = Vec::new();
     let waiting = (|| -> Result<()> {
-        for caller in 0..3 {
+        for caller in 0..4 {
             let runtimes = Arc::clone(runtimes);
             let repo = repo.to_owned();
             let name = name.to_owned();
@@ -357,12 +356,14 @@ fn waiting_requests(
         for _ in 0..callers.len() {
             started.recv_timeout(Duration::from_secs(5))?;
         }
+        for _ in 1..callers.len() {
+            responses
+                .recv_timeout(Duration::from_secs(2))
+                .context("excess callers waited behind the blocked checkout refresh")?;
+        }
         ensure!(
-            matches!(
-                responses.recv_timeout(Duration::from_millis(150)),
-                Err(mpsc::RecvTimeoutError::Timeout)
-            ),
-            "a caller completed before the blocked writer was released"
+            responses.try_recv().is_err(),
+            "the admitted caller completed before the blocked writer was released"
         );
         Ok(())
     })();
@@ -600,7 +601,55 @@ fn a_blocked_worktree_writer_does_not_block_another_worktree() -> Result<()> {
 }
 
 #[test]
-fn all_waiters_receive_the_completed_worktree_refresh() -> Result<()> {
+fn concurrent_callers_share_a_fast_due_refresh() -> Result<()> {
+    for refresh_ms in [TsIndexConfig::default().server.worktree_refresh_ms, 0] {
+        let (_directory, root) = fixture()?;
+        let checkout = linked_checkout(&root, "branch-one", "before_refresh")?;
+        for file in 0..250 {
+            fs::write(
+                checkout.join(format!("file_{file}.py")),
+                format!("def symbol_{file}():\n    pass\n"),
+            )?;
+        }
+        let mut config = TsIndexConfig::load(&root)?;
+        config.server.worktree_refresh_ms = refresh_ms;
+        let runtimes = Arc::new(Runtimes::new(Runtime::new(
+            root.clone(),
+            db_path(&root),
+            config,
+            vec![],
+        )));
+        assert_eq!(
+            symbol(&runtimes, "branch-one", "before_refresh")?["total"],
+            1
+        );
+        fs::write(checkout.join("a.py"), "def after_refresh():\n    pass\n")?;
+        thread::sleep(Duration::from_millis(refresh_ms + 10));
+
+        let start = Arc::new(std::sync::Barrier::new(4));
+        let callers: Vec<_> = (0..4)
+            .map(|_| {
+                let runtimes = Arc::clone(&runtimes);
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    symbol(&runtimes, "branch-one", "after_refresh")
+                })
+            })
+            .collect();
+        let responses: Vec<_> = callers
+            .into_iter()
+            .map(|caller| caller.join().expect("worktree caller panicked"))
+            .collect();
+        for response in responses {
+            assert_eq!(response?["total"], 1, "refresh interval {refresh_ms} ms");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn one_waiter_receives_the_completed_refresh_and_excess_callers_retry() -> Result<()> {
     let (_directory, root) = fixture()?;
     let checkout = linked_checkout(&root, "branch-one", "shared_edit")?;
     let runtimes = Arc::new(Runtimes::new(Runtime::new(
@@ -609,9 +658,121 @@ fn all_waiters_receive_the_completed_worktree_refresh() -> Result<()> {
         TsIndexConfig::load(&root)?,
         vec![],
     )));
-    for response in waiting_requests(&runtimes, &checkout, "branch-one", "shared_edit")? {
-        assert_eq!(response?["total"], 1);
+    let mut responses =
+        waiting_requests(&runtimes, &checkout, "branch-one", "shared_edit")?.into_iter();
+    assert_eq!(responses.next().unwrap()?["total"], 1);
+    for response in responses {
+        let error = response.expect_err("excess callers must retry after the coalescing window");
+        assert!(format!("{error:#}").contains("update is in progress; retry shortly"));
     }
+    Ok(())
+}
+
+#[test]
+fn primary_tools_progress_while_one_checkout_has_four_callers() -> Result<()> {
+    let (_directory, root) = fixture()?;
+    let checkout = linked_checkout(&root, "branch-one", "shared_edit")?;
+    let writer = FileLease::acquire(
+        maintenance::writer_lease_path(&db_path(&checkout)),
+        Duration::from_secs(1),
+    )?;
+    let mut server = Command::new(BIN)
+        .args(["--no-refresh", "serve", "--mcp"])
+        .arg("--root")
+        .arg(&root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut input = server.stdin.take().unwrap();
+    let output = server.stdout.take().unwrap();
+    let (finished, responses) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        for line in BufReader::new(output).lines() {
+            let response = line
+                .map_err(anyhow::Error::from)
+                .and_then(|line| serde_json::from_str::<Value>(&line).map_err(anyhow::Error::from));
+            if finished.send(response).is_err() {
+                break;
+            }
+        }
+    });
+    let progress = (|| -> Result<()> {
+        for id in 1..=4 {
+            writeln!(
+                input,
+                "{}",
+                json!({"jsonrpc":"2.0", "id":id, "method":"tools/call",
+                "params":{"name":"get_symbol", "arguments":{"repo":"branch-one", "name":"shared_edit"}}})
+            )?;
+            input.flush()?;
+            if id == 1 {
+                wait_for_file(&checkout.join(".tsindex/config.toml"))?;
+            }
+        }
+        for (id, name, arguments) in [
+            (5, "get_symbol", json!({"name":"before_edit"})),
+            (
+                6,
+                "query",
+                json!({"language":"python", "file_glob":"a.py",
+                "query":"(function_definition name: (identifier) @name)"}),
+            ),
+        ] {
+            writeln!(
+                input,
+                "{}",
+                json!({"jsonrpc":"2.0", "id":id, "method":"tools/call",
+                "params":{"name":name, "arguments":arguments}})
+            )?;
+        }
+        input.flush()?;
+        let mut completed = Vec::new();
+        for _ in 0..5 {
+            let response = responses.recv_timeout(Duration::from_secs(2))??;
+            let id = response["id"].as_u64().context("response missing ID")?;
+            if id <= 4 {
+                ensure!(
+                    id != 1,
+                    "the admitted caller returned before its writer was released"
+                );
+                ensure!(response["error"]["code"] == -32603, "{response}");
+                ensure!(
+                    response["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("update is in progress; retry shortly")
+                );
+            } else {
+                ensure!(response.get("error").is_none(), "{response}");
+                let payload: Value = serde_json::from_str(
+                    response["result"]["content"][0]["text"].as_str().unwrap(),
+                )?;
+                if id == 5 {
+                    ensure!(payload["total"] == 1, "{payload}");
+                } else {
+                    ensure!(payload["captures"][0]["text"] == "before_edit", "{payload}");
+                }
+            }
+            completed.push(id);
+        }
+        completed.sort_unstable();
+        ensure!(completed == [2, 3, 4, 5, 6], "{completed:?}");
+        Ok(())
+    })();
+    drop(writer);
+    drop(input);
+    let status = server.wait()?;
+    reader.join().expect("response reader panicked");
+    progress?;
+    ensure!(status.success());
+    let response = responses.recv_timeout(Duration::from_secs(2))??;
+    assert_eq!(response["id"], 1);
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(
+        responses.try_recv().is_err(),
+        "every accepted ID is answered once"
+    );
     Ok(())
 }
 
@@ -633,7 +794,7 @@ fn a_zero_interval_linked_checkout_reconciles_each_request() -> Result<()> {
 }
 
 #[test]
-fn all_waiters_receive_a_refresh_failure_and_the_next_request_can_retry() -> Result<()> {
+fn admitted_waiter_receives_a_refresh_failure_and_the_next_request_can_retry() -> Result<()> {
     let (_directory, root) = fixture()?;
     let checkout = linked_checkout(&root, "branch-one", "recovered_edit")?;
     let mut config = TsIndexConfig::load(&root)?;
@@ -644,9 +805,16 @@ fn all_waiters_receive_a_refresh_failure_and_the_next_request_can_retry() -> Res
         config,
         vec![],
     )));
-    for response in waiting_requests(&runtimes, &checkout, "branch-one", "recovered_edit")? {
-        let failure = response.expect_err("every waiter must observe the failed refresh");
-        assert!(format!("{failure:#}").contains("invalid-maintenance-language"));
+    let mut responses =
+        waiting_requests(&runtimes, &checkout, "branch-one", "recovered_edit")?.into_iter();
+    let failure = responses
+        .next()
+        .unwrap()
+        .expect_err("the waiter must observe the failed refresh");
+    assert!(format!("{failure:#}").contains("invalid-maintenance-language"));
+    for response in responses {
+        let error = response.expect_err("excess callers must retry after the coalescing window");
+        assert!(format!("{error:#}").contains("update is in progress; retry shortly"));
     }
     let mut config = TsIndexConfig::load(&checkout)?;
     config.languages.include = vec!["python".into()];

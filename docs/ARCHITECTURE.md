@@ -17,6 +17,9 @@ separate indexes or source-discovery rules.
 - `src/overlay.rs` owns immutable base publication, private staging, and merged
   read views. `src/maintenance.rs` coordinates database writers, watcher
   ownership, and successful full-refresh markers across server processes.
+- `src/daemon/` implements the login-started user orchestrator (`orchestrator.rs`),
+  the thin `serve --mcp` stdio proxy (`proxy.rs`), and macOS `launchd` / Linux
+  `systemd --user` login service management (`service.rs`).
 
 ## Checkout storage
 
@@ -206,19 +209,44 @@ wait for an active catalog mutation, whose exclusive section includes cloning.
 This fence coordinates requests within one HTTP server. Existing host, origin,
 size, and read-only tool guards remain in the HTTP dispatch path.
 
-## Process ownership
+## Orchestrator daemon and process ownership
 
-`src/lifecycle.rs` monitors an owning process every five seconds on a dedicated
-thread, starting before index initialization. MCP infers its immediate parent;
-an explicit `--session-pid` replaces parent monitoring and also enables cleanup
-for HTTP servers and watchers. Inferred owners that cannot be inspected retain
-parent-PID-only tracking; inspection failures after capture do not imply exit.
+MCP sessions are supervised by a standalone, login-started user orchestrator
+(`tsindex daemon run`, managed by `launchd` on macOS and `systemd --user` on
+Linux). The orchestrator starts completely idle: it opens no SQLite databases
+and registers no filesystem watchers at boot. It acquires an exclusive
+`FileLease` (`daemon.lock`), removes any stale socket left by a previous crash,
+and listens on a private `0600` Unix domain socket inside a `0700` user-owned
+directory, rejecting peers whose effective UID differs from the daemon (`getpeereid`
+on macOS, `SO_PEERCRED` on Linux).
 
-Linux reads process metadata as bytes because the kernel can truncate a process
-name inside a UTF-8 character. Only fields following the process name in
-`/proc/<pid>/stat` are decoded. Its start time detects PID reuse, and its thread
-count distinguishes a zombie leader with surviving workers from an entirely
-exited process. Both values come from the same read without scanning individual
+Agent harnesses continue invoking `tsindex --root <path> serve --mcp`, which
+runs as a thin stdio-to-Unix-socket proxy. If the daemon is not running, the
+proxy fails fast with an actionable error instead of falling back to an
+unmanaged standalone server. For each accepted session, the orchestrator spawns
+an isolated per-session MCP worker (`tsindex daemon worker`) in its own process
+group (`setpgid(0, 0)`, plus `PR_SET_PDEATHSIG(SIGTERM)` on Linux). Per-session
+workers preserve full isolation when concurrent sessions work on the same
+repository in different Git worktrees while existing file leases and immutable
+overlay bases coordinate shared storage.
+
+The orchestrator bridges raw newline-delimited JSON-RPC traffic between the
+proxy socket and the worker stdio pipes, passively capturing client identity
+(`initialize`), request/tool counters, and bounded worker stderr logs for
+`daemon status` and `daemon sessions`. Harness exit or proxy `SIGKILL` closes
+the Unix socket immediately, causing the orchestrator to close worker stdin,
+allow a bounded drain on clean EOF, escalate to `SIGTERM`/`SIGKILL` against the
+worker process group if needed, and reap the child so no zombies or orphans
+remain. See [ADR 0004](adrs/0004-orchestrator-daemon.md).
+
+`src/lifecycle.rs` provides the process-identity inspection shared by both the
+orchestrator's single background sweeper (`ProcessOwner`) and direct `watch` /
+`serve --http --session-pid` watchdogs (`SessionLifecycle`). Linux reads
+process metadata as bytes because the kernel can truncate a process name inside
+a UTF-8 character. Only fields following the process name in `/proc/<pid>/stat`
+are decoded. Its start time detects PID reuse, and its thread count
+distinguishes a zombie leader with surviving workers from an entirely exited
+process. Both values come from the same read without scanning individual
 threads.
 
 ## Filesystem updates

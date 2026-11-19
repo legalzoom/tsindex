@@ -339,7 +339,8 @@ tsindex --root /path/to/main worktrees --json
 - `query`: Runs a raw tree-sitter query for one or more languages.
 - `worktrees`: Lists checkout names, paths, index status, and last update times.
 - `repos`: Lists, adds, and removes repos in the catalog.
-- `serve`: Starts the MCP or HTTP server.
+- `serve`: Connects an MCP stdio session through the orchestrator daemon, or starts the HTTP server.
+- `daemon`: Installs, starts, stops, inspects, and manages the login-started orchestrator daemon and its active sessions.
 
 You can inspect per-command help with:
 
@@ -365,6 +366,7 @@ tsindex query '(function_definition name: (identifier) @fn)' --language python -
 
 - `--root`: Workspace root to index or query.
 - `--db`: Override the SQLite database path.
+- `--socket`: Override the orchestrator daemon Unix socket path (defaults to `$TSINDEX_SOCKET`, `$TSINDEX_HOME/daemon.sock`, or the platform runtime socket).
 - `--languages <lang>`: Restrict work to one or more explicit languages
   (repeatable). `query` accepts either `--language <lang>` or repeated
   `--languages <lang>` options to query several grammars.
@@ -374,43 +376,62 @@ tsindex query '(function_definition name: (identifier) @fn)' --language python -
 
 Several query commands also support `--repo` to restrict results to one configured repo.
 
-## MCP server
+## Orchestrator daemon & MCP server
 
-Start the MCP server on stdio:
+On macOS and Linux, MCP sessions are managed by a standalone, long-standing
+orchestrator daemon that starts automatically at login and remains idle (with
+zero open databases or filesystem watchers) until an agent harness connects.
+
+Install and start the login service (`launchd` LaunchAgent on macOS,
+`systemd --user` on Linux):
+
+```bash
+tsindex daemon install
+```
+
+Or manage the daemon manually:
+
+```bash
+tsindex daemon start          # start in the background (idempotent)
+tsindex daemon status         # show daemon PID, version, socket, and active sessions
+tsindex daemon sessions       # list active MCP sessions (--all includes recent)
+tsindex daemon kill <id>      # terminate a single session (--all for every session)
+tsindex daemon restart        # gracefully restart (e.g. after upgrading tsindex)
+tsindex daemon stop           # gracefully drain and stop the daemon and its workers
+tsindex daemon uninstall      # stop and remove the login service
+```
+
+Agent harnesses invoke the same stdio MCP command as before:
 
 ```bash
 tsindex --root /path/to/repo serve --mcp
 ```
 
-The MCP server runs a session lifecycle handler on a dedicated thread. It
-records the owning session PID and tsindex PID in stderr and checks the owner
-every **5 seconds**, exiting when that process ends. The handler starts before
-index initialization and ends with tsindex; it needs no separate daemon or PID
-file. By default, the owner is tsindex's immediate parent (normally Codex,
-Claude, or another MCP client). Launches directly under PID 1 keep running
-without inferred ownership.
+`serve --mcp` acts as a thin stdio proxy over the orchestrator's private Unix
+socket (`~/.tsindex/run/daemon.sock` on macOS, `$XDG_RUNTIME_DIR/tsindex/daemon.sock`
+on Linux, or `--socket` / `$TSINDEX_SOCKET`). If the orchestrator is not
+running, `serve --mcp` fails fast with an error instructing the harness/user to
+run `tsindex daemon start` or `tsindex daemon install`.
 
-When a wrapper launches the server, pass the actual session process PID:
+For each connected harness session, the orchestrator spawns an isolated
+per-session MCP worker child process (so concurrent sessions working on the
+same repository in different Git worktrees stay isolated), bridges JSON-RPC
+traffic, monitors the owning harness PID (or explicit `--session-pid`) from a
+single centralized sweeper, and deterministically terminates and reaps the
+worker when the harness disconnects, crashes, or exits.
+
+When a wrapper launches the MCP proxy, pass the actual session process PID:
 
 ```bash
 tsindex --root /path/to/repo serve --mcp --session-pid 12345
 ```
 
-Use the live Codex/Claude/etc. process PID in place of `12345`. Explicit
-ownership survives wrapper exit and also works with `serve --http` and `watch`.
-HTTP remains independent unless `--session-pid` is supplied; `watch
---exit-with-parent` monitors its immediate parent. The watcher's `--session-pid`
-replaces parent monitoring and cannot be combined with `--exit-with-parent`.
-
-On macOS and Linux, the handler also checks process start time to detect PID
-reuse and treats fully exited zombie processes as ended. On Linux, an exited
-main thread does not end ownership while worker threads remain alive, and
-process names need not be valid UTF-8. If the inferred parent cannot be
-inspected, the handler falls back to parent-PID-only tracking, without PID-reuse
-or zombie checks. An explicit owner must exist and allow process inspection or
-startup fails; this includes PID 1 when inspection is denied. A later permission
-or inspection error does not count as an exit. Normal MCP stdin EOF still stops
-the server promptly.
+Explicit `--session-pid` ownership also continues to work directly with
+`serve --http` and `watch`, and `watch --exit-with-parent` monitors its
+immediate parent. On macOS and Linux, owner monitoring checks process start
+time to detect PID reuse and treats fully exited zombie processes as ended
+(while on Linux an exited thread-group leader with surviving worker threads
+remains alive, and non-UTF-8 process names are handled safely).
 
 The server exposes five read tools:
 
@@ -692,5 +713,6 @@ tsindex is available under either the [MIT license](LICENSE-MIT) or the
 - [src/app.rs](./src/app.rs): CLI definition and command dispatch
 - [src/index.rs](./src/index.rs): indexing, SQLite schema, and query API
 - [src/lang.rs](./src/lang.rs): language registry and tree-sitter queries
+- [src/daemon/](./src/daemon/mod.rs): orchestrator daemon, stdio MCP proxy, and macOS/Linux login services
 - [src/mcp.rs](./src/mcp.rs): MCP and HTTP serving layer
 - [tests/integration.rs](./tests/integration.rs): fixture-based integration tests

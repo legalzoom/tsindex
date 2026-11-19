@@ -23,14 +23,14 @@ use crate::index::{
 use crate::worktrees::Runtimes;
 
 #[derive(Default)]
-struct TransportCancellation {
+pub(crate) struct TransportCancellation {
     stopped: AtomicBool,
     #[cfg(unix)]
     wake: Option<Mutex<std::os::unix::net::UnixStream>>,
 }
 
 impl TransportCancellation {
-    fn stop(&self) {
+    pub(crate) fn stop(&self) {
         if !self.stopped.swap(true, Ordering::AcqRel) {
             #[cfg(unix)]
             if let Some(wake) = &self.wake {
@@ -44,15 +44,15 @@ impl TransportCancellation {
 }
 
 #[cfg(unix)]
-struct CancellableStdin {
+pub(crate) struct CancellableStdin {
     input: io::BufReader<fs::File>,
     wake: std::os::unix::net::UnixStream,
-    cancellation: Arc<TransportCancellation>,
+    pub(crate) cancellation: Arc<TransportCancellation>,
 }
 
 #[cfg(unix)]
 impl CancellableStdin {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         use std::os::fd::AsFd;
         let input = io::stdin().as_fd().try_clone_to_owned()?;
         let (wake, notify) = std::os::unix::net::UnixStream::pair()?;
@@ -133,6 +133,13 @@ impl BufRead for CancellableStdin {
 
 pub fn serve_mcp(runtime: Runtime) -> Result<()> {
     spawn_parent_watchdog()?;
+    serve_mcp_worker(runtime)
+}
+
+/// Serve MCP over stdio without spawning a per-process parent-PID watchdog.
+/// Used by orchestrator-managed per-session worker processes whose lifecycle
+/// is supervised directly by the daemon.
+pub(crate) fn serve_mcp_worker(runtime: Runtime) -> Result<()> {
     let stdout = io::stdout();
     #[cfg(unix)]
     let input = CancellableStdin::new()?;
@@ -1233,7 +1240,7 @@ fn global_repo_dir(root: &Path) -> PathBuf {
 
 /// `~/.tsindex`, or `$TSINDEX_HOME` when set so tests and CI can point the
 /// telemetry sink at a scratch directory instead of the developer's home.
-fn tsindex_home() -> PathBuf {
+pub(crate) fn tsindex_home() -> PathBuf {
     tsindex_home_from(std::env::var_os("TSINDEX_HOME"))
 }
 
@@ -1741,7 +1748,7 @@ fn file_mentions_tsindex(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn home_path(relative: &str) -> PathBuf {
+pub(crate) fn home_path(relative: &str) -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"))

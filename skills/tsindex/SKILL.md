@@ -37,12 +37,14 @@ index refresh as an eager warm-up, and exits:
 tsindex --root <target> update
 ```
 
-It does not install LaunchAgents, use `nohup`, or leave a watcher running after
-the startup command exits. `serve --mcp` runs its own in-process watcher for the
-lifetime of the server (startup refresh, then filesystem notifications), so this
-warm-up is helpful but not required for freshness once the MCP server is up. To
-keep a foreground watcher attached to the current shell for CLI-only sessions
-that never start `serve --mcp`, run:
+The startup script refreshes the index on demand and exits without starting a
+repo watcher. `serve --mcp` connects to the long-standing `tsindex` orchestrator
+daemon (which starts idle at login via `tsindex daemon install`, or manually via
+`tsindex daemon start`) and spawns a managed per-session MCP worker that runs
+its own watcher for the lifetime of that session. If the daemon is not running,
+`serve --mcp` fails fast telling the harness to start or install it. To keep a
+foreground watcher attached to the current shell for CLI-only sessions that
+never start `serve --mcp`, run:
 
 ```bash
 TSINDEX_START_MODE=watch bash "$skill_root/scripts/start-tsindex.sh"
@@ -155,7 +157,7 @@ separate `watch` only matters for CLI-only sessions.
 ## Guardrails
 
 - Keep this skill scoped to tsindex startup and code-reading behavior.
-- Do not install persistent daemons or background watchers.
+- Only install or start the `tsindex` orchestrator daemon (`tsindex daemon install` / `tsindex daemon start`) when the user requests it or when `serve --mcp` reports the daemon is not running.
 - Do not add product-specific paths, repo names, patterns, or MCP tools.
 - Use tsindex for code structure, not string search.
 - Fall back gracefully to `rg` and targeted reads when MCP tools are

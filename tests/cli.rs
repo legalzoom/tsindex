@@ -3,6 +3,9 @@
 //! goes through the library API, so these are the only checks that arg
 //! parsing, stdout hygiene, and transport wiring actually work.
 
+#[cfg(unix)]
+mod common;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -150,14 +153,18 @@ fn cli_init_build_symbol_round_trip() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 #[test]
 fn mcp_stdio_emits_only_json_rpc_lines() -> Result<()> {
+    let daemon = common::TestDaemon::start()?;
     let dir = tempdir()?;
     fixture(dir.path())?;
     let out = tsindex(dir.path(), &["build"])?;
     assert!(out.status.success());
 
     let mut child = Command::new(BIN)
+        .arg("--socket")
+        .arg(&daemon.socket)
         .arg("--root")
         .arg(dir.path())
         .args(["--no-refresh", "serve", "--mcp"])
@@ -235,12 +242,15 @@ fn mcp_exits_when_stdout_closes_even_if_the_parent_keeps_stdin_open() -> Result<
             let _ = self.0.wait();
         }
     }
+    let daemon = common::TestDaemon::start()?;
     let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/transport-fixtures");
     fs::create_dir_all(&artifacts)?;
     let dir = tempfile::tempdir_in(artifacts)?;
     fixture(dir.path())?;
     let mut server = Server(
         Command::new(BIN)
+            .arg("--socket")
+            .arg(&daemon.socket)
             .arg("--root")
             .arg(dir.path())
             .args(["--no-refresh", "serve", "--mcp"])
@@ -249,6 +259,7 @@ fn mcp_exits_when_stdout_closes_even_if_the_parent_keeps_stdin_open() -> Result<
             .stderr(Stdio::null())
             .spawn()?,
     );
+    daemon.wait_active_sessions(1, Duration::from_secs(5))?;
     drop(server.0.stdout.take());
     let input = server.0.stdin.as_mut().unwrap();
     writeln!(input, r#"{{"jsonrpc":"2.0","id":1,"method":"ping"}}"#)?;
@@ -271,6 +282,7 @@ fn mcp_exits_when_stdout_closes_even_if_the_parent_keeps_stdin_open() -> Result<
         !status.unwrap().success(),
         "a broken output pipe is an I/O error"
     );
+    daemon.wait_active_sessions(0, Duration::from_secs(5))?;
     Ok(())
 }
 
@@ -309,7 +321,7 @@ fn mcp_watcher_skips_dependency_symlinks_and_refreshes_source() -> Result<()> {
         Command::new(BIN)
             .arg("--root")
             .arg(&root)
-            .args(["serve", "--mcp"])
+            .args(["daemon", "worker"])
             // Each step below waits out one debounce window; keep it short.
             .env("TSINDEX_WATCH_DEBOUNCE_MS", "200")
             // Never written, but it must stay open: the server exits on stdin EOF.

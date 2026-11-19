@@ -11,7 +11,7 @@ use crate::index::{
     Runtime, print_json, print_language_reports,
 };
 use crate::lifecycle::spawn_session_handler;
-use crate::mcp::{serve_http, serve_mcp};
+use crate::mcp::serve_http;
 
 #[derive(Debug, Parser)]
 #[command(name = "tsindex")]
@@ -33,6 +33,12 @@ pub struct Cli {
         help = "Path to the SQLite index database. Defaults to .tsindex/index.db under --root."
     )]
     db: Option<PathBuf>,
+    #[arg(
+        long,
+        global = true,
+        help = "Path to the orchestrator daemon Unix socket. Defaults to $TSINDEX_SOCKET or the platform runtime socket."
+    )]
+    socket: Option<PathBuf>,
     #[arg(
         long = "languages",
         global = true,
@@ -93,8 +99,14 @@ pub enum Command {
     Repos(ReposCommand),
     #[command(about = "List Git worktrees and their index status without indexing them.")]
     Worktrees,
-    #[command(about = "Start the MCP server or the HTTP JSON server.")]
+    #[command(
+        about = "Connect an MCP session through the orchestrator daemon, or start the HTTP server."
+    )]
     Serve(ServeCommand),
+    #[command(
+        about = "Manage the long-standing tsindex orchestrator daemon and its login service."
+    )]
+    Daemon(DaemonCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -384,7 +396,7 @@ pub struct QueryCommand {
 pub struct ServeCommand {
     #[arg(
         long,
-        help = "Serve the four retrieval primitives over MCP on stdin/stdout."
+        help = "Attach an MCP stdio session through the running orchestrator daemon."
     )]
     mcp: bool,
     #[arg(long, help = "Serve the same primitives over a small HTTP JSON API.")]
@@ -409,9 +421,72 @@ pub struct ServeCommand {
     #[arg(
         long,
         value_parser = clap::value_parser!(u32).range(1..=i32::MAX as i64),
-        help = "Owning Codex/Claude/etc. session PID (must be inspectable). Check every 5s and exit when it ends. MCP defaults to its parent PID; HTTP only monitors an explicit session PID."
+        help = "Owning Codex/Claude/etc. session PID (must be inspectable). For MCP, monitored by the orchestrator daemon; for HTTP, monitors the owner locally."
     )]
     session_pid: Option<u32>,
+}
+
+#[derive(Debug, Args)]
+pub struct DaemonCommand {
+    #[command(subcommand)]
+    action: DaemonAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DaemonAction {
+    #[command(about = "Run the orchestrator daemon in the foreground (used by launchd/systemd).")]
+    Run,
+    #[command(about = "Start the orchestrator daemon in the background (idempotent).")]
+    Start,
+    #[command(about = "Gracefully stop the running orchestrator daemon and its active sessions.")]
+    Stop,
+    #[command(about = "Gracefully restart the orchestrator daemon.")]
+    Restart,
+    #[command(about = "Show orchestrator daemon status, socket path, and login-service state.")]
+    Status,
+    #[command(about = "List sessions currently managed by the orchestrator daemon.")]
+    Sessions(DaemonSessionsArgs),
+    #[command(about = "Terminate one active session or all sessions managed by the daemon.")]
+    Kill(DaemonKillArgs),
+    #[command(
+        about = "Install and start the login service (launchd on macOS, systemd --user on Linux)."
+    )]
+    Install(DaemonInstallArgs),
+    #[command(about = "Stop and remove the installed login service.")]
+    Uninstall,
+    /// Internal per-session MCP worker spawned by the orchestrator daemon.
+    #[command(hide = true)]
+    Worker,
+}
+
+#[derive(Debug, Args)]
+pub struct DaemonSessionsArgs {
+    #[arg(
+        long,
+        help = "Include recently exited sessions in addition to active ones."
+    )]
+    all: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DaemonKillArgs {
+    #[arg(
+        required_unless_present = "all",
+        conflicts_with = "all",
+        help = "Session ID to terminate (from `tsindex daemon sessions`)."
+    )]
+    session_id: Option<String>,
+    #[arg(long, help = "Terminate all active sessions.")]
+    all: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DaemonInstallArgs {
+    #[arg(
+        long,
+        help = "Explicit path to the tsindex binary for the login service. Defaults to the current executable."
+    )]
+    binary: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -614,22 +689,264 @@ pub fn run() -> Result<()> {
             }
             Ok(())
         }),
-        Command::Serve(ref command) => with_runtime(&cli, |runtime| {
-            let runtime = runtime.with_jobs(0);
+        Command::Serve(ref command) => {
             if command.mcp {
-                spawn_background_watch(&cli, &runtime)?;
-                return serve_mcp(runtime);
+                return run_mcp_via_daemon(&cli, command);
             }
-            refresh_if_needed(&cli, &runtime)?;
-            if !cli.no_refresh {
-                crate::maintenance::register_primary(&runtime, false);
-            }
-            // `--mcp` returned above; everything else (`--http` or no mode at
-            // all) serves the HTTP dashboard.
-            let port = command.port.unwrap_or(runtime.config.server.http_port);
-            serve_http(runtime, &command.bind, port, &command.allowed_hosts)
-        }),
+            with_runtime(&cli, |runtime| {
+                let runtime = runtime.with_jobs(0);
+                refresh_if_needed(&cli, &runtime)?;
+                if !cli.no_refresh {
+                    crate::maintenance::register_primary(&runtime, false);
+                }
+                // `--mcp` returned above; everything else (`--http` or no mode at
+                // all) serves the HTTP dashboard.
+                let port = command.port.unwrap_or(runtime.config.server.http_port);
+                serve_http(runtime, &command.bind, port, &command.allowed_hosts)
+            })
+        }
+        Command::Daemon(ref command) => manage_daemon(&cli, command),
     }
+}
+
+#[cfg(unix)]
+fn run_mcp_via_daemon(cli: &Cli, command: &ServeCommand) -> Result<()> {
+    let root = resolve_root(cli.root.as_deref())?;
+    crate::daemon::proxy::run_mcp_proxy(crate::daemon::proxy::McpProxyArgs {
+        root,
+        db: cli.db.clone(),
+        languages: cli.languages.clone(),
+        no_refresh: cli.no_refresh,
+        session_pid: command.session_pid,
+        socket: cli.socket.clone(),
+    })
+}
+
+#[cfg(not(unix))]
+fn run_mcp_via_daemon(_cli: &Cli, _command: &ServeCommand) -> Result<()> {
+    anyhow::bail!("tsindex orchestrator daemon is only supported on macOS and Linux")
+}
+
+#[cfg(unix)]
+fn manage_daemon(cli: &Cli, command: &DaemonCommand) -> Result<()> {
+    use crate::daemon::{DaemonClient, DaemonPaths, orchestrator, service};
+
+    match &command.action {
+        DaemonAction::Worker => with_runtime(cli, |runtime| {
+            let runtime = runtime.with_jobs(0);
+            spawn_background_watch(cli, &runtime)?;
+            crate::mcp::serve_mcp_worker(runtime)
+        }),
+        DaemonAction::Run => {
+            let paths = DaemonPaths::resolve(cli.socket.as_deref())?;
+            orchestrator::run_orchestrator(paths)
+        }
+        DaemonAction::Start => {
+            let paths = DaemonPaths::resolve(cli.socket.as_deref())?;
+            let status = service::start_daemon(&paths, cli.socket.as_deref())?;
+            if cli.json {
+                print_json(&status)
+            } else {
+                println!(
+                    "tsindex daemon running (pid {}, version {}, socket {})",
+                    status.daemon_pid,
+                    status.version,
+                    status.socket.display()
+                );
+                Ok(())
+            }
+        }
+        DaemonAction::Stop => {
+            let paths = DaemonPaths::resolve(cli.socket.as_deref())?;
+            let stopped = service::stop_daemon(&paths)?;
+            if cli.json {
+                print_json(&json!({
+                    "stopped": stopped,
+                    "socket": paths.socket_path,
+                }))
+            } else if stopped {
+                println!("tsindex daemon stopped ({})", paths.socket_path.display());
+                Ok(())
+            } else {
+                println!(
+                    "tsindex daemon is not running ({})",
+                    paths.socket_path.display()
+                );
+                Ok(())
+            }
+        }
+        DaemonAction::Restart => {
+            let paths = DaemonPaths::resolve(cli.socket.as_deref())?;
+            let status = service::restart_daemon(&paths, cli.socket.as_deref())?;
+            if cli.json {
+                print_json(&status)
+            } else {
+                println!(
+                    "tsindex daemon restarted (pid {}, version {}, socket {})",
+                    status.daemon_pid,
+                    status.version,
+                    status.socket.display()
+                );
+                Ok(())
+            }
+        }
+        DaemonAction::Status => {
+            let paths = DaemonPaths::resolve(cli.socket.as_deref())?;
+            let svc = service::inspect_service();
+            let live = DaemonClient::new(paths.clone()).ping().ok();
+            let cli_version = env!("CARGO_PKG_VERSION");
+            if cli.json {
+                print_json(&json!({
+                    "running": live.is_some(),
+                    "cli_version": cli_version,
+                    "socket": paths.socket_path,
+                    "log": paths.log_path,
+                    "service": svc,
+                    "daemon": live,
+                }))
+            } else {
+                match live {
+                    Some(status) => {
+                        println!("status: running");
+                        println!("pid: {}", status.daemon_pid);
+                        println!("version: {}", status.version);
+                        if status.version != cli_version {
+                            println!(
+                                "warning: CLI is v{cli_version}; run `tsindex daemon restart` to upgrade"
+                            );
+                        }
+                        println!("uptime: {}s", status.uptime_secs);
+                        println!("socket: {}", status.socket.display());
+                        println!(
+                            "sessions: {} active ({} total)",
+                            status.active_sessions, status.total_sessions_started
+                        );
+                    }
+                    None => {
+                        println!("status: stopped");
+                        println!("socket: {}", paths.socket_path.display());
+                    }
+                }
+                println!(
+                    "service ({}): {} ({})",
+                    svc.manager,
+                    if svc.installed {
+                        "installed"
+                    } else {
+                        "not installed"
+                    },
+                    svc.service_file.display()
+                );
+                Ok(())
+            }
+        }
+        DaemonAction::Sessions(args) => {
+            let paths = DaemonPaths::resolve(cli.socket.as_deref())?;
+            let (active, recent) = DaemonClient::new(paths).list_sessions(args.all)?;
+            if cli.json {
+                print_json(&json!({
+                    "active": active,
+                    "recent": recent,
+                }))
+            } else {
+                if active.is_empty() {
+                    println!("no active sessions");
+                } else {
+                    for s in &active {
+                        let harness = s.harness_name.as_deref().unwrap_or("-");
+                        let owner = s
+                            .owner_pid
+                            .map_or_else(|| "-".to_string(), |pid| pid.to_string());
+                        println!(
+                            "{}\t{:?}\tworker={}\towner={}\tharness={}\treqs={}\ttools={}\t{}",
+                            s.session_id,
+                            s.state,
+                            s.worker_pid,
+                            owner,
+                            harness,
+                            s.requests_received,
+                            s.tool_calls,
+                            s.root.display()
+                        );
+                    }
+                }
+                if args.all && !recent.is_empty() {
+                    println!("\nrecent:");
+                    for s in &recent {
+                        let reason = s.exit_reason.as_deref().unwrap_or("-");
+                        println!(
+                            "{}\t{:?}\tworker={}\treason={}\treqs={}\ttools={}\t{}",
+                            s.session_id,
+                            s.state,
+                            s.worker_pid,
+                            reason,
+                            s.requests_received,
+                            s.tool_calls,
+                            s.root.display()
+                        );
+                    }
+                }
+                Ok(())
+            }
+        }
+        DaemonAction::Kill(args) => {
+            let paths = DaemonPaths::resolve(cli.socket.as_deref())?;
+            let client = DaemonClient::new(paths);
+            let killed = if args.all {
+                client.kill_all()?
+            } else {
+                client.kill_session(args.session_id.clone().unwrap_or_default())?
+            };
+            if cli.json {
+                print_json(&json!({ "killed": killed }))
+            } else if killed.is_empty() {
+                println!("no active sessions to terminate");
+                Ok(())
+            } else {
+                println!("terminated session(s): {}", killed.join(", "));
+                Ok(())
+            }
+        }
+        DaemonAction::Install(args) => {
+            let paths = DaemonPaths::resolve(cli.socket.as_deref())?;
+            let (svc, status) =
+                service::install_service(&paths, cli.socket.as_deref(), args.binary.as_deref())?;
+            if cli.json {
+                print_json(&json!({
+                    "service": svc,
+                    "daemon": status,
+                }))
+            } else {
+                println!(
+                    "installed {} service at {}",
+                    svc.manager,
+                    svc.service_file.display()
+                );
+                println!(
+                    "tsindex daemon running (pid {}, version {}, socket {})",
+                    status.daemon_pid,
+                    status.version,
+                    status.socket.display()
+                );
+                Ok(())
+            }
+        }
+        DaemonAction::Uninstall => {
+            let paths = DaemonPaths::resolve(cli.socket.as_deref())?;
+            let removed = service::uninstall_service(&paths)?;
+            if cli.json {
+                print_json(&json!({ "removed": removed }))
+            } else {
+                println!("removed tsindex login service ({})", removed.display());
+                Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn manage_daemon(_cli: &Cli, _command: &DaemonCommand) -> Result<()> {
+    anyhow::bail!("tsindex orchestrator daemon is only supported on macOS and Linux")
 }
 
 fn build_stats_json(stats: &BuildStats) -> serde_json::Value {
@@ -643,7 +960,9 @@ fn build_stats_json(stats: &BuildStats) -> serde_json::Value {
 
 fn should_start_parent_watchdog(command: &Command) -> bool {
     match command {
-        Command::Serve(command) => command.mcp || command.session_pid.is_some(),
+        // MCP sessions are supervised centrally by the orchestrator daemon;
+        // only direct HTTP (--session-pid) and watch processes run a local watchdog.
+        Command::Serve(command) => !command.mcp && command.session_pid.is_some(),
         Command::Watch(args) => args.exit_with_parent || args.session_pid.is_some(),
         _ => false,
     }
@@ -1122,9 +1441,8 @@ mod tests {
     }
 
     #[test]
-    fn parent_watchdog_starts_for_mcp_serve_and_watch_exit_with_parent() {
+    fn parent_watchdog_starts_for_direct_http_and_watch_not_daemon_proxied_mcp() {
         for argv in [
-            ["tsindex", "serve", "--mcp"].as_slice(),
             ["tsindex", "watch", "--exit-with-parent"].as_slice(),
             ["tsindex", "serve", "--http", "--session-pid", "42"].as_slice(),
             ["tsindex", "serve", "--session-pid", "42"].as_slice(),
@@ -1138,6 +1456,10 @@ mod tests {
         }
 
         for argv in [
+            ["tsindex", "serve", "--mcp"].as_slice(),
+            ["tsindex", "serve", "--mcp", "--session-pid", "42"].as_slice(),
+            ["tsindex", "daemon", "run"].as_slice(),
+            ["tsindex", "daemon", "worker"].as_slice(),
             ["tsindex", "watch"].as_slice(),
             ["tsindex", "serve", "--http"].as_slice(),
             ["tsindex", "build"].as_slice(),
@@ -1145,10 +1467,10 @@ mod tests {
             ["tsindex", "languages"].as_slice(),
             ["tsindex", "symbol", "foo"].as_slice(),
         ] {
-            let cli = Cli::try_parse_from(argv).expect("short-lived command should parse");
+            let cli = Cli::try_parse_from(argv).expect("command should parse");
             assert!(
                 !should_start_parent_watchdog(&cli.command),
-                "watchdog should not start for {argv:?}"
+                "local watchdog should not start for {argv:?}"
             );
         }
     }
@@ -1183,6 +1505,38 @@ mod tests {
                 assert!(Cli::try_parse_from(["tsindex", command, "--session-pid", pid]).is_err());
             }
         }
+    }
+
+    #[test]
+    fn daemon_subcommands_and_global_socket_parse() {
+        for argv in [
+            ["tsindex", "daemon", "run"].as_slice(),
+            ["tsindex", "--socket", "/tmp/d.sock", "daemon", "start"].as_slice(),
+            ["tsindex", "daemon", "stop", "--socket", "/tmp/d.sock"].as_slice(),
+            ["tsindex", "daemon", "restart"].as_slice(),
+            ["tsindex", "daemon", "status", "--json"].as_slice(),
+            ["tsindex", "daemon", "sessions", "--all"].as_slice(),
+            ["tsindex", "daemon", "kill", "s-1"].as_slice(),
+            ["tsindex", "daemon", "kill", "--all"].as_slice(),
+            ["tsindex", "daemon", "install"].as_slice(),
+            [
+                "tsindex",
+                "daemon",
+                "install",
+                "--binary",
+                "/usr/local/bin/tsindex",
+            ]
+            .as_slice(),
+            ["tsindex", "daemon", "uninstall"].as_slice(),
+            ["tsindex", "daemon", "worker"].as_slice(),
+        ] {
+            assert!(
+                Cli::try_parse_from(argv).is_ok(),
+                "expected daemon CLI to parse: {argv:?}"
+            );
+        }
+        assert!(Cli::try_parse_from(["tsindex", "daemon", "kill"]).is_err());
+        assert!(Cli::try_parse_from(["tsindex", "daemon", "kill", "s-1", "--all"]).is_err());
     }
 
     // --- `repos add` helpers -------------------------------------------------

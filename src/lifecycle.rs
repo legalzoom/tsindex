@@ -101,6 +101,90 @@ impl SessionLifecycle {
 
 /// Start once, before index initialization. An explicit owner takes precedence
 /// over a later default start from the MCP transport entry point.
+/// Process-identity handle monitored by the orchestrator's centralized
+/// session sweeper. Unlike [`SessionLifecycle`], this does not rely on
+/// `getppid()` because the orchestrator is not a child of the harness.
+#[derive(Debug, Clone)]
+pub(crate) struct ProcessOwner {
+    pid: libc::pid_t,
+    started_at: (u64, u64),
+}
+
+impl ProcessOwner {
+    pub(crate) fn capture(
+        owner_pid: Option<u32>,
+        explicit: bool,
+        excluded_pids: &[u32],
+    ) -> Result<Option<Self>> {
+        Self::capture_with(owner_pid, explicit, excluded_pids, process_start_time)
+    }
+
+    fn capture_with(
+        owner_pid: Option<u32>,
+        explicit: bool,
+        excluded_pids: &[u32],
+        inspect: impl FnOnce(libc::pid_t) -> io::Result<Option<(u64, u64)>>,
+    ) -> Result<Option<Self>> {
+        let Some(pid) = owner_pid else {
+            if explicit {
+                bail!(
+                    "session PID must identify another process (1..={})",
+                    i32::MAX
+                );
+            }
+            return Ok(None);
+        };
+        if !explicit && pid <= 1 {
+            return Ok(None);
+        }
+        if pid == 0 || pid > i32::MAX as u32 || excluded_pids.contains(&pid) {
+            bail!(
+                "session PID must identify another process (1..={})",
+                i32::MAX
+            );
+        }
+        if explicit {
+            let started_at = inspect(pid as libc::pid_t)
+                .with_context(|| format!("cannot inspect session PID {pid}"))?
+                .with_context(|| format!("session PID {pid} has already exited"))?;
+            Ok(Some(Self {
+                pid: pid as libc::pid_t,
+                started_at,
+            }))
+        } else {
+            // Inferred owners must not break launches when process inspection
+            // is restricted; fall back to Unix socket EOF tracking if needed.
+            match inspect(pid as libc::pid_t) {
+                Ok(Some(started_at)) => Ok(Some(Self {
+                    pid: pid as libc::pid_t,
+                    started_at,
+                })),
+                Ok(None) => bail!("session PID {pid} has already exited"),
+                Err(_) => Ok(None),
+            }
+        }
+    }
+
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid as u32
+    }
+
+    pub(crate) fn has_ended(&self) -> bool {
+        self.has_ended_with(process_start_time)
+    }
+
+    fn has_ended_with(
+        &self,
+        inspect: impl FnOnce(libc::pid_t) -> io::Result<Option<(u64, u64)>>,
+    ) -> bool {
+        // Permission or transient inspection errors are not evidence of death.
+        // A missing/zombie process or a changed start time is conclusive.
+        matches!(inspect(self.pid), Ok(current) if current != Some(self.started_at))
+    }
+}
+
+/// Start once, before index initialization. An explicit owner takes precedence
+/// over a later default start from the MCP transport entry point.
 pub(crate) fn spawn_session_handler(session_pid: Option<u32>) -> Result<()> {
     let mut started = HANDLER_STARTED.lock().unwrap();
     if *started {
@@ -370,6 +454,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn process_owner_rejects_excluded_or_missing_explicit_pids() {
+        assert!(ProcessOwner::capture_with(Some(0), true, &[], |_| Ok(Some((1, 1)))).is_err());
+        assert!(ProcessOwner::capture_with(Some(42), true, &[42], |_| Ok(Some((1, 1)))).is_err());
+        assert!(ProcessOwner::capture_with(Some(99), true, &[], |_| Ok(None)).is_err());
+        assert!(ProcessOwner::capture_with(None, true, &[], |_| Ok(Some((1, 1)))).is_err());
+    }
+
+    #[test]
+    fn process_owner_handles_inferred_init_and_uninspectable_parents() -> Result<()> {
+        assert!(ProcessOwner::capture_with(Some(1), false, &[], |_| Ok(Some((1, 1))))?.is_none());
+        assert!(
+            ProcessOwner::capture_with(Some(50), false, &[], |_| {
+                Err(io::Error::from_raw_os_error(libc::EPERM))
+            })?
+            .is_none()
+        );
+        let owner = ProcessOwner::capture_with(Some(50), false, &[], |_| Ok(Some((10, 20))))?
+            .expect("inspectable inferred owner");
+        assert_eq!(owner.pid(), 50);
+        assert!(!owner.has_ended_with(|_| Ok(Some((10, 20)))));
+        assert!(owner.has_ended_with(|_| Ok(Some((10, 21)))));
+        assert!(owner.has_ended_with(|_| Ok(None)));
+        assert!(!owner.has_ended_with(|_| Err(io::Error::from_raw_os_error(libc::EPERM))));
+        Ok(())
     }
 
     #[test]

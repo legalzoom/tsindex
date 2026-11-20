@@ -53,54 +53,91 @@ extern "C" fn handle_termination_signal(_sig: libc::c_int) {
     }
 }
 
+const SUPERVISOR_SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGCHLD];
+
+fn supervisor_signal_set() -> libc::sigset_t {
+    let mut set = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut set);
+        for signal in SUPERVISOR_SIGNALS {
+            libc::sigaddset(&mut set, signal);
+        }
+    }
+    set
+}
+
+fn default_signal_action() -> libc::sigaction {
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = libc::SIG_DFL;
+    unsafe { libc::sigemptyset(&mut action.sa_mask) };
+    action
+}
+
 struct SignalGuard {
-    prev_term: libc::sigaction,
-    prev_int: libc::sigaction,
+    previous_actions: Vec<(libc::c_int, libc::sigaction)>,
+    previous_mask: libc::sigset_t,
     _wake_holder: UnixStream,
 }
 
 impl SignalGuard {
     fn install(wake_writer: UnixStream) -> Result<Self> {
         wake_writer.set_nonblocking(true)?;
+        let signals = supervisor_signal_set();
+        let mut previous_mask = unsafe { std::mem::zeroed() };
+        // A launcher can ignore or block these signals across exec. Install
+        // dispositions before unblocking, while new threads still inherit
+        // this one normalized mask.
+        let rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &signals, &mut previous_mask) };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc))
+                .context("failed to block supervisor signals");
+        }
         SIGNAL_STOP.store(false, Ordering::Release);
         SIGNAL_WAKE_FD.store(wake_writer.as_raw_fd(), Ordering::Release);
-
-        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-        action.sa_sigaction = handle_termination_signal as *const () as usize;
-        action.sa_flags = libc::SA_RESTART;
-        unsafe {
-            libc::sigemptyset(&mut action.sa_mask);
-        }
-
-        let mut prev_term: libc::sigaction = unsafe { std::mem::zeroed() };
-        let mut prev_int: libc::sigaction = unsafe { std::mem::zeroed() };
-        if unsafe { libc::sigaction(libc::SIGTERM, &action, &mut prev_term) } != 0 {
-            SIGNAL_WAKE_FD.store(-1, Ordering::Release);
-            return Err(io::Error::last_os_error()).context("failed to install SIGTERM handler");
-        }
-        if unsafe { libc::sigaction(libc::SIGINT, &action, &mut prev_int) } != 0 {
-            unsafe {
-                libc::sigaction(libc::SIGTERM, &prev_term, std::ptr::null_mut());
-            }
-            SIGNAL_WAKE_FD.store(-1, Ordering::Release);
-            return Err(io::Error::last_os_error()).context("failed to install SIGINT handler");
-        }
-        Ok(Self {
-            prev_term,
-            prev_int,
+        let mut guard = Self {
+            previous_actions: Vec::with_capacity(SUPERVISOR_SIGNALS.len()),
+            previous_mask,
             _wake_holder: wake_writer,
-        })
+        };
+        for signal in SUPERVISOR_SIGNALS {
+            let mut action = default_signal_action();
+            if signal != libc::SIGCHLD {
+                action.sa_sigaction = handle_termination_signal as *const () as usize;
+                action.sa_flags = libc::SA_RESTART;
+            }
+            // SIG_DFL with SA_NOCLDWAIT cleared preserves the waitable worker
+            // leader. Group shutdown depends on that PID remaining reserved.
+            let mut previous = unsafe { std::mem::zeroed() };
+            if unsafe { libc::sigaction(signal, &action, &mut previous) } != 0 {
+                return Err(io::Error::last_os_error())
+                    .context("failed to install supervisor signal disposition");
+            }
+            guard.previous_actions.push((signal, previous));
+        }
+        let rc =
+            unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &signals, std::ptr::null_mut()) };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc))
+                .context("failed to unblock supervisor signals");
+        }
+        Ok(guard)
     }
 }
 
 impl Drop for SignalGuard {
     fn drop(&mut self) {
+        // Also rolls back partial setup. Restore the launcher's mask only
+        // after returning every disposition to the state it supplied.
+        let signals = supervisor_signal_set();
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &signals, std::ptr::null_mut()) };
         SIGNAL_WAKE_FD.store(-1, Ordering::Release);
-        unsafe {
-            libc::sigaction(libc::SIGTERM, &self.prev_term, std::ptr::null_mut());
-            libc::sigaction(libc::SIGINT, &self.prev_int, std::ptr::null_mut());
+        for (signal, previous) in self.previous_actions.iter().rev() {
+            unsafe { libc::sigaction(*signal, previous, std::ptr::null_mut()) };
         }
         SIGNAL_STOP.store(false, Ordering::Release);
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous_mask, std::ptr::null_mut())
+        };
     }
 }
 
@@ -1279,9 +1316,22 @@ fn spawn_worker(
             if worker_groups && libc::setpgid(0, 0) != 0 {
                 return Err(io::Error::last_os_error());
             }
-            // Reset the inherited daemon handler before parent-death delivery.
-            libc::signal(libc::SIGTERM, libc::SIG_DFL);
-            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            // A fork preserves the launching thread's mask. Reset the worker's
+            // dispositions before permitting termination or parent-death delivery.
+            let action = default_signal_action();
+            for signal in SUPERVISOR_SIGNALS {
+                if libc::sigaction(signal, &action, std::ptr::null_mut()) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            if libc::sigprocmask(
+                libc::SIG_UNBLOCK,
+                &supervisor_signal_set(),
+                std::ptr::null_mut(),
+            ) < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
             #[cfg(target_os = "linux")]
             {
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) != 0 {

@@ -545,85 +545,139 @@ fn managed_proxy_reports_worker_crash_after_readiness() -> Result<()> {
 #[cfg(target_os = "linux")]
 #[test]
 fn managed_proxy_exits_when_daemon_stops_with_stdout_full() -> Result<()> {
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::thread;
     use std::time::{Duration, Instant};
 
-    struct Proxy(std::process::Child);
+    struct Proxy {
+        child: std::process::Child,
+        writer: Option<thread::JoinHandle<std::process::ChildStdin>>,
+    }
     impl Drop for Proxy {
         fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            // Killing the proxy releases a writer blocked on its stdin. Join
+            // even after an assertion fails so no fixture thread survives.
+            if let Some(writer) = self.writer.take() {
+                let _ = writer.join();
+            }
         }
     }
 
     let daemon = common::TestDaemon::start()?;
     let dir = tempdir()?;
     fixture(dir.path())?;
-    let mut proxy = Proxy(
-        Command::new(BIN)
-            .arg("--socket")
-            .arg(&daemon.socket)
-            .arg("--root")
-            .arg(dir.path())
-            .args(["--no-refresh", "serve", "--mcp", "--via-daemon"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?,
-    );
-    let mut stdin = proxy.0.stdin.take().unwrap();
-    let writer = thread::spawn(move || {
-        // Tool schemas fill a normal pipe without requiring a large fixture.
-        for id in 0..1024 {
-            if writeln!(
-                stdin,
-                "{}",
-                serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/list"})
-            )
-            .is_err()
-            {
+    for limit in [None, Some(4096)] {
+        let mut raw = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(raw.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: pipe2 succeeded and transfers two distinct descriptors.
+        let stdout = unsafe { OwnedFd::from_raw_fd(raw[0]) };
+        let observer = unsafe { OwnedFd::from_raw_fd(raw[1]) };
+        if let Some(limit) = limit {
+            // The kernel rounds the requested capacity up to its page size.
+            let actual = unsafe { libc::fcntl(observer.as_raw_fd(), libc::F_SETPIPE_SZ, limit) };
+            assert!(actual >= limit, "failed to set stdout pipe capacity");
+        }
+        let mut proxy = Proxy {
+            child: Command::new(BIN)
+                .arg("--socket")
+                .arg(&daemon.socket)
+                .arg("--root")
+                .arg(dir.path())
+                .args(["--no-refresh", "serve", "--mcp", "--via-daemon"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::from(observer.try_clone()?))
+                .stderr(Stdio::null())
+                .spawn()?,
+            writer: None,
+        };
+        let mut stdin = proxy.child.stdin.take().unwrap();
+        proxy.writer = Some(thread::spawn(move || {
+            // Tool schemas fill a normal pipe without requiring a large fixture.
+            for id in 0..1024 {
+                if writeln!(
+                    stdin,
+                    "{}",
+                    serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/list"})
+                )
+                .is_err()
+                {
+                    break;
+                }
+            }
+            // The harness keeps stdin open while neglecting output. Retain its
+            // handle in the thread result until the proxy has exited.
+            stdin
+        }));
+        daemon.wait_active_sessions(1, Duration::from_secs(5))?;
+        let capacity = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETPIPE_SZ) };
+        assert!(capacity > 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                proxy.child.try_wait()?.is_none(),
+                "proxy exited before stdout backpressure"
+            );
+            let mut available: libc::c_int = 0;
+            assert_eq!(
+                unsafe { libc::ioctl(stdout.as_raw_fd(), libc::FIONREAD, &mut available) },
+                0
+            );
+            // Page fragmentation can stop writes before the byte capacity is
+            // reached. Observe readiness on a write descriptor, matching the
+            // proxy's POLLOUT wait, without adding any data to its output.
+            let mut writing = libc::pollfd {
+                fd: observer.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut writing, 1, 0) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error.into());
+            }
+            assert_eq!(
+                writing.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL),
+                0
+            );
+            if available > 0 && ready == 0 {
+                eprintln!("stdout backpressured with {available}/{capacity} bytes queued");
                 break;
             }
+            assert!(
+                Instant::now() < deadline,
+                "proxy did not encounter stdout backpressure ({available}/{capacity} bytes): {}",
+                daemon.read_log()
+            );
+            thread::sleep(Duration::from_millis(20));
         }
-        // The test models a harness that keeps stdin open while neglecting
-        // output. Retain its handle in the thread result until teardown ends.
-        stdin
-    });
-    daemon.wait_active_sessions(1, Duration::from_secs(5))?;
-    let fd = proxy.0.stdout.as_ref().unwrap().as_raw_fd();
-    let capacity = unsafe { libc::fcntl(fd, libc::F_GETPIPE_SZ) };
-    assert!(capacity > 0);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let mut available: libc::c_int = 0;
+        drop(observer);
+        let (sessions, _) = daemon.client()?.list_sessions(false)?;
+        assert_eq!(sessions.len(), 1);
+        let worker_pid = sessions[0].worker_pid;
+        assert!(worker_pid > 1);
+        daemon.client()?.kill_all()?;
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while proxy.child.try_wait()?.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "full stdout prevented proxy teardown"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        proxy.writer.take().unwrap().join().unwrap();
+        daemon.wait_active_sessions(0, Duration::from_secs(3))?;
+        assert_eq!(unsafe { libc::kill(worker_pid as i32, 0) }, -1);
         assert_eq!(
-            unsafe { libc::ioctl(fd, libc::FIONREAD, &mut available) },
-            0
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "worker was not reaped"
         );
-        // Linux accounts pipe capacity in pages, including partially filled
-        // pages. A remaining partial page can already block the next write.
-        if available >= (capacity - 4096).max(1) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "proxy did not fill stdout ({available}/{capacity} bytes): {}",
-            daemon.read_log()
-        );
-        thread::sleep(Duration::from_millis(20));
     }
-    daemon.client()?.kill_all()?;
-    let deadline = Instant::now() + Duration::from_secs(6);
-    while proxy.0.try_wait()?.is_none() {
-        assert!(
-            Instant::now() < deadline,
-            "full stdout prevented proxy teardown"
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
-    writer.join().unwrap();
-    daemon.wait_active_sessions(0, Duration::from_secs(3))?;
     Ok(())
 }
 

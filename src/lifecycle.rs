@@ -99,8 +99,6 @@ impl SessionLifecycle {
     }
 }
 
-/// Start once, before index initialization. An explicit owner takes precedence
-/// over a later default start from the MCP transport entry point.
 /// Process-identity handle monitored by the orchestrator's centralized
 /// session sweeper. Unlike [`SessionLifecycle`], this does not rely on
 /// `getppid()` because the orchestrator is not a child of the harness.
@@ -111,12 +109,56 @@ pub(crate) struct ProcessOwner {
 }
 
 impl ProcessOwner {
-    pub(crate) fn capture(
-        owner_pid: Option<u32>,
+    pub(crate) fn for_peer(
+        peer_pid: u32,
+        requested: Option<u32>,
         explicit: bool,
-        excluded_pids: &[u32],
     ) -> Result<Option<Self>> {
-        Self::capture_with(owner_pid, explicit, excluded_pids, process_start_time)
+        let excluded = [peer_pid, std::process::id()];
+        #[cfg(target_os = "linux")]
+        let current_view = procfs_uses_daemon_pid_namespace().unwrap_or(false);
+        if explicit {
+            #[cfg(target_os = "linux")]
+            {
+                // Supplied numbers belong to the proxy's PID namespace. The
+                // same number can identify a different process in the daemon.
+                const GUIDANCE: &str = "managed --session-pid requires a verifiably shared PID namespace; use direct `tsindex serve --mcp --session-pid PID`";
+                if !current_view || !peer_shares_pid_namespace(peer_pid).context(GUIDANCE)? {
+                    bail!("{GUIDANCE}");
+                }
+            }
+            return Self::capture_explicit_with(requested, &excluded, process_start_time).map(Some);
+        }
+        #[cfg(target_os = "linux")]
+        if !current_view {
+            return Ok(None);
+        }
+        Ok(Self::infer_parent_with(peer_pid, &excluded, process_info))
+    }
+
+    fn infer_parent_with(
+        peer_pid: u32,
+        excluded: &[u32],
+        mut inspect: impl FnMut(libc::pid_t) -> io::Result<Option<ProcessInfo>>,
+    ) -> Option<Self> {
+        // SO_PEERCRED/LOCAL_PEERPID identifies the proxy in the daemon's PID
+        // namespace. Resolve its parent there, including for nested harnesses.
+        let peer_pid = libc::pid_t::try_from(peer_pid).ok()?;
+        let peer = inspect(peer_pid).ok().flatten()?;
+        if peer.parent <= 1 || excluded.contains(&peer.parent) {
+            return None;
+        }
+        let pid = peer.parent.try_into().ok()?;
+        let parent = inspect(pid).ok().flatten()?;
+        // Reparenting or PID reuse between lookups invalidates this inference.
+        // On any uncertainty the proxy connection still owns the session.
+        if parent.started_at > peer.started_at || inspect(peer_pid).ok().flatten() != Some(peer) {
+            return None;
+        }
+        Some(Self {
+            pid,
+            started_at: parent.started_at,
+        })
     }
 
     /// A daemon may disappear after answering a control ping. Preserve
@@ -146,39 +188,14 @@ impl ProcessOwner {
         Ok(pid as libc::pid_t)
     }
 
-    fn capture_with(
+    fn capture_explicit_with(
         owner_pid: Option<u32>,
-        explicit: bool,
         excluded_pids: &[u32],
         inspect: impl FnOnce(libc::pid_t) -> io::Result<Option<(u64, u64)>>,
-    ) -> Result<Option<Self>> {
-        let Some(pid) = owner_pid else {
-            if explicit {
-                bail!(
-                    "session PID must identify another process (1..={})",
-                    i32::MAX
-                );
-            }
-            return Ok(None);
-        };
-        if !explicit && pid <= 1 {
-            return Ok(None);
-        }
-        let pid = Self::validate_pid(pid, excluded_pids)?;
-        if explicit {
-            let started_at = inspect(pid)
-                .with_context(|| format!("cannot inspect session PID {pid}"))?
-                .with_context(|| format!("session PID {pid} has already exited"))?;
-            Ok(Some(Self { pid, started_at }))
-        } else {
-            // Inferred owners must not break launches when process inspection
-            // is restricted; fall back to Unix socket EOF tracking if needed.
-            match inspect(pid) {
-                Ok(Some(started_at)) => Ok(Some(Self { pid, started_at })),
-                Ok(None) => bail!("session PID {pid} has already exited"),
-                Err(_) => Ok(None),
-            }
-        }
+    ) -> Result<Self> {
+        let pid = owner_pid.context("--session-pid requires an owning process ID")?;
+        Self::capture_if_running_with(pid, excluded_pids, inspect)?
+            .with_context(|| format!("session PID {pid} has already exited"))
     }
 
     pub(crate) fn pid(&self) -> u32 {
@@ -230,8 +247,45 @@ pub(crate) fn spawn_session_handler(session_pid: Option<u32>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessInfo {
+    parent: u32,
+    started_at: (u64, u64),
+}
+
 fn process_start_time(pid: libc::pid_t) -> io::Result<Option<(u64, u64)>> {
+    Ok(process_info(pid)?.map(|info| info.started_at))
+}
+
+#[cfg(target_os = "linux")]
+fn procfs_uses_daemon_pid_namespace() -> io::Result<bool> {
+    // NStgid starts in the namespace that mounted procfs and ends in the
+    // process's own namespace. An inherited host mount cannot safely resolve
+    // the kernel's peer PID for a daemon in a nested namespace.
+    // https://man7.org/linux/man-pages/man5/proc_pid_status.5.html
+    let status = std::fs::read("/proc/self/status")?;
+    let entry = status
+        .split(|&b| b == b'\n')
+        .find_map(|line| line.strip_prefix(b"NStgid:"))
+        .ok_or_else(|| io::Error::other("procfs does not report PID namespaces"))?;
+    let entry = std::str::from_utf8(entry).map_err(io::Error::other)?;
+    let mut pids = entry.split_ascii_whitespace();
+    Ok(
+        pids.next().and_then(|pid| pid.parse::<u32>().ok()) == Some(std::process::id())
+            && pids.next().is_none(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn peer_shares_pid_namespace(peer_pid: u32) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let ours = std::fs::metadata("/proc/self/ns/pid")?;
+    let peer = std::fs::metadata(format!("/proc/{peer_pid}/ns/pid"))?;
+    Ok(ours.dev() == peer.dev() && ours.ino() == peer.ino())
+}
+
+#[cfg(target_os = "macos")]
+fn process_info(pid: libc::pid_t) -> io::Result<Option<ProcessInfo>> {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
     let read = unsafe {
@@ -255,11 +309,14 @@ fn process_start_time(pid: libc::pid_t) -> io::Result<Option<(u64, u64)>> {
         return Err(io::Error::other("incomplete process information"));
     }
     let info = unsafe { info.assume_init() };
-    Ok((info.pbi_status != libc::SZOMB).then_some((info.pbi_start_tvsec, info.pbi_start_tvusec)))
+    Ok((info.pbi_status != libc::SZOMB).then_some(ProcessInfo {
+        parent: info.pbi_ppid,
+        started_at: (info.pbi_start_tvsec, info.pbi_start_tvusec),
+    }))
 }
 
 #[cfg(target_os = "linux")]
-fn process_start_time(pid: libc::pid_t) -> io::Result<Option<(u64, u64)>> {
+fn process_info(pid: libc::pid_t) -> io::Result<Option<ProcessInfo>> {
     match std::fs::read(format!("/proc/{pid}/stat")) {
         Ok(stat) => parse_proc_stat(&stat),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -268,7 +325,7 @@ fn process_start_time(pid: libc::pid_t) -> io::Result<Option<(u64, u64)>> {
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn parse_proc_stat(stat: &[u8]) -> io::Result<Option<(u64, u64)>> {
+fn parse_proc_stat(stat: &[u8]) -> io::Result<Option<ProcessInfo>> {
     // comm (field 2) contains arbitrary bytes; Linux can even truncate a UTF-8
     // name mid-character. Decode only the fields after its final ') '.
     let end = stat
@@ -279,9 +336,13 @@ fn parse_proc_stat(stat: &[u8]) -> io::Result<Option<(u64, u64)>> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let mut fields = tail.split_whitespace();
     let state = fields.next();
-    // After state (3), num_threads is field 20 and starttime is field 22.
+    let parent = fields
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| io::Error::other("missing process parent"))?;
+    // After ppid (4), num_threads is field 20 and starttime is field 22.
     let threads = fields
-        .nth(16)
+        .nth(15)
         .and_then(|field| field.parse::<u64>().ok())
         .ok_or_else(|| io::Error::other("missing process thread count"))?;
     let started_at = fields
@@ -291,15 +352,21 @@ fn parse_proc_stat(stat: &[u8]) -> io::Result<Option<(u64, u64)>> {
     // A zombie leader still represents a live process when workers remain.
     // The count includes the leader; only an entirely exited group ends ownership.
     let alive = !matches!(state, Some("Z" | "X" | "x")) || threads > 1;
-    Ok(alive.then_some((started_at, 0)))
+    Ok(alive.then_some(ProcessInfo {
+        parent,
+        started_at: (started_at, 0),
+    }))
 }
 
 // Keep the existing Unix support outside the macOS/Linux release targets.
 // These platforms can check liveness but do not have a start-time fingerprint.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn process_start_time(pid: libc::pid_t) -> io::Result<Option<(u64, u64)>> {
+fn process_info(pid: libc::pid_t) -> io::Result<Option<ProcessInfo>> {
     if unsafe { libc::kill(pid, 0) } == 0 {
-        return Ok(Some((0, 0)));
+        return Ok(Some(ProcessInfo {
+            parent: 0,
+            started_at: (0, 0),
+        }));
     }
     let error = io::Error::last_os_error();
     if error.raw_os_error() == Some(libc::ESRCH) {
@@ -474,16 +541,18 @@ mod tests {
 
     #[test]
     fn process_owner_rejects_excluded_or_missing_explicit_pids() {
-        assert!(ProcessOwner::capture_with(Some(0), true, &[], |_| Ok(Some((1, 1)))).is_err());
-        assert!(ProcessOwner::capture_with(Some(42), true, &[42], |_| Ok(Some((1, 1)))).is_err());
-        assert!(ProcessOwner::capture_with(Some(99), true, &[], |_| Ok(None)).is_err());
-        assert!(ProcessOwner::capture_with(None, true, &[], |_| Ok(Some((1, 1)))).is_err());
+        assert!(ProcessOwner::capture_explicit_with(Some(0), &[], |_| Ok(Some((1, 1)))).is_err());
+        assert!(
+            ProcessOwner::capture_explicit_with(Some(42), &[42], |_| Ok(Some((1, 1)))).is_err()
+        );
+        assert!(ProcessOwner::capture_explicit_with(Some(99), &[], |_| Ok(None)).is_err());
+        assert!(ProcessOwner::capture_explicit_with(None, &[], |_| Ok(Some((1, 1)))).is_err());
     }
 
     #[test]
     fn process_owner_control_capture_treats_exited_process_as_absent() -> Result<()> {
         assert!(ProcessOwner::capture_if_running_with(99, &[], |_| Ok(None))?.is_none());
-        assert!(ProcessOwner::capture_with(Some(99), true, &[], |_| Ok(None)).is_err());
+        assert!(ProcessOwner::capture_explicit_with(Some(99), &[], |_| Ok(None)).is_err());
         Ok(())
     }
 
@@ -505,22 +574,70 @@ mod tests {
     }
 
     #[test]
-    fn process_owner_handles_inferred_init_and_uninspectable_parents() -> Result<()> {
-        assert!(ProcessOwner::capture_with(Some(1), false, &[], |_| Ok(Some((1, 1))))?.is_none());
-        assert!(
-            ProcessOwner::capture_with(Some(50), false, &[], |_| {
-                Err(io::Error::from_raw_os_error(libc::EPERM))
-            })?
-            .is_none()
-        );
-        let owner = ProcessOwner::capture_with(Some(50), false, &[], |_| Ok(Some((10, 20))))?
-            .expect("inspectable inferred owner");
+    fn inferred_parent_uses_verified_peer_and_socket_fallback() {
+        let peer = ProcessInfo {
+            parent: 50,
+            started_at: (10, 30),
+        };
+        let parent = ProcessInfo {
+            parent: 1,
+            started_at: (10, 20),
+        };
+        let owner = ProcessOwner::infer_parent_with(71, &[71, 99], |pid| match pid {
+            71 => Ok(Some(peer)),
+            50 => Ok(Some(parent)),
+            _ => panic!("unexpected PID {pid}"),
+        })
+        .expect("inspectable inferred parent");
         assert_eq!(owner.pid(), 50);
         assert!(!owner.has_ended_with(|_| Ok(Some((10, 20)))));
         assert!(owner.has_ended_with(|_| Ok(Some((10, 21)))));
         assert!(owner.has_ended_with(|_| Ok(None)));
         assert!(!owner.has_ended_with(|_| Err(io::Error::from_raw_os_error(libc::EPERM))));
-        Ok(())
+
+        for parent_pid in [0, 1, 71, 99] {
+            assert!(
+                ProcessOwner::infer_parent_with(71, &[71, 99], |pid| {
+                    assert_eq!(pid, 71);
+                    Ok(Some(ProcessInfo {
+                        parent: parent_pid,
+                        ..peer
+                    }))
+                })
+                .is_none()
+            );
+        }
+        for parent_info in [
+            Ok(None),
+            Err(io::Error::from_raw_os_error(libc::EPERM)),
+            Ok(Some(ProcessInfo {
+                started_at: (11, 0),
+                ..parent
+            })),
+        ] {
+            let mut parent_info = Some(parent_info);
+            assert!(
+                ProcessOwner::infer_parent_with(71, &[], |pid| match pid {
+                    71 => Ok(Some(peer)),
+                    50 => parent_info.take().unwrap(),
+                    _ => unreachable!(),
+                })
+                .is_none()
+            );
+        }
+        let mut passes = 0;
+        assert!(
+            ProcessOwner::infer_parent_with(71, &[], |pid| {
+                passes += 1;
+                Ok(Some(match (pid, passes) {
+                    (71, 1) => peer,
+                    (50, 2) => parent,
+                    (71, 3) => ProcessInfo { parent: 1, ..peer },
+                    _ => unreachable!(),
+                }))
+            })
+            .is_none()
+        );
     }
 
     #[test]
@@ -528,6 +645,11 @@ mod tests {
         let pid = std::process::id() as libc::pid_t;
         let first = process_start_time(pid)?.expect("test process is alive");
         assert_eq!(process_start_time(pid)?, Some(first));
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert_eq!(
+            process_info(pid)?.unwrap().parent,
+            unsafe { libc::getppid() } as u32
+        );
         Ok(())
     }
 
@@ -539,17 +661,32 @@ mod tests {
                 "0 ".repeat(16)
             )
         }
-        assert_eq!(parse_proc_stat(stat("S", 1).as_bytes())?, Some((98765, 0)));
+        assert_eq!(
+            parse_proc_stat(stat("S", 1).as_bytes())?,
+            Some(ProcessInfo {
+                parent: 0,
+                started_at: (98765, 0)
+            })
+        );
         for state in ["Z", "X", "x"] {
             assert_eq!(parse_proc_stat(stat(state, 1).as_bytes())?, None);
             assert_eq!(
                 parse_proc_stat(stat(state, 2).as_bytes())?,
-                Some((98765, 0))
+                Some(ProcessInfo {
+                    parent: 0,
+                    started_at: (98765, 0)
+                })
             );
         }
         let mut non_utf8 = stat("S", 1).into_bytes();
         non_utf8[5] = 0xff;
-        assert_eq!(parse_proc_stat(&non_utf8)?, Some((98765, 0)));
+        assert_eq!(
+            parse_proc_stat(&non_utf8)?,
+            Some(ProcessInfo {
+                parent: 0,
+                started_at: (98765, 0)
+            })
+        );
         assert!(parse_proc_stat(b"malformed").is_err());
         assert!(parse_proc_stat(b"123 (name) S 0").is_err());
         for started_at in ["-1", "18446744073709551616", "unknown"] {

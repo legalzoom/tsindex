@@ -5,7 +5,7 @@ mod common;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,8 +23,20 @@ impl Drop for SandboxProcess {
     }
 }
 
-#[test]
-fn direct_mcp_preserves_harness_filesystem_sandbox() -> Result<()> {
+impl SandboxProcess {
+    fn finish(mut self) -> Result<Output> {
+        let child = self.0.as_mut().context("sandbox child")?;
+        drop(child.stdin.take());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while child.try_wait()?.is_none() {
+            anyhow::ensure!(Instant::now() < deadline, "sandbox process did not exit");
+            thread::sleep(Duration::from_millis(25));
+        }
+        Ok(self.0.take().unwrap().wait_with_output()?)
+    }
+}
+
+fn sandbox_available() -> Result<bool> {
     // Some CI hosts disable unprivileged user namespaces. Probe the actual
     // boundary before starting fixtures so an unavailable runtime is explicit.
     let probe = Command::new("bwrap")
@@ -39,17 +51,23 @@ fn direct_mcp_preserves_harness_filesystem_sandbox() -> Result<()> {
         ])
         .output();
     match probe {
-        Ok(output) if output.status.success() => {}
+        Ok(output) if output.status.success() => Ok(true),
         other => {
             anyhow::ensure!(
                 std::env::var("TSINDEX_REQUIRE_SANDBOX").as_deref() != Ok("1"),
                 "required sandbox boundary is unavailable: {other:?}"
             );
             eprintln!("sandbox test skipped because bubblewrap is unavailable: {other:?}");
-            return Ok(());
+            Ok(false)
         }
     }
+}
 
+#[test]
+fn direct_mcp_preserves_harness_filesystem_sandbox() -> Result<()> {
+    if !sandbox_available()? {
+        return Ok(());
+    }
     let daemon = common::TestDaemon::start()?;
     let host_network_namespace = fs::read_link("/proc/self/ns/net")?;
     let dir = tempfile::tempdir()?;
@@ -147,15 +165,7 @@ fn direct_mcp_preserves_harness_filesystem_sandbox() -> Result<()> {
             writeln!(stdin, "{request}")?;
         }
     }
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while child.0.as_mut().unwrap().try_wait()?.is_none() {
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "sandbox MCP session did not exit"
-        );
-        thread::sleep(Duration::from_millis(25));
-    }
-    let output = child.0.take().unwrap().wait_with_output()?;
+    let output = child.finish()?;
     assert!(
         output.status.success(),
         "{}",
@@ -205,5 +215,89 @@ fn direct_mcp_preserves_harness_filesystem_sandbox() -> Result<()> {
     );
     daemon.wait_active_sessions(0, Duration::from_secs(1))?;
     assert_eq!(daemon.ping()?.total_sessions_started, 0);
+    Ok(())
+}
+
+#[test]
+fn trusted_managed_proxy_in_a_pid_namespace_tracks_its_actual_parent() -> Result<()> {
+    if !sandbox_available()? {
+        return Ok(());
+    }
+    let daemon = common::TestDaemon::start()?;
+    let workspace = tempfile::tempdir()?;
+    let proxy = |explicit: bool| -> Result<SandboxProcess> {
+        // Keep the wrapper as the proxy's real parent. Its $$ is meaningful
+        // inside this PID namespace and may name another process on the host.
+        let wrapper = if explicit {
+            r#""$@" --session-pid "$$"; exit $?"#
+        } else {
+            r#""$@"; exit $?"#
+        };
+        let child = Command::new("bwrap")
+            .args([
+                "--unshare-user",
+                "--unshare-pid",
+                "--die-with-parent",
+                "--ro-bind",
+                "/",
+                "/",
+                "--proc",
+                "/proc",
+                "/bin/sh",
+                "-c",
+                wrapper,
+                "harness",
+            ])
+            .arg(common::BIN)
+            .arg("--socket")
+            .arg(&daemon.socket)
+            .arg("--root")
+            .arg(workspace.path())
+            .args(["--no-refresh", "serve", "--mcp", "--via-daemon"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        Ok(SandboxProcess(Some(child)))
+    };
+    let child = proxy(false)?;
+    daemon.wait_active_sessions(1, Duration::from_secs(8))?;
+    let sessions = daemon.client()?.list_sessions(false)?.0;
+    let session = sessions.first().context("managed session")?;
+    let status = fs::read_to_string(format!("/proc/{}/status", session.client_pid))?;
+    let parent = status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))
+        .context("missing kernel parent")?
+        .trim()
+        .parse::<u32>()?;
+    let namespace_depth = status
+        .lines()
+        .find_map(|line| line.strip_prefix("NStgid:"))
+        .context("missing kernel PID namespace")?
+        .split_ascii_whitespace()
+        .count();
+    anyhow::ensure!(namespace_depth > 1 && parent > 1);
+    anyhow::ensure!(
+        session.owner_pid == Some(parent),
+        "daemon did not track the host-visible wrapper PID"
+    );
+    let result = child.finish()?;
+    anyhow::ensure!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    daemon.wait_active_sessions(0, Duration::from_secs(5))?;
+
+    let result = proxy(true)?.finish()?;
+    let error = String::from_utf8_lossy(&result.stderr);
+    anyhow::ensure!(
+        !result.status.success()
+            && error.contains("shared PID namespace")
+            && error.contains("direct"),
+        "{error}"
+    );
+    anyhow::ensure!(daemon.ping()?.total_sessions_started == 1);
     Ok(())
 }

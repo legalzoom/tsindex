@@ -62,14 +62,6 @@ pub fn run_mcp_proxy(args: McpProxyArgs) -> Result<()> {
     stream.set_read_timeout(Some(STARTUP_IO_TIMEOUT + CONTROL_IO_TIMEOUT))?;
     stream.set_write_timeout(Some(CONTROL_IO_TIMEOUT))?;
 
-    let (owner_pid, owner_explicit) = match args.session_pid {
-        Some(pid) => (Some(pid), true),
-        None => {
-            let ppid = unsafe { libc::getppid() };
-            ((ppid > 1).then_some(ppid as u32), false)
-        }
-    };
-
     let request = DaemonRequest::StartSession(StartSessionRequest {
         protocol: PROTOCOL_VERSION,
         client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -78,8 +70,8 @@ pub fn run_mcp_proxy(args: McpProxyArgs) -> Result<()> {
         languages: args.languages,
         no_refresh: args.no_refresh,
         client_pid: std::process::id(),
-        owner_pid,
-        owner_explicit,
+        owner_pid: args.session_pid,
+        owner_explicit: args.session_pid.is_some(),
     });
     write_json_line(&mut stream, &request)?;
 

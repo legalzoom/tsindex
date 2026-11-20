@@ -1025,8 +1025,7 @@ fn handle_start_session(
         })?;
         return Ok(());
     };
-    let excluded = [client_pid, std::process::id()];
-    let owner = match ProcessOwner::capture(req.owner_pid, req.owner_explicit, &excluded) {
+    let owner = match ProcessOwner::for_peer(client_pid, req.owner_pid, req.owner_explicit) {
         Ok(owner) => owner,
         Err(error) => {
             write_json_line(

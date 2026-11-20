@@ -427,7 +427,7 @@ pub struct ServeCommand {
     #[arg(
         long,
         value_parser = clap::value_parser!(u32).range(1..=i32::MAX as i64),
-        help = "Owning session PID (must be inspectable). Managed MCP tracks it in the daemon; direct MCP and HTTP track it locally."
+        help = "Inspectable owning session PID. Managed MCP requires the daemon's PID namespace. Direct MCP and HTTP track this PID locally."
     )]
     session_pid: Option<u32>,
 }

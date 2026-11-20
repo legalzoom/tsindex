@@ -777,7 +777,7 @@ fn manage_daemon(cli: &Cli, command: &DaemonCommand) -> Result<()> {
             service::check_socket(&paths)
         }
         DaemonAction::Start => {
-            let paths = DaemonPaths::resolve(cli.socket.as_deref())?;
+            let paths = service::client_paths(cli.socket.as_deref())?;
             let status = service::start_daemon(&paths, cli.socket.as_deref())?;
             if cli.json {
                 print_json(&status)
@@ -792,7 +792,7 @@ fn manage_daemon(cli: &Cli, command: &DaemonCommand) -> Result<()> {
             }
         }
         DaemonAction::Stop => {
-            let paths = DaemonPaths::resolve(cli.socket.as_deref())?;
+            let paths = service::client_paths(cli.socket.as_deref())?;
             let stopped = service::stop_daemon(&paths)?;
             if cli.json {
                 print_json(&json!({
@@ -811,7 +811,7 @@ fn manage_daemon(cli: &Cli, command: &DaemonCommand) -> Result<()> {
             }
         }
         DaemonAction::Restart => {
-            let paths = DaemonPaths::resolve(cli.socket.as_deref())?;
+            let paths = service::client_paths(cli.socket.as_deref())?;
             let status = service::restart_daemon(&paths, cli.socket.as_deref())?;
             if cli.json {
                 print_json(&status)
@@ -826,9 +826,9 @@ fn manage_daemon(cli: &Cli, command: &DaemonCommand) -> Result<()> {
             }
         }
         DaemonAction::Status => {
-            let paths = DaemonPaths::resolve(cli.socket.as_deref())?;
+            let paths = service::client_paths(cli.socket.as_deref())?;
             let svc = service::inspect_service();
-            let live = DaemonClient::new(paths.clone()).ping().ok();
+            let live = service::probe_daemon(&paths)?;
             let cli_version = env!("CARGO_PKG_VERSION");
             if cli.json {
                 print_json(&json!({
@@ -876,7 +876,7 @@ fn manage_daemon(cli: &Cli, command: &DaemonCommand) -> Result<()> {
             }
         }
         DaemonAction::Sessions(args) => {
-            let paths = DaemonPaths::resolve(cli.socket.as_deref())?;
+            let paths = service::client_paths(cli.socket.as_deref())?;
             if let Some(id) = &args.id {
                 let session = DaemonClient::new(paths).session_detail(id)?;
                 return print_json(&session);
@@ -929,7 +929,7 @@ fn manage_daemon(cli: &Cli, command: &DaemonCommand) -> Result<()> {
             }
         }
         DaemonAction::Kill(args) => {
-            let paths = DaemonPaths::resolve(cli.socket.as_deref())?;
+            let paths = service::client_paths(cli.socket.as_deref())?;
             let client = DaemonClient::new(paths);
             let killed = if args.all {
                 client.kill_all()?
@@ -947,7 +947,7 @@ fn manage_daemon(cli: &Cli, command: &DaemonCommand) -> Result<()> {
             }
         }
         DaemonAction::Install(args) => {
-            let paths = DaemonPaths::resolve(cli.socket.as_deref())?;
+            let paths = service::client_paths(cli.socket.as_deref())?;
             let (svc, status) =
                 service::install_service(&paths, cli.socket.as_deref(), args.binary.as_deref())?;
             if cli.json {
@@ -971,7 +971,7 @@ fn manage_daemon(cli: &Cli, command: &DaemonCommand) -> Result<()> {
             }
         }
         DaemonAction::Uninstall => {
-            let paths = DaemonPaths::resolve(cli.socket.as_deref())?;
+            let paths = service::client_paths(cli.socket.as_deref())?;
             let removed = service::uninstall_service(&paths)?;
             if cli.json {
                 print_json(&json!({ "removed": removed }))

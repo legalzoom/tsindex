@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::daemon::{
-    CONTROL_IO_TIMEOUT, DaemonClient, DaemonPaths, DaemonRequest, DaemonResponse,
+    CONTROL_IO_TIMEOUT, DaemonClient, DaemonRequest, DaemonResponse,
     MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION, STARTUP_IO_TIMEOUT, SessionState,
     StartSessionRequest, connect_with_timeout, daemon_not_running_message, read_bounded_line,
     validate_private_dir, verify_server_credentials, write_json_line,
@@ -39,7 +39,7 @@ pub struct McpProxyArgs {
 ///
 /// Fails fast with an actionable message if the daemon is not running.
 pub fn run_mcp_proxy(args: McpProxyArgs) -> Result<()> {
-    let paths = DaemonPaths::resolve(args.socket.as_deref())?;
+    let paths = crate::daemon::service::client_paths(args.socket.as_deref())?;
     let root = absolutize(&args.root)?;
     let db = args.db.as_deref().map(absolutize).transpose()?;
 

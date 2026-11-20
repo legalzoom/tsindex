@@ -746,11 +746,11 @@ impl DaemonClient {
 
     pub fn connect(&self) -> Result<std::os::unix::net::UnixStream> {
         validate_private_dir(self.paths.socket_dir()?)?;
-        let stream =
-            connect_with_timeout(&self.paths.socket_path, CONTROL_IO_TIMEOUT).map_err(|error| {
-                anyhow!(
-                    "{} ({error})",
-                    daemon_not_running_message(&self.paths.socket_path)
+        let stream = connect_with_timeout(&self.paths.socket_path, CONTROL_IO_TIMEOUT)
+            .with_context(|| {
+                format!(
+                    "failed to connect to daemon at {}",
+                    self.paths.socket_path.display()
                 )
             })?;
         // Authenticate the service before disclosing workspace paths or commands.
@@ -1027,7 +1027,16 @@ mod tests {
         assert!(live_stream_endpoint(&path)?);
         drop(listener);
         assert!(fs::symlink_metadata(&path)?.file_type().is_socket());
-        assert!(!live_stream_endpoint(&path)?);
+        // Other unit tests can fork while this listener is open. Its inherited
+        // copy remains live until that child reaches exec.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while live_stream_endpoint(&path)? {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "listener remained live after close"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let start = Instant::now();
         let error = connect_with_timeout(&path, Duration::from_secs(2)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);

@@ -184,8 +184,8 @@ impl DaemonCore {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|&value| value > 0)
             .unwrap_or(DEFAULT_MAX_SESSIONS);
-        let worker_executable =
-            std::env::current_exe().context("failed to locate worker executable")?;
+        let worker_executable = crate::daemon::service::invocation_binary()
+            .context("failed to locate worker executable")?;
         // A random boot nonce prevents a stale destructive session ID from
         // selecting a different session after a daemon restart.
         let mut nonce = [0u8; 16];

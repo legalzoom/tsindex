@@ -44,6 +44,10 @@ jobs:
           TSINDEX_REQUIRE_SANDBOX: "1"
           TSINDEX_REQUIRE_SYSTEMD: "1"
         run: cargo test --locked
+      - name: Exercise installed daemon through the CLI
+        env:
+          TSINDEX_TEST_INSTALL: "1"
+        run: cargo test --locked --test service_activation installed_cli_controls_native_service -- --ignored --exact
       # Fetch the immutable writer independently: squash/rebase merges and
       # branch deletion can remove it from the main checkout's fetched history.
       - name: Checkout original overlay writer
@@ -112,7 +116,12 @@ jobs:
       - name: Test daemon and activation lifecycle
         run: |
           cargo test --locked --lib daemon::
-          cargo test --locked --test daemon --test service_activation
+          cargo test --locked --lib lifecycle::
+          cargo test --locked --test daemon --test lifecycle --test service_activation
+      - name: Exercise installed daemon through the CLI
+        env:
+          TSINDEX_TEST_INSTALL: "1"
+        run: cargo test --locked --test service_activation installed_cli_controls_native_service -- --ignored --exact
 
   secrets:
     name: secret scan

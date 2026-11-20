@@ -17,9 +17,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[cfg(target_os = "macos")]
-use anyhow::Context;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use tempfile::TempDir;
 use tsindex::daemon::{DaemonClient, DaemonPaths, SessionState};
 
@@ -255,8 +253,255 @@ fn installed_custom_endpoint_uses_manager_and_reports_manager_failures() -> Resu
 
 #[cfg(target_os = "linux")]
 #[test]
-fn legacy_service_routes_control_and_migrates_without_endpoint_metadata() -> Result<()> {
+fn login_clients_discover_installed_socket_and_preserve_explicit_isolation() -> Result<()> {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let scratch = private_scratch()?;
+    let runtime = scratch.path().join("runtime");
+    let config = scratch.path().join("config/systemd/user");
+    fs::create_dir_all(&config)?;
+    let private = scratch.path().join("private");
+    fs::create_dir(&private)?;
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700))?;
+    let socket = private.join("custom.sock");
+    fs::write(config.join("tsindex.service"), "[Service]\n")?;
+    fs::write(config.join("tsindex.socket"), "[Socket]\n")?;
+    fs::write(
+        config.join("tsindex.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "socket": socket, "default_socket": runtime.join("tsindex/daemon.sock"),
+        }))?,
+    )?;
+    let bin = scratch.path().join("bin");
+    fs::create_dir(&bin)?;
+    let manager = bin.join("systemctl");
+    fs::write(&manager, "#!/bin/sh\nprintf '%s\\n' \"$*\" >&2\nexit 42\n")?;
+    fs::set_permissions(&manager, fs::Permissions::from_mode(0o700))?;
+    let command = || {
+        let mut cmd = Command::new(BIN);
+        cmd.env("XDG_CONFIG_HOME", scratch.path().join("config"))
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("HOME", scratch.path())
+            .env("PATH", &bin)
+            .env_remove("TSINDEX_HOME")
+            .env_remove("TSINDEX_SOCKET");
+        cmd
+    };
+    let status_socket = |cmd: &mut Command| -> Result<PathBuf> {
+        let out = cmd.args(["daemon", "status", "--json"]).output()?;
+        ensure!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let status: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+        Ok(PathBuf::from(
+            status["socket"].as_str().context("socket missing")?,
+        ))
+    };
+    ensure!(status_socket(&mut command())? == socket);
+    let independent = scratch.path().join("independent.sock");
+    ensure!(status_socket(command().arg("--socket").arg(&independent))? == independent);
+    ensure!(status_socket(command().env("TSINDEX_SOCKET", &independent))? == independent);
+    let other_home = scratch.path().join("cache");
+    ensure!(
+        status_socket(command().env("TSINDEX_HOME", &other_home))?
+            == other_home.join("run/daemon.sock")
+    );
+    let other_runtime = scratch.path().join("runtime2");
+    ensure!(
+        status_socket(command().env("XDG_RUNTIME_DIR", &other_runtime))?
+            == other_runtime.join("tsindex/daemon.sock")
+    );
+
+    let alias = scratch.path().join("ancestor-alias");
+    symlink(scratch.path(), &alias)?;
+    for selected in [None, Some(alias.join("private/custom.sock"))] {
+        let mut cmd = command();
+        if let Some(selected) = selected {
+            cmd.arg("--socket").arg(selected);
+        }
+        let output = cmd.args(["daemon", "stop"]).output()?;
+        ensure!(!output.status.success());
+        ensure!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("--user stop tsindex.socket tsindex.service"),
+            "stop must address the actual installed manager"
+        );
+    }
+    // A fresh client shell can launch managed MCP using the single installed
+    // endpoint, even without the custom socket override used at installation.
+    let _server = Daemon(
+        command()
+            .arg("--socket")
+            .arg(&socket)
+            .args(["daemon", "run"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    wait_ready(&socket)?;
+    let root = scratch.path().join("repo");
+    fs::create_dir(&root)?;
+    let result = command()
+        .arg("--root")
+        .arg(&root)
+        .args(["--no-refresh", "serve", "--mcp", "--via-daemon"])
+        .stdin(Stdio::null())
+        .output()?;
+    ensure!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    ensure!(client(&socket)?.ping()?.total_sessions_started == 1);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn invalid_replacement_executable_preserves_existing_installation() -> Result<()> {
+    let scratch = private_scratch()?;
+    let config = scratch.path().join("config/systemd/user");
+    fs::create_dir_all(&config)?;
+    let service = config.join("tsindex.service");
+    fs::write(&service, "[Service]\n")?;
+    let socket = scratch.path().join("d.sock");
+    let regular = scratch.path().join("plain");
+    fs::write(&regular, "regular non-executable file")?;
+    for invalid in [&regular, &config] {
+        let output = Command::new(BIN)
+            .arg("--socket")
+            .arg(&socket)
+            .args(["daemon", "install", "--binary"])
+            .arg(invalid)
+            .env("HOME", scratch.path())
+            .env("XDG_CONFIG_HOME", scratch.path().join("config"))
+            .env("PATH", scratch.path().join("no-manager"))
+            .output()?;
+        ensure!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        ensure!(
+            error.contains("cannot execute") || error.contains("regular file"),
+            "{error}"
+        );
+        ensure!(fs::read_to_string(&service)? == "[Service]\n");
+        ensure!(!config.join("tsindex.socket").exists());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn manager_outage_during_replacement_restores_durable_configuration() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    let scratch = private_scratch()?;
+    let config = scratch.path().join("config/systemd/user");
+    fs::create_dir_all(&config)?;
+    let service = config.join("tsindex.service");
+    let socket_unit = config.join("tsindex.socket");
+    let record = config.join("tsindex.json");
+    let old_socket = scratch.path().join("old.sock");
+    let metadata = serde_json::to_string(&serde_json::json!({"socket": old_socket}))?;
+    fs::write(&service, "[Service]\n# previous version\n")?;
+    fs::write(&socket_unit, "[Socket]\n# previous version\n")?;
+    fs::write(&record, &metadata)?;
+    let bin = scratch.path().join("bin");
+    fs::create_dir(&bin)?;
+    let manager = bin.join("systemctl");
+    fs::write(
+        &manager,
+        r#"#!/bin/sh
+case "$*" in
+  *'start tsindex.socket') : >"$HOME/offline" ;;
+esac
+if test -e "$HOME/offline"; then
+  printf 'manager unavailable\n' >&2
+  exit 42
+fi
+exit 0
+"#,
+    )?;
+    fs::set_permissions(&manager, fs::Permissions::from_mode(0o700))?;
+    let output = Command::new(BIN)
+        .arg("--socket")
+        .arg(scratch.path().join("replacement.sock"))
+        .args(["daemon", "install"])
+        .env("XDG_CONFIG_HOME", scratch.path().join("config"))
+        .env("HOME", scratch.path())
+        .env("PATH", &bin)
+        .env_remove("TSINDEX_HOME")
+        .env_remove("TSINDEX_SOCKET")
+        .output()?;
+    let error = String::from_utf8_lossy(&output.stderr);
+    ensure!(
+        !output.status.success() && error.contains("rollback was incomplete"),
+        "{error}"
+    );
+    ensure!(scratch.path().join("offline").exists());
+    ensure!(fs::read_to_string(service)? == "[Service]\n# previous version\n");
+    ensure!(fs::read_to_string(socket_unit)? == "[Socket]\n# previous version\n");
+    ensure!(fs::read_to_string(record)? == metadata);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn status_and_detached_stop_distinguish_absence_from_an_unhealthy_daemon() -> Result<()> {
+    let scratch = private_scratch()?;
+    let socket = scratch.path().join("d.sock");
+    let cli = |action: &str| -> Result<std::process::Output> {
+        Ok(Command::new(BIN)
+            .arg("--socket")
+            .arg(&socket)
+            .args(["daemon", action])
+            .env("HOME", scratch.path())
+            .env("XDG_CONFIG_HOME", scratch.path().join("config"))
+            .env_remove("TSINDEX_HOME")
+            .env_remove("TSINDEX_SOCKET")
+            .output()?)
+    };
+    ensure!(cli("status")?.status.success());
+    ensure!(cli("stop")?.status.success());
+    let listener = UnixListener::bind(&socket)?;
+    thread::scope(|scope| -> Result<()> {
+        let server = scope.spawn(|| -> Result<()> {
+            for _ in 0..2 {
+                let mut event = libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                ensure!(
+                    unsafe { libc::poll(&mut event, 1, 5_000) } > 0,
+                    "timed out waiting for control client"
+                );
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                let mut request = String::new();
+                BufReader::new(stream.try_clone()?).read_line(&mut request)?;
+                ensure!(request.contains("ping"));
+                stream.write_all(b"unreadable response\n")?;
+            }
+            Ok(())
+        });
+        for action in ["status", "stop"] {
+            let result = cli(action)?;
+            ensure!(!result.status.success());
+            ensure!(
+                String::from_utf8_lossy(&result.stderr)
+                    .contains("could not determine whether the daemon is running")
+            );
+        }
+        server.join().expect("control responder panicked")?;
+        Ok(())
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn legacy_service_routes_control_and_migrates_without_endpoint_metadata() -> Result<()> {
+    use std::os::unix::fs::{PermissionsExt, symlink};
     for custom in [false, true] {
         let scratch = private_scratch()?;
         let runtime = scratch.path().join("runtime");
@@ -285,13 +530,29 @@ fn legacy_service_routes_control_and_migrates_without_endpoint_metadata() -> Res
         fs::create_dir(&bin)?;
         let calls = scratch.path().join("calls");
         let manager = bin.join("systemctl");
+        let invoked = bin.join("tsindex-link");
+        symlink(BIN, &invoked)?;
         fs::write(
             &manager,
-            "#!/bin/sh\nprintf '%s\n' \"$*\" >>\"$FAKE_MANAGER_CALLS\"\ncase \"$*\" in\n  *'show --property=LoadState --value tsindex.service') printf 'not-found\n'; exit 0;;\n  *'start '*|*'restart '*) printf 'intentional manager start failure\n' >&2; exit 42;;\n  *) exit 0;;\nesac\n",
+            r#"#!/bin/sh
+printf '%s\n' "$*" >>"$FAKE_MANAGER_CALLS"
+case "$*" in
+  *'show --property=LoadState --value tsindex.service') printf 'not-found\n' ;;
+  *'start tsindex.socket')
+    /bin/cp "$XDG_CONFIG_HOME/systemd/user/tsindex.service" "$HOME/candidate-service"
+    /bin/cp "$XDG_CONFIG_HOME/systemd/user/tsindex.json" "$HOME/candidate-endpoint"
+    printf 'intentional manager start failure\n' >&2
+    exit 42 ;;
+  *'start '*|*'restart '*)
+    if test -f "$HOME/candidate-service"; then exit 0; fi
+    printf 'intentional manager start failure\n' >&2
+    exit 42 ;;
+esac
+"#,
         )?;
         fs::set_permissions(&manager, fs::Permissions::from_mode(0o700))?;
         let run = |action: &str| -> Result<std::process::Output> {
-            let mut command = Command::new(BIN);
+            let mut command = Command::new(&invoked);
             if custom {
                 command.arg("--socket").arg(&socket);
             }
@@ -348,7 +609,11 @@ fn legacy_service_routes_control_and_migrates_without_endpoint_metadata() -> Res
         ensure!(calls.contains("--user disable tsindex.service"));
         ensure!(calls.contains("--user enable tsindex.socket"));
         ensure!(calls.contains("--user start tsindex.socket"));
-        let definition = fs::read_to_string(&service)?;
+        let definition = fs::read_to_string(scratch.path().join("candidate-service"))?;
+        ensure!(
+            definition.contains(&serde_json::to_string(&invoked)?),
+            "the service must keep the invocation symlink across package switches"
+        );
         ensure!(definition.contains("--socket-activated"));
         ensure!(!definition.contains("WantedBy=default.target"));
         if custom {
@@ -361,23 +626,51 @@ fn legacy_service_routes_control_and_migrates_without_endpoint_metadata() -> Res
             );
         }
         let endpoint: serde_json::Value =
-            serde_json::from_slice(&fs::read(config.join("tsindex.json"))?)?;
+            serde_json::from_slice(&fs::read(scratch.path().join("candidate-endpoint"))?)?;
         ensure!(endpoint["socket"] == socket.to_string_lossy().as_ref());
-        ensure!(config.join("tsindex.socket").is_file());
+        ensure!(
+            endpoint["default_socket"]
+                == runtime
+                    .join("tsindex/daemon.sock")
+                    .to_string_lossy()
+                    .as_ref()
+        );
+        ensure!(
+            fs::read_to_string(&service)? == legacy,
+            "legacy definition was not restored"
+        );
+        ensure!(!config.join("tsindex.socket").exists());
+        ensure!(!config.join("tsindex.json").exists());
+        ensure!(calls.contains("--user disable tsindex.socket"));
+        ensure!(calls.ends_with("--user enable tsindex.service\n--user start tsindex.service\n"));
     }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn uninstall_without_installation_needs_no_service_manager() -> Result<()> {
+fn empty_uninstall_preserves_an_independent_daemon_without_a_manager() -> Result<()> {
     let scratch = private_scratch()?;
     let missing = scratch.path().join("absent-bin");
     fs::create_dir(&missing)?;
+    let socket = scratch.path().join("d.sock");
+    let _server = Daemon(
+        Command::new(BIN)
+            .arg("--socket")
+            .arg(&socket)
+            .args(["daemon", "run"])
+            .env("HOME", scratch.path())
+            .env_remove("TSINDEX_HOME")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    let pid = wait_ready(&socket)?;
     for _ in 0..2 {
         let output = Command::new(BIN)
             .arg("--socket")
-            .arg(scratch.path().join("d.sock"))
+            .arg(&socket)
             .args(["daemon", "uninstall"])
             .env("PATH", &missing)
             .env("XDG_CONFIG_HOME", scratch.path().join("config"))
@@ -391,6 +684,7 @@ fn uninstall_without_installation_needs_no_service_manager() -> Result<()> {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    ensure!(client(&socket)?.ping()?.daemon_pid == pid);
     Ok(())
 }
 
@@ -761,6 +1055,121 @@ fn non_utf8_install_rejects_before_writing_or_enabling_units() -> Result<()> {
         "invalid UTF-8 install left service definitions"
     );
     Ok(())
+}
+
+// The CLI uses the production manager name. CI explicitly runs this test in
+// its own step on a disposable native runner, after the normal tests finish.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+#[ignore = "requires a clean GitHub-hosted runner and a dedicated invocation"]
+fn installed_cli_controls_native_service() -> Result<()> {
+    use tsindex::daemon::service::service_file_path;
+
+    ensure!(
+        std::env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted")
+            && std::env::var("TSINDEX_TEST_INSTALL").as_deref() == Ok("1"),
+        "the production service name may only be exercised on a clean hosted runner"
+    );
+    let service = service_file_path();
+    let files = [
+        service.clone(),
+        service.with_extension("socket"),
+        service.with_extension("json"),
+        service.with_extension("install.lock"),
+    ];
+    for file in &files {
+        ensure!(
+            fs::symlink_metadata(file)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+            "service configuration already exists at {file:?}"
+        );
+    }
+    // A globally installed or transient unit can exist even without any file
+    // in this account's configuration. Verify the manager is also unoccupied.
+    #[cfg(target_os = "linux")]
+    for unit in ["tsindex.service", "tsindex.socket"] {
+        let result = Command::new("systemctl")
+            .args(["--user", "show", "-p", "LoadState", "--value", unit])
+            .output()?;
+        ensure!(
+            String::from_utf8_lossy(&result.stdout).trim() == "not-found",
+            "manager already knows {unit} or is unavailable"
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let target = format!(
+            "gui/{}/{}",
+            unsafe { libc::geteuid() },
+            tsindex::daemon::service::MACOS_SERVICE_LABEL
+        );
+        let result = Command::new("launchctl")
+            .args(["print", &target])
+            .output()?;
+        ensure!(
+            !result.status.success()
+                && String::from_utf8_lossy(&result.stderr)
+                    .to_lowercase()
+                    .contains("could not find service"),
+            "launchd already knows this service or its GUI domain is unavailable"
+        );
+    }
+
+    let scratch = private_scratch()?;
+    let socket = scratch.path().join("custom.sock");
+    let cli = |action: &str, explicit: bool| -> Result<serde_json::Value> {
+        let mut cmd = Command::new(BIN);
+        cmd.env_remove("TSINDEX_HOME").env_remove("TSINDEX_SOCKET");
+        if explicit {
+            cmd.arg("--socket").arg(&socket);
+        }
+        let result = cmd.args(["daemon", action, "--json"]).output()?;
+        ensure!(
+            result.status.success(),
+            "daemon {action}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        Ok(serde_json::from_slice(&result.stdout)?)
+    };
+    let result = (|| -> Result<()> {
+        let installed = cli("install", true)?;
+        let first = wait_ready(&socket)?;
+        ensure!(installed["daemon"]["daemon_pid"] == first);
+        let replacement = cli("install", false)?;
+        let replaced = wait_ready(&socket)?;
+        ensure!(replaced != first && replacement["daemon"]["daemon_pid"] == replaced);
+        let restarted = cli("restart", false)?;
+        let second = wait_ready(&socket)?;
+        ensure!(second != replaced && restarted["daemon_pid"] == second);
+        ensure!(cli("stop", false)?["stopped"] == true);
+        wait_gone(second)?;
+        let status = cli("status", false)?;
+        ensure!(
+            status["running"] == false && status["socket"] == socket.to_string_lossy().as_ref()
+        );
+        let started = cli("start", false)?;
+        ensure!(started["daemon_pid"] == wait_ready(&socket)?);
+        cli("uninstall", false)?;
+        wait_gone(
+            started["daemon_pid"]
+                .as_u64()
+                .context("missing daemon PID")?
+                .try_into()?,
+        )?;
+        for file in &files[..3] {
+            ensure!(!file.try_exists()?, "uninstall left {file:?}");
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = cli("uninstall", true);
+    }
+    // The persistent lock inode serializes future installs. This disposable
+    // runner started without that file and has no other installation clients.
+    if files[3].try_exists()? {
+        fs::remove_file(&files[3])?;
+    }
+    result
 }
 
 struct ManagedJob {

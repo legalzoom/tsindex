@@ -59,13 +59,58 @@ fn validate_listener(fd: OwnedFd, paths: &DaemonPaths) -> Result<UnixListener> {
         return Err(io::Error::last_os_error()).context("failed to protect activation descriptor");
     }
     let listener = UnixListener::from(fd);
-    if listener.local_addr()?.as_pathname() != Some(paths.socket_path.as_path()) {
-        bail!(
-            "activation socket does not match configured endpoint {}",
+    let address = listener.local_addr()?;
+    let reported = address.as_pathname().with_context(|| {
+        format!(
+            "activation socket has no filesystem pathname; configured endpoint {}",
             paths.socket_path.display()
-        );
-    }
+        )
+    })?;
+    validate_endpoint_path(reported, &paths.socket_path).with_context(|| {
+        format!(
+            "activation socket reported {} for configured endpoint {}",
+            reported.display(),
+            paths.socket_path.display()
+        )
+    })?;
     Ok(listener)
+}
+
+fn validate_endpoint_path(reported: &std::path::Path, configured: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    if reported.file_name().is_none() || reported.file_name() != configured.file_name() {
+        bail!("activation socket filename does not match configured endpoint");
+    }
+    let reported_parent = reported
+        .parent()
+        .context("activation socket has no parent")?;
+    let configured_parent = configured
+        .parent()
+        .context("configured socket has no parent")?;
+    // Parent aliases such as /tmp and /private/tmp can name the same private
+    // directory. Resolve only the parents, preserving rejection of a symlink
+    // at the socket leaf instead of following it into another endpoint.
+    for (socket, parent) in [(reported, reported_parent), (configured, configured_parent)] {
+        crate::daemon::validate_private_dir(parent)?;
+        let metadata = std::fs::symlink_metadata(socket).with_context(|| {
+            format!("failed to inspect activation endpoint {}", socket.display())
+        })?;
+        if !metadata.file_type().is_socket() || metadata.uid() != crate::daemon::current_uid() {
+            bail!(
+                "activation endpoint {} must be an owned Unix socket",
+                socket.display()
+            );
+        }
+    }
+    let reported_parent = std::fs::canonicalize(reported_parent)
+        .context("failed to resolve activation socket parent")?;
+    let configured_parent = std::fs::canonicalize(configured_parent)
+        .context("failed to resolve configured socket parent")?;
+    if reported_parent != configured_parent {
+        bail!("activation socket parent does not match configured endpoint parent");
+    }
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -221,10 +266,17 @@ fn activated_fd() -> Result<Option<OwnedFd>> {
 mod tests {
     use std::io::{Read, Write};
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::os::unix::net::{UnixDatagram, UnixStream};
     use std::time::Duration;
 
     use super::*;
+
+    fn private_scratch() -> Result<tempfile::TempDir> {
+        let dir = tempfile::tempdir_in("/tmp")?;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+        Ok(dir)
+    }
 
     fn unbound_stream() -> Result<OwnedFd> {
         #[cfg(target_os = "linux")]
@@ -245,7 +297,7 @@ mod tests {
 
     #[test]
     fn listener_validation_preserves_pending_client_and_manager_socket() -> Result<()> {
-        let dir = tempfile::tempdir_in("/tmp")?;
+        let dir = private_scratch()?;
         let paths = DaemonPaths::resolve(Some(&dir.path().join("d.sock")))?;
         let manager = UnixListener::bind(&paths.socket_path)?;
         let mut client = UnixStream::connect(&paths.socket_path)?;
@@ -274,7 +326,7 @@ mod tests {
 
     #[test]
     fn listener_validation_rejects_connected_unbound_and_non_listening_streams() -> Result<()> {
-        let dir = tempfile::tempdir_in("/tmp")?;
+        let dir = private_scratch()?;
         let paths = DaemonPaths::resolve(Some(&dir.path().join("d.sock")))?;
         let (connected, _peer) = UnixStream::pair()?;
         assert!(validate_listener(connected.into(), &paths).is_err());
@@ -312,7 +364,7 @@ mod tests {
 
     #[test]
     fn listener_validation_rejects_wrong_type_family_and_endpoint() -> Result<()> {
-        let dir = tempfile::tempdir_in("/tmp")?;
+        let dir = private_scratch()?;
         let paths = DaemonPaths::resolve(Some(&dir.path().join("d.sock")))?;
         let datagram = UnixDatagram::bind(&paths.socket_path)?;
         assert!(validate_listener(datagram.into(), &paths).is_err());
@@ -322,6 +374,87 @@ mod tests {
         let manager = UnixListener::bind(&other)?;
         assert!(validate_listener(manager.try_clone()?.into(), &paths).is_err());
         assert!(other.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn listener_validation_accepts_ancestor_alias_without_consuming_a_client() -> Result<()> {
+        let dir = private_scratch()?;
+        let real = dir.path().join("real");
+        let private = real.join("private");
+        std::fs::create_dir_all(&private)?;
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700))?;
+        let alias = dir.path().join("alias");
+        symlink(&real, &alias)?;
+        let actual = private.join("d.sock");
+        let configured = alias.join("private/d.sock");
+        let paths = DaemonPaths::resolve(Some(&configured))?;
+        let manager = UnixListener::bind(&actual)?;
+        let direct_alias = dir.path().join("parent-link");
+        symlink(&private, &direct_alias)?;
+        let direct_paths = DaemonPaths::resolve(Some(&direct_alias.join("d.sock")))?;
+        assert!(validate_listener(manager.try_clone()?.into(), &direct_paths).is_err());
+        let mut client = UnixStream::connect(&configured)?;
+        client.write_all(b"queued request")?;
+
+        let adopted = validate_listener(manager.try_clone()?.into(), &paths)?;
+        assert_ne!(
+            unsafe { libc::fcntl(adopted.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        adopted.set_nonblocking(true)?;
+        let (mut accepted, _) = adopted.accept()?;
+        accepted.set_read_timeout(Some(Duration::from_secs(1)))?;
+        let mut request = [0u8; 14];
+        accepted.read_exact(&mut request)?;
+        assert_eq!(&request, b"queued request");
+        drop(adopted);
+        assert!(actual.exists());
+        assert!(configured.exists());
+        let _next = UnixStream::connect(&configured)?;
+        assert!(manager.accept().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn listener_validation_rejects_different_parents_and_symlink_socket_leaves() -> Result<()> {
+        use std::os::unix::fs::FileTypeExt;
+
+        let dir = private_scratch()?;
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        for parent in [&first, &second] {
+            std::fs::create_dir(parent)?;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let actual = first.join("d.sock");
+        let configured = second.join("d.sock");
+        let manager = UnixListener::bind(&actual)?;
+        let _other = UnixListener::bind(&configured)?;
+        let paths = DaemonPaths::resolve(Some(&configured))?;
+        let error = validate_listener(manager.try_clone()?.into(), &paths).unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains(&actual.display().to_string()));
+        assert!(diagnostic.contains(&configured.display().to_string()));
+        assert!(std::fs::symlink_metadata(&actual)?.file_type().is_socket());
+        assert!(
+            std::fs::symlink_metadata(&configured)?
+                .file_type()
+                .is_socket()
+        );
+
+        // Even identical pathname strings must reject a leaf replaced after
+        // bind, rather than following that symlink into the other endpoint.
+        std::fs::remove_file(&actual)?;
+        symlink(&configured, &actual)?;
+        let paths = DaemonPaths::resolve(Some(&actual))?;
+        assert!(validate_listener(manager.try_clone()?.into(), &paths).is_err());
+        assert!(std::fs::symlink_metadata(&actual)?.file_type().is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&configured)?
+                .file_type()
+                .is_socket()
+        );
         Ok(())
     }
 }

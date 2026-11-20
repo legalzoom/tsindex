@@ -1250,6 +1250,7 @@ fn spawn_detached_daemon(paths: &DaemonPaths, _socket_override: Option<&Path>) -
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_err));
+    crate::daemon::fds::prepare_exec(&mut cmd, None)?;
     unsafe {
         cmd.pre_exec(|| {
             if libc::setsid() == -1 {

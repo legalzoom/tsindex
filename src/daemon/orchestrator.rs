@@ -1306,13 +1306,10 @@ fn spawn_worker(
         .stderr(Stdio::piped());
     #[cfg(target_os = "linux")]
     let parent_pid = std::process::id() as libc::pid_t;
-    #[cfg(target_os = "macos")]
-    let descriptor_limit = macos_worker_descriptor_limit()?;
+    super::fds::prepare_exec(&mut cmd, None)?;
     // SAFETY: these are async-signal-safe syscalls in the fork/exec interval.
     unsafe {
         cmd.pre_exec(move || {
-            #[cfg(target_os = "macos")]
-            mark_worker_fds_cloexec(descriptor_limit)?;
             if worker_groups && libc::setpgid(0, 0) != 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -1346,52 +1343,6 @@ fn spawn_worker(
     }
     cmd.spawn()
         .context("failed to spawn worker; restart the daemon after upgrading tsindex")
-}
-
-#[cfg(target_os = "macos")]
-fn macos_worker_descriptor_limit() -> io::Result<libc::c_int> {
-    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let mut ceiling: libc::c_int = 0;
-    let mut size = std::mem::size_of_val(&ceiling);
-    // Query before fork, where sysctl may allocate. The kernel ceiling keeps
-    // RLIM_INFINITY finite without imposing a new application limit.
-    // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_resource.c
-    if unsafe {
-        libc::sysctlbyname(
-            c"kern.maxfilesperproc".as_ptr(),
-            (&mut ceiling as *mut libc::c_int).cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    if ceiling < 3 {
-        return Err(io::Error::other("invalid kernel descriptor ceiling"));
-    }
-    Ok(limit.rlim_cur.min(ceiling as libc::rlim_t) as libc::c_int)
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn mark_worker_fds_cloexec(limit: libc::c_int) -> io::Result<()> {
-    // Darwin may set CLOEXEC after creating/accepting sockets. Mark the actual
-    // inherited descriptors in the forked child, covering descriptors another
-    // daemon thread opened concurrently with worker creation. Only 0..2 are
-    // intentionally inherited. The spawn error pipe remains open until exec.
-    for fd in 3..limit {
-        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::EBADF) {
-                return Err(error);
-            }
-        }
-    }
-    Ok(())
 }
 
 fn nonblocking(fd: libc::c_int) -> io::Result<()> {
@@ -2469,29 +2420,6 @@ mod tests {
             fs::read_to_string(stale)?,
             "unfinished publication from a reused PID"
         );
-        Ok(())
-    }
-
-    #[test]
-    fn worker_exec_closes_a_descriptor_opened_without_cloexec() -> Result<()> {
-        use std::os::fd::{FromRawFd, OwnedFd};
-        let file = fs::File::open("/dev/null")?;
-        let raw = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 128) };
-        assert!(raw >= 128);
-        let descriptor = unsafe { OwnedFd::from_raw_fd(raw) };
-        let mut command = Command::new("sh");
-        command.arg("-c").arg(format!("test ! -e /dev/fd/{raw}"));
-        unsafe {
-            command.pre_exec(move || {
-                // Simulate the accept-to-fcntl window in a different daemon thread.
-                if libc::fcntl(raw, libc::F_SETFD, 0) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                mark_worker_fds_cloexec(raw + 1)
-            });
-        }
-        assert!(command.status()?.success());
-        drop(descriptor);
         Ok(())
     }
 

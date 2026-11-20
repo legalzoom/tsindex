@@ -368,6 +368,61 @@ fn managed_proxy_reports_clean_daemon_stop_and_restart() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn detached_daemon_releases_inherited_launcher_descriptors() -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir_in("/tmp")?;
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+    let socket = dir.path().join("d.sock");
+    let launcher = || {
+        let mut command = Command::new(BIN);
+        command
+            .arg("--socket")
+            .arg(&socket)
+            .env("HOME", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path());
+        command
+    };
+    let (mut observer, endpoint) = UnixStream::pair()?;
+    let fd = endpoint.as_raw_fd();
+    let mut start = launcher();
+    start.args(["daemon", "start"]);
+    // Only this test launcher inherits the descriptor. A long-lived detached
+    // daemon retaining it would keep the observer from seeing EOF.
+    unsafe {
+        start.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let started = start.output()?;
+    drop(endpoint);
+    // Capture the result before asserting so even a regression stops the daemon.
+    observer.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let disconnected = observer.read(&mut [0]);
+    let stopped = launcher().args(["daemon", "stop"]).output()?;
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert_eq!(disconnected?, 0);
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn managed_proxy_drains_buffered_responses_after_normal_input_eof() -> Result<()> {

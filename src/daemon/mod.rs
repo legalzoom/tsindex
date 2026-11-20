@@ -4,6 +4,8 @@
 #[cfg(unix)]
 pub(crate) mod activation;
 #[cfg(unix)]
+mod fds;
+#[cfg(unix)]
 pub mod orchestrator;
 #[cfg(unix)]
 pub mod proxy;

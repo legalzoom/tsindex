@@ -11,7 +11,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -765,9 +765,14 @@ fn non_utf8_install_rejects_before_writing_or_enabling_units() -> Result<()> {
 
 struct ManagedJob {
     _scratch: TempDir,
+    #[cfg(target_os = "linux")]
     name: String,
     #[cfg(target_os = "linux")]
     directory: PathBuf,
+    #[cfg(target_os = "macos")]
+    target: Option<String>,
+    #[cfg(target_os = "macos")]
+    plist: PathBuf,
 }
 
 #[cfg(target_os = "linux")]
@@ -793,10 +798,10 @@ impl Drop for ManagedJob {
 #[cfg(target_os = "macos")]
 impl Drop for ManagedJob {
     fn drop(&mut self) {
-        let domain = format!("user/{}/{}", unsafe { libc::getuid() }, self.name);
-        let _ = Command::new("launchctl")
-            .args(["bootout", &domain])
-            .status();
+        if let Some(target) = self.target.as_deref() {
+            let _ = Command::new("launchctl").args(["bootout", target]).output();
+        }
+        let _ = fs::remove_file(&self.plist);
     }
 }
 
@@ -895,46 +900,110 @@ fn systemd_manager_activates_isolated_service_when_available() -> Result<()> {
 #[cfg(target_os = "macos")]
 #[test]
 fn launchd_manager_activates_isolated_service() -> Result<()> {
-    use tsindex::daemon::service::{MACOS_SERVICE_LABEL, render_launchd_plist};
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    use tsindex::daemon::service::{MACOS_SERVICE_LABEL, render_launchd_plist, service_file_path};
     let scratch = private_scratch()?;
     let socket = scratch.path().join("d.sock");
-    let name = format!("com.legalzoom.tsindex.test.{}", std::process::id());
-    let plist = scratch.path().join(format!("{name}.plist"));
+    let suffix = scratch.path().file_name().unwrap().to_string_lossy();
+    let name = format!(
+        "com.legalzoom.tsindex.test.{}-{}",
+        std::process::id(),
+        suffix.trim_start_matches('.')
+    );
+    let service = service_file_path();
+    let agents = service
+        .parent()
+        .context("LaunchAgent directory is unavailable")?;
+    fs::create_dir_all(agents)?;
+    let plist = agents.join(format!("{name}.plist"));
     let log = scratch.path().join("daemon.log");
+    // Normal LaunchAgents default to Aqua. Exercise the installed service's
+    // GUI domain instead of the Background user domain.
+    // https://developer.apple.com/forums/thread/783780
+    let domain = format!("gui/{}", unsafe { libc::geteuid() });
+    let target = format!("{domain}/{name}");
+    let domain_status = Command::new("launchctl")
+        .args(["print", &domain])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    ensure!(
+        domain_status.success(),
+        "launchd GUI domain {domain} is unavailable ({domain_status}) for fixture {}",
+        plist.display()
+    );
     let rendered = render_launchd_plist(Path::new(BIN), Some(&socket), &log, "/usr/bin:/bin")
         .replace(MACOS_SERVICE_LABEL, &name);
-    fs::write(&plist, rendered)?;
-    let _job = ManagedJob {
+    // create_new protects unrelated files if a prior fixture name survives.
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&plist)?;
+    let mut job = ManagedJob {
         _scratch: scratch,
-        name: name.clone(),
+        target: None,
+        plist: plist.clone(),
     };
-    let domain = format!("user/{}", unsafe { libc::getuid() });
+    file.write_all(rendered.as_bytes())?;
+    drop(file);
+    let lint = Command::new("/usr/bin/plutil")
+        .args(["-lint", "--"])
+        .arg(&plist)
+        .output()?;
     ensure!(
-        Command::new("launchctl")
-            .args(["bootstrap", &domain])
-            .arg(&plist)
-            .status()?
-            .success()
+        lint.status.success(),
+        "invalid LaunchAgent plist {} ({}) stdout={} stderr={}",
+        plist.display(),
+        lint.status,
+        String::from_utf8_lossy(&lint.stdout[..lint.stdout.len().min(2048)]),
+        String::from_utf8_lossy(&lint.stderr[..lint.stderr.len().min(2048)])
     );
+    let bootstrap = Command::new("launchctl")
+        .args(["bootstrap", &domain])
+        .arg(&plist)
+        .output()?;
+    ensure!(
+        bootstrap.status.success(),
+        "launchctl bootstrap {domain} {} failed ({}) stderr={}",
+        plist.display(),
+        bootstrap.status,
+        String::from_utf8_lossy(&bootstrap.stderr[..bootstrap.stderr.len().min(4096)])
+    );
+    // Bootstrap success confirms ownership before arming registration cleanup.
+    job.target = Some(target.clone());
     let first =
         wait_ready(&socket).with_context(|| fs::read_to_string(&log).unwrap_or_default())?;
-    let (_proxy, worker) = active_worker(&socket, &_job._scratch.path().join("repo"))?;
+    let (_proxy, worker) = active_worker(&socket, &job._scratch.path().join("repo"))?;
     // launchd's process-group cleanup must cover a worker when its supervisor
     // is killed before it can close the child's stdin.
     ensure!(unsafe { libc::kill(first as libc::pid_t, libc::SIGKILL) } == 0);
     wait_gone(worker)?;
     let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
+    let restarted = loop {
         if let Ok(pid) = wait_ready(&socket)
             && pid != first
         {
-            break;
+            break pid;
         }
         ensure!(
             Instant::now() < deadline,
             "launchd failed to reactivate the supervisor"
         );
         thread::sleep(Duration::from_millis(100));
-    }
+    };
+    let bootout = Command::new("launchctl")
+        .args(["bootout", &target])
+        .output()?;
+    ensure!(
+        bootout.status.success(),
+        "launchctl bootout {target} failed ({}) stderr={}",
+        bootout.status,
+        String::from_utf8_lossy(&bootout.stderr[..bootout.stderr.len().min(4096)])
+    );
+    job.target = None;
+    wait_gone(restarted)?;
     Ok(())
 }

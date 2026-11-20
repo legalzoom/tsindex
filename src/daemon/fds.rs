@@ -290,7 +290,84 @@ fn fallback_ceiling() -> io::Result<Option<RawFd>> {
     Ok(Some(ceiling))
 }
 
+// The portable fallback runs after fork, when no other thread can change the
+// child's table. Obtain the actual table size or its entries without allocating
+// or taking userspace locks; the precomputed ceiling remains a safe last resort.
+#[cfg(target_os = "linux")]
+fn child_fd_table_size() -> Option<RawFd> {
+    let raw = unsafe {
+        libc::open(
+            c"/proc/self/status".as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if raw < 0 {
+        return None;
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut fs: libc::statfs = unsafe { mem::zeroed() };
+    if unsafe { libc::fstatfs(fd.as_raw_fd(), &mut fs) } != 0 || fs.f_type != libc::PROC_SUPER_MAGIC
+    {
+        return None;
+    }
+    let mut buf = [0u8; 2048];
+    let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+    let bytes = buf.get(..usize::try_from(n).ok()?)?;
+    // The kernel publishes max_fds, including holes and open fds above a
+    // lowered RLIMIT_NOFILE. Ignore incomplete records or a foreign PID view.
+    // https://github.com/torvalds/linux/blob/master/fs/proc/array.c
+    let number = |key: &[u8]| {
+        bytes.split_inclusive(|b| *b == b'\n').find_map(|line| {
+            let field = line.strip_suffix(b"\n")?.strip_prefix(key)?;
+            std::str::from_utf8(field)
+                .ok()?
+                .trim()
+                .parse::<RawFd>()
+                .ok()
+        })
+    };
+    if number(b"Pid:")? != unsafe { libc::getpid() } {
+        return None;
+    }
+    number(b"FDSize:").filter(|&size| size > raw)
+}
+
+#[cfg(target_os = "macos")]
+fn mark_darwin_open_fds() -> io::Result<bool> {
+    // proc_pidinfo is a direct __proc_info syscall wrapper. A full bounded
+    // array may be truncated, in which case use the conservative sweep below.
+    // https://github.com/apple-oss-distributions/xnu/blob/main/libsyscall/wrappers/libproc/libproc.c
+    let mut entries = [mem::MaybeUninit::<libc::proc_fdinfo>::uninit(); 1024];
+    let bytes = std::mem::size_of_val(&entries);
+    let n = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDLISTFDS,
+            0,
+            entries.as_mut_ptr().cast(),
+            bytes as _,
+        )
+    };
+    let n = n as usize;
+    if n == 0 || n >= bytes || !n.is_multiple_of(size_of::<libc::proc_fdinfo>()) {
+        return Ok(false);
+    }
+    for entry in &entries[..n / size_of::<libc::proc_fdinfo>()] {
+        let fd = unsafe { entry.assume_init_ref() }.proc_fd;
+        if fd >= 3 {
+            set_fd_flags(fd, libc::FD_CLOEXEC)?;
+        }
+    }
+    Ok(true)
+}
+
 fn sweep_cloexec(ceiling: RawFd) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if mark_darwin_open_fds()? {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    let ceiling = child_fd_table_size().unwrap_or(ceiling);
     for fd in 3..ceiling {
         if let Err(error) = set_fd_flags(fd, libc::FD_CLOEXEC)
             && error.raw_os_error() != Some(libc::EBADF)
@@ -366,6 +443,36 @@ mod tests {
             0,
             "the receiver retained an extra descriptor"
         );
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn fallback_sweep_handles_open_descriptors_above_a_lowered_soft_limit() -> io::Result<()> {
+        let file = fs::File::open("/dev/null")?;
+        let raw = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 128) };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let high = unsafe { OwnedFd::from_raw_fd(raw) };
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(format!("test ! -e /dev/fd/{raw}"));
+        unsafe {
+            cmd.pre_exec(move || {
+                let mut limit: libc::rlimit = mem::zeroed();
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                limit.rlim_cur = 64;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                set_fd_flags(raw, 0)?;
+                sweep_cloexec(raw + 1)
+            });
+        }
+        assert!(cmd.status()?.success());
+        drop(high);
         Ok(())
     }
 

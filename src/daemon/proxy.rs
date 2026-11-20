@@ -2,9 +2,13 @@
 //! `tsindex serve --mcp --via-daemon`.
 
 use std::env;
-use std::io::{self, BufReader, Read, Write};
+use std::ffi::{CStr, OsStr};
+use std::fs::{File, Metadata, OpenOptions};
+use std::io::{self, BufReader, IsTerminal, Read, Write};
 use std::net::Shutdown;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,10 +19,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::daemon::{
-    CONTROL_IO_TIMEOUT, DaemonClient, DaemonRequest, DaemonResponse,
-    MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION, STARTUP_IO_TIMEOUT, SessionState,
-    StartSessionRequest, connect_with_timeout, daemon_not_running_message, read_bounded_line,
-    validate_private_dir, verify_server_credentials, write_json_line,
+    CONTROL_IO_TIMEOUT, DaemonClient, DaemonRequest, DaemonResponse, MAX_CONTROL_LINE_BYTES,
+    PROTOCOL_VERSION, STARTUP_IO_TIMEOUT, SessionState, StartSessionRequest, connect_with_timeout,
+    daemon_not_running_message, read_bounded_line, validate_private_dir, verify_server_credentials,
+    write_json_line,
 };
 use crate::mcp::CancellableStdin;
 
@@ -119,11 +123,11 @@ pub fn run_mcp_proxy(args: McpProxyArgs) -> Result<()> {
     let cancel_data = uds_reader.get_ref().try_clone()?;
     let stdin = CancellableStdin::new()?;
     let cancellation = Arc::clone(&stdin.cancellation);
-    let outcome_failed = Arc::new(AtomicBool::new(false));
+    let cancel_blocked_output = AtomicBool::new(false);
     let (sent, received) = mpsc::sync_channel(1);
 
     thread::scope(|scope| -> Result<()> {
-        let watcher_failed = Arc::clone(&outcome_failed);
+        let cancel_drain = &cancel_blocked_output;
         scope.spawn(move || {
             let result: Result<_> = (|| {
                 let line = read_bounded_line(&mut outcomes, MAX_CONTROL_LINE_BYTES)
@@ -138,15 +142,25 @@ pub fn run_mcp_proxy(args: McpProxyArgs) -> Result<()> {
                     other => bail!("unexpected MCP worker outcome: {other:?}"),
                 }
             })();
+            // A normal exit can precede delivery of the worker's buffered replies.
+            // An explicit stop, crash, or lost supervisor ends a stalled delivery
+            // even when the client has already half-closed stdin.
+            if !result.as_ref().is_ok_and(|session| {
+                matches!(
+                    session.exit_reason.as_deref(),
+                    Some("client_eof" | "worker_exited")
+                )
+            }) {
+                cancel_drain.store(true, Ordering::Release);
+            }
             if result.is_err() {
-                watcher_failed.store(true, Ordering::Release);
                 cancellation.stop();
                 let _ = cancel_data.shutdown(Shutdown::Both);
             }
             let _ = sent.send(result);
         });
 
-        if let Err(error) = relay_stdio(uds_reader, stdin, outcome_failed) {
+        if let Err(error) = relay_stdio(uds_reader, stdin, &cancel_blocked_output) {
             let _ = cancel_outcomes.shutdown(Shutdown::Both);
             return Err(error);
         }
@@ -173,7 +187,7 @@ pub fn run_mcp_proxy(args: McpProxyArgs) -> Result<()> {
 fn relay_stdio(
     mut uds_reader: BufReader<UnixStream>,
     mut stdin: CancellableStdin,
-    outcome_failed: Arc<AtomicBool>,
+    cancel_blocked_output: &AtomicBool,
 ) -> Result<()> {
     let mut uds_writer = uds_reader
         .get_ref()
@@ -181,55 +195,34 @@ fn relay_stdio(
         .context("failed to clone orchestrator socket")?;
     let cancellation = Arc::clone(&stdin.cancellation);
     let output_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-    let input_eof = Arc::new(AtomicBool::new(false));
+    let mut stdout =
+        ProxyStdout::new(io::stdout().as_fd()).context("failed to prepare MCP stdout")?;
 
     thread::scope(|scope| {
         let cancel_from_egress = Arc::clone(&cancellation);
         let egress_error = &output_error;
-        let egress_input_eof = Arc::clone(&input_eof);
         scope.spawn(move || {
-            let mut stdout = match NonblockingStdout::new() {
-                Ok(stdout) => stdout,
-                Err(error) => {
-                    *egress_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error.into());
-                    cancel_from_egress.stop();
-                    let _ = uds_reader.get_ref().shutdown(Shutdown::Both);
-                    return;
-                }
-            };
             let mut buf = [0u8; 8192];
             loop {
-                match uds_reader.read(&mut buf) {
-                    Ok(0) => {
-                        cancel_from_egress.stop();
-                        let _ = uds_reader.get_ref().shutdown(Shutdown::Both);
-                        break;
-                    }
-                    Ok(n) => {
-                        if let Err(error) = stdout.write_all(
-                            &buf[..n],
-                            uds_reader.get_ref().as_raw_fd(),
-                            &egress_input_eof,
-                            &outcome_failed,
-                        ) {
-                            let mut slot = egress_error.lock().unwrap_or_else(|e| e.into_inner());
-                            if slot.is_none() {
-                                *slot = Some(error.into());
-                            }
-                            cancel_from_egress.stop();
-                            let _ = uds_reader.get_ref().shutdown(Shutdown::Both);
-                            break;
-                        }
-                    }
+                let result = match uds_reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => stdout.relay(&buf[..n], cancel_blocked_output),
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(true) => continue,
+                    Ok(false) => break,
                     Err(error) => {
-                        *egress_error.lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some(error.into());
-                        cancel_from_egress.stop();
-                        let _ = uds_reader.get_ref().shutdown(Shutdown::Both);
+                        egress_error
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_or_insert(error.into());
                         break;
                     }
                 }
             }
+            cancel_from_egress.stop();
+            let _ = uds_reader.get_ref().shutdown(Shutdown::Both);
         });
 
         let mut buf = [0u8; 8192];
@@ -238,7 +231,6 @@ fn relay_stdio(
                 Ok(0) => {
                     // Half-close write side so the orchestrator flushes any
                     // remaining responses from the worker before disconnecting.
-                    input_eof.store(true, Ordering::Release);
                     let _ = uds_writer.shutdown(Shutdown::Write);
                     break;
                 }
@@ -268,63 +260,175 @@ fn relay_stdio(
     Ok(())
 }
 
-struct NonblockingStdout {
-    fd: OwnedFd,
-    previous_flags: libc::c_int,
+/// The harness may keep a duplicate of stdout. File status flags belong to the
+/// open file description and changing them through any duplicate changes them
+/// for every holder, including after an ungraceful proxy exit.
+struct ProxyStdout {
+    file: File,
+    mode: OutputMode,
 }
 
-impl NonblockingStdout {
-    fn new() -> io::Result<Self> {
-        let fd = io::stdout().as_fd().try_clone_to_owned()?;
-        let previous_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
-        if previous_flags < 0
-            || unsafe {
-                libc::fcntl(
-                    fd.as_raw_fd(),
-                    libc::F_SETFL,
-                    previous_flags | libc::O_NONBLOCK,
-                )
-            } < 0
-        {
+enum OutputMode {
+    Write,
+    Socket,
+    PollPipe,
+}
+
+impl ProxyStdout {
+    fn new(stdout: BorrowedFd<'_>) -> io::Result<Self> {
+        let file = File::from(stdout.try_clone_to_owned()?);
+        let metadata = file.metadata()?;
+        let kind = metadata.file_type();
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { fd, previous_flags })
+        // A private reopen must never grant access the inherited descriptor lacks.
+        if flags & libc::O_ACCMODE == libc::O_RDONLY {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+        let mode = if kind.is_socket() {
+            OutputMode::Socket
+        } else if kind.is_fifo() {
+            // Linux procfs reopens the pipe with an independent file description.
+            // Some sandboxes omit procfs or disallow reopening an inherited pipe.
+            #[cfg(target_os = "linux")]
+            // Packet-mode pipes preserve the original writer's packet boundaries.
+            if flags & libc::O_DIRECT == 0
+                && let Ok(private) = reopen_output(
+                    Path::new(&format!("/proc/self/fd/{}", file.as_raw_fd())),
+                    &metadata,
+                )
+            {
+                return Ok(Self {
+                    file: private,
+                    mode: OutputMode::Write,
+                });
+            }
+            OutputMode::PollPipe
+        } else if file.is_terminal() {
+            // A terminal can stop accepting output after poll (e.g. flow control).
+            // Give the relay its own nonblocking open of the same terminal device.
+            let mut name = [0; libc::PATH_MAX as usize];
+            let rc = unsafe { libc::ttyname_r(file.as_raw_fd(), name.as_mut_ptr(), name.len()) };
+            if rc != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "cannot resolve stdout terminal; use a pipe ({})",
+                        io::Error::from_raw_os_error(rc)
+                    ),
+                ));
+            }
+            let name = unsafe { CStr::from_ptr(name.as_ptr()) };
+            let path = Path::new(OsStr::from_bytes(name.to_bytes()));
+            // Opening a PTY master device can allocate a different terminal.
+            if path
+                .file_name()
+                .is_some_and(|name| name == "ptmx" || name.as_bytes().starts_with(b"pty"))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "use a terminal slave or a pipe for MCP stdout",
+                ));
+            }
+            let private = reopen_output(path, &metadata).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("cannot reopen stdout terminal; use a pipe ({error})"),
+                )
+            })?;
+            return Ok(Self {
+                file: private,
+                mode: OutputMode::Write,
+            });
+        } else if kind.is_char_device()
+            && flags & libc::O_NONBLOCK == 0
+            && !["/dev/null", "/dev/zero", "/dev/full"].iter().any(|path| {
+                std::fs::metadata(path)
+                    .is_ok_and(|m| m.file_type().is_char_device() && m.rdev() == metadata.rdev())
+            })
+        {
+            // Arbitrary device drivers can block after poll, and a fresh open
+            // can have different driver state. Keep their inherited flags intact.
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "use a pipe or a nonblocking character device for MCP stdout",
+            ));
+        } else {
+            // In particular, regular files must retain the caller's shared offset
+            // and append semantics. Kernel filesystem I/O has its usual behavior.
+            OutputMode::Write
+        };
+        Ok(Self { file, mode })
     }
 
-    fn write_all(
-        &mut self,
-        mut bytes: &[u8],
-        socket_fd: libc::c_int,
-        input_eof: &AtomicBool,
-        outcome_failed: &AtomicBool,
-    ) -> io::Result<()> {
+    fn try_write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self.mode {
+            OutputMode::Write => self.file.write(bytes),
+            OutputMode::Socket => {
+                let n = unsafe {
+                    libc::send(
+                        self.file.as_raw_fd(),
+                        bytes.as_ptr().cast(),
+                        bytes.len(),
+                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                    )
+                };
+                if n < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }
+            OutputMode::PollPipe => {
+                // MCP dedicates this pipe's byte stream to one writer. With no
+                // competing writer, Linux and Darwin leave at least PIPE_BUF
+                // bytes available after write readiness and a read only frees more.
+                if !self.wait_writable(0)? {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                self.file.write(&bytes[..bytes.len().min(libc::PIPE_BUF)])
+            }
+        }
+    }
+
+    fn wait_writable(&self, timeout_ms: i32) -> io::Result<bool> {
+        let mut fd = libc::pollfd {
+            fd: self.file.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut fd, 1, timeout_ms) };
+        if rc < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(rc != 0)
+        }
+    }
+
+    /// Returns false when the supervisor ended a session with blocked output.
+    fn relay(&mut self, mut bytes: &[u8], cancel_blocked_output: &AtomicBool) -> io::Result<bool> {
         let mut deadline = Instant::now() + STREAM_STALL_TIMEOUT;
         while !bytes.is_empty() {
-            if outcome_failed.load(Ordering::Acquire) {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "MCP worker outcome connection was lost",
-                ));
+            match self.try_write(bytes) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "MCP stdout closed",
+                    ));
+                }
+                Ok(n) => {
+                    bytes = &bytes[n..];
+                    deadline = Instant::now() + STREAM_STALL_TIMEOUT;
+                    continue;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
+                Err(e) => return Err(e),
             }
-            let written =
-                unsafe { libc::write(self.fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
-            if written > 0 {
-                bytes = &bytes[written as usize..];
-                deadline = Instant::now() + STREAM_STALL_TIMEOUT;
-                continue;
-            }
-            if written == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "MCP stdout closed",
-                ));
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            if error.kind() != io::ErrorKind::WouldBlock {
-                return Err(error);
+            if cancel_blocked_output.load(Ordering::Acquire) {
+                return Ok(false);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -333,47 +437,39 @@ impl NonblockingStdout {
                     "MCP stdout stalled",
                 ));
             }
-            let mut fds = [
-                libc::pollfd {
-                    fd: self.fd.as_raw_fd(),
-                    events: libc::POLLOUT,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    // After normal input EOF, the worker can exit while its
-                    // responses remain buffered. Preserve their bounded drain.
-                    fd: if input_eof.load(Ordering::Acquire) {
-                        -1
-                    } else {
-                        socket_fd
-                    },
-                    events: 0,
-                    revents: 0,
-                },
-            ];
-            // Socket hangup interrupts a full stdout pipe during daemon teardown.
-            let rc =
-                unsafe { libc::poll(fds.as_mut_ptr(), 2, remaining.as_millis().min(100) as i32) };
-            if rc < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-                return Err(io::Error::last_os_error());
-            }
-            if !input_eof.load(Ordering::Acquire)
-                && fds[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+            if let Err(error) = self.wait_writable(remaining.as_millis().min(100) as i32)
+                && error.kind() != io::ErrorKind::Interrupted
             {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "daemon disconnected while MCP stdout was blocked",
-                ));
+                return Err(error);
             }
         }
-        Ok(())
+        Ok(true)
     }
 }
 
-impl Drop for NonblockingStdout {
-    fn drop(&mut self) {
-        unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_SETFL, self.previous_flags) };
+fn reopen_output(path: &Path, expected: &Metadata) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)?;
+    let actual = file.metadata()?;
+    if (
+        actual.dev(),
+        actual.ino(),
+        actual.rdev(),
+        actual.file_type(),
+    ) != (
+        expected.dev(),
+        expected.ino(),
+        expected.rdev(),
+        expected.file_type(),
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stdout device changed while reopening it",
+        ));
     }
+    Ok(file)
 }
 
 fn absolutize(path: &Path) -> Result<PathBuf> {
@@ -385,4 +481,117 @@ fn absolutize(path: &Path) -> Result<PathBuf> {
             .join(path)
     };
     Ok(joined.canonicalize().unwrap_or(joined))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Seek, SeekFrom};
+    use std::os::fd::FromRawFd;
+
+    fn flags(fd: impl AsFd) -> libc::c_int {
+        let flags = unsafe { libc::fcntl(fd.as_fd().as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        flags
+    }
+
+    #[test]
+    fn stdout_preserves_shared_file_offset() -> io::Result<()> {
+        let mut file = tempfile::tempfile()?;
+        file.write_all(b"0123456789")?;
+        file.seek(SeekFrom::Start(3))?;
+        let before = flags(&file);
+        let mut stdout = ProxyStdout::new(file.as_fd())?;
+        assert_eq!(flags(&file), before);
+        assert!(stdout.relay(b"mcp", &AtomicBool::new(false))?);
+        file.write_all(b"!")?;
+        file.rewind()?;
+        // The harness can change append behavior while the proxy is connected.
+        assert_eq!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, before | libc::O_APPEND) },
+            0
+        );
+        assert!(stdout.relay(b"end", &AtomicBool::new(false))?);
+        drop(stdout);
+        assert_ne!(flags(&file) & libc::O_APPEND, 0);
+        file.rewind()?;
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
+        assert_eq!(content, "012mcp!789end");
+        Ok(())
+    }
+
+    #[test]
+    fn socket_stdout_preserves_flags_and_stops_when_its_reader_stalls() -> io::Result<()> {
+        let (socket, mut reader) = UnixStream::pair()?;
+        let before = flags(&socket);
+        let mut stdout = ProxyStdout::new(socket.as_fd())?;
+        assert!(stdout.relay(b"mcp", &AtomicBool::new(false))?);
+        let mut reply = [0; 3];
+        reader.read_exact(&mut reply)?;
+        assert_eq!(&reply, b"mcp");
+        assert_eq!(flags(&socket), before);
+        let cancel = AtomicBool::new(true);
+        // The reader stays open. Each successful send fills the bounded socket
+        // buffer until per-write nonblocking delivery observes backpressure.
+        let chunk = [0; 8192];
+        while stdout.relay(&chunk, &cancel)? {}
+        assert_eq!(flags(&socket), before);
+        Ok(())
+    }
+
+    #[test]
+    fn pipe_stdout_bounds_writes_with_an_inherited_blocking_descriptor() -> io::Result<()> {
+        let (mut reader, writer) = io::pipe()?;
+        let before = flags(&writer);
+        let mut stdout = ProxyStdout::new(writer.as_fd())?;
+        assert!(stdout.relay(b"mcp", &AtomicBool::new(false))?);
+        let mut reply = [0; 3];
+        reader.read_exact(&mut reply)?;
+        assert_eq!(&reply, b"mcp");
+        assert_eq!(flags(&writer), before);
+
+        // Exercise the no-procfs path on Linux too. Poll guarantees no more
+        // than one atomic write. A larger blocking write could strand teardown.
+        let mut stdout = ProxyStdout {
+            file: File::from(writer.as_fd().try_clone_to_owned()?),
+            mode: OutputMode::PollPipe,
+        };
+        let chunk = vec![0; libc::PIPE_BUF * 2];
+        assert_eq!(stdout.try_write(&chunk)?, libc::PIPE_BUF);
+        let cancel = AtomicBool::new(true);
+        while stdout.relay(&chunk, &cancel)? {}
+        assert_eq!(flags(&writer), before);
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn terminal_stdout_keeps_the_harness_terminal_blocking() -> io::Result<()> {
+        let (mut master, mut slave) = (-1, -1);
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // openpty transferred ownership of both descriptors on success.
+        let mut master = unsafe { File::from_raw_fd(master) };
+        let slave = unsafe { File::from_raw_fd(slave) };
+        let before = flags(&slave);
+        let mut stdout = ProxyStdout::new(slave.as_fd())?;
+        assert_eq!(flags(&slave), before);
+        assert!(stdout.relay(b"mcp", &AtomicBool::new(false))?);
+        let mut reply = [0; 3];
+        master.read_exact(&mut reply)?;
+        assert_eq!(&reply, b"mcp");
+        assert_eq!(flags(&slave), before);
+        Ok(())
+    }
 }

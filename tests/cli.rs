@@ -568,12 +568,14 @@ fn managed_proxy_exits_when_daemon_stops_with_stdout_full() -> Result<()> {
     let daemon = common::TestDaemon::start()?;
     let dir = tempdir()?;
     fixture(dir.path())?;
-    for limit in [None, Some(4096)] {
+    for (limit, close_input) in [(None, false), (Some(4096), true)] {
         let mut raw = [0; 2];
         assert_eq!(unsafe { libc::pipe2(raw.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
         // SAFETY: pipe2 succeeded and transfers two distinct descriptors.
         let stdout = unsafe { OwnedFd::from_raw_fd(raw[0]) };
         let observer = unsafe { OwnedFd::from_raw_fd(raw[1]) };
+        let inherited_flags = unsafe { libc::fcntl(observer.as_raw_fd(), libc::F_GETFL) };
+        assert!(inherited_flags >= 0);
         if let Some(limit) = limit {
             // The kernel rounds the requested capacity up to its page size.
             let actual = unsafe { libc::fcntl(observer.as_raw_fd(), libc::F_SETPIPE_SZ, limit) };
@@ -595,7 +597,8 @@ fn managed_proxy_exits_when_daemon_stops_with_stdout_full() -> Result<()> {
         let mut stdin = proxy.child.stdin.take().unwrap();
         proxy.writer = Some(thread::spawn(move || {
             // Tool schemas fill a normal pipe without requiring a large fixture.
-            for id in 0..1024 {
+            let count = if close_input { 4 } else { 1024 };
+            for id in 0..count {
                 if writeln!(
                     stdin,
                     "{}",
@@ -655,11 +658,36 @@ fn managed_proxy_exits_when_daemon_stops_with_stdout_full() -> Result<()> {
             );
             thread::sleep(Duration::from_millis(20));
         }
-        drop(observer);
+        assert_eq!(
+            unsafe { libc::fcntl(observer.as_raw_fd(), libc::F_GETFL) },
+            inherited_flags,
+            "the proxy changed the harness stdout flags"
+        );
         let (sessions, _) = daemon.client()?.list_sessions(false)?;
         assert_eq!(sessions.len(), 1);
         let worker_pid = sessions[0].worker_pid;
         assert!(worker_pid > 1);
+        if close_input {
+            // Hold this worker across EOF so the daemon reports an explicit stop
+            // during the drain. Normal EOF may otherwise complete first.
+            assert_eq!(unsafe { libc::kill(worker_pid as i32, libc::SIGSTOP) }, 0);
+            drop(proxy.writer.take().unwrap().join().unwrap());
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let (sessions, _) = daemon.client()?.list_sessions(false)?;
+                if sessions
+                    .iter()
+                    .any(|s| s.state == tsindex::daemon::SessionState::Draining)
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the half-close never reached the daemon"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
         daemon.client()?.kill_all()?;
         let deadline = Instant::now() + Duration::from_secs(6);
         while proxy.child.try_wait()?.is_none() {
@@ -669,7 +697,13 @@ fn managed_proxy_exits_when_daemon_stops_with_stdout_full() -> Result<()> {
             );
             thread::sleep(Duration::from_millis(20));
         }
-        proxy.writer.take().unwrap().join().unwrap();
+        if let Some(writer) = proxy.writer.take() {
+            writer.join().unwrap();
+        }
+        assert_eq!(
+            unsafe { libc::fcntl(observer.as_raw_fd(), libc::F_GETFL) },
+            inherited_flags
+        );
         daemon.wait_active_sessions(0, Duration::from_secs(3))?;
         assert_eq!(unsafe { libc::kill(worker_pid as i32, 0) }, -1);
         assert_eq!(

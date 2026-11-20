@@ -447,14 +447,32 @@ tsindex --root /path/to/repo serve --mcp --via-daemon
 ```
 
 The login service manager owns the private Unix socket and starts the
-orchestrator on demand. `launchd` provides the socket on macOS and a
-`systemd --user` socket unit provides it on Linux. The idle orchestrator opens
-zero databases and filesystem watchers. It launches one worker per connection,
-so each session keeps its own checkout and language settings while file leases
-coordinate shared index state. Installation, service start, and launchd
-bootstrap validate endpoint ownership and file type before the manager binds
-its reserved socket. The Linux socket unit also runs a pre-bind validation
-hook when activated.
+orchestrator on demand. It uses launchd on macOS and a systemd user socket on
+Linux. The orchestrator starts with no index or watcher. The first connection
+opens an indexing process that owns the checkout's watcher, refresh
+coordination, and warm linked-checkout cache. Other connections with the same
+checkout, database selection, language filters, refresh mode, and effective
+configuration reuse that process. Different checkouts get separate index owners.
+
+Each connection has its own MCP worker, request IDs, pending edits, output, and
+exit status. Killing or closing one session leaves its peers usable. After the
+last session closes, the daemon keeps the index warm for 60 seconds and retains
+at most four idle index owners. Set `TSINDEX_RUNTIME_IDLE_SECS` in the daemon's
+environment to change that interval. A value of zero releases unused owners on
+the next sweep. If an index owner crashes, its sessions end and reconnecting
+starts a fresh owner. A timed-out lookup retires that generation for future
+connections. Existing peers can finish their work. If a new connection finds
+the index process stopped by a signal, the daemon replaces it and releases its
+file leases. `daemon sessions` shows the session worker and index
+runtime PIDs, so two clients can verify what they share.
+
+`tsindex daemon status` reports the effective session maximum. The daemon caps
+`TSINDEX_MAX_SESSIONS` (default 128) against its inherited open-file limit and
+reserves descriptors for idle index owners, concurrent worker launches, and
+lifecycle commands. A full daemon can still report status and stop sessions.
+
+Installation and service startup validate the reserved socket's ownership and
+file type. Linux also checks before each socket-unit bind.
 
 ```bash
 tsindex daemon start          # activate the installed service or start manually
@@ -463,16 +481,34 @@ tsindex daemon sessions       # list active sessions
 tsindex daemon sessions --all # include recent sessions
 tsindex daemon sessions --id <id> # fetch one session and recent worker stderr
 tsindex daemon kill <id>      # terminate one session (--all for every session)
-tsindex daemon restart        # restart after a binary upgrade
+tsindex daemon restart        # replace the supervisor and end its sessions
 tsindex daemon stop           # stop accepting sessions and tear down workers
 tsindex daemon uninstall      # stop and remove the login service
 ```
 
 `$TSINDEX_HOME/run/daemon.sock` overrides the platform runtime location.
 `--socket` and `$TSINDEX_SOCKET` select a custom endpoint. Use a dedicated,
-private directory for it. The installed service persists the resolved endpoint,
-including environment-derived overrides. Manual foreground operation uses
-`tsindex daemon run` and the same ownership and permissions checks.
+private directory for it. The installed service remembers the resolved endpoint.
+Bare lifecycle and proxy commands discover it in its installation scope.
+Explicit socket selections still address the specified endpoint. There is one
+installed service per account. Its definition must be in the active user
+manager's configuration search path. On Linux, a user manager that stops at
+logout also stops the daemon. Administrators who require service across logouts
+can configure lingering for that user. [systemd loginctl manual][linger]
+
+[linger]: https://www.freedesktop.org/software/systemd/man/latest/loginctl.html
+
+Run service lifecycle commands in the manager's PID namespace with access to
+its user service domain. For a manual daemon, use the launcher's PID namespace.
+A trusted MCP client in another Linux PID namespace can use
+`serve --mcp --via-daemon` when its harness grants access to the socket.
+
+Harnesses that share a confinement policy can run a separate foreground
+`tsindex daemon run` inside that policy, with a dedicated private socket and
+index/cache locations. Point those harnesses at that socket with
+`--socket /private/path/daemon.sock` and `serve --mcp --via-daemon`. Keep
+the user's broader login-daemon socket outside the sandbox. Use direct MCP when
+the harness only launches one server or restricts local socket access.
 
 Managed startup acknowledges a session after its worker initializes. A
 dedicated outcome connection carries its final status through daemon stop and
@@ -496,7 +532,17 @@ detects daemon hangup while stdout is blocked.
 Direct MCP, managed MCP, `serve --http --session-pid`, and
 `watch --session-pid` check owner process identity. Linux inspects process
 start time to distinguish PID reuse and an exited zombie process from a leader
-with surviving threads. `watch --exit-with-parent` tracks its immediate parent.
+with surviving threads. A managed proxy in another Linux PID namespace can
+use its inferred owner. An explicit `--session-pid` needs a PID from the same
+namespace as the daemon. Use direct MCP for an explicit sandbox-local PID.
+`watch --exit-with-parent` tracks its immediate parent.
+
+A session here means one MCP connection. A host can keep that connection and
+owner process alive across several conversations. Ending a conversation alone
+then leaves the connection active. The host can close its transport or an
+operator can terminate the session by ID. Compatible protocol versions keep
+working across package upgrades. Restart the daemon when its control protocol
+changes. A deliberate restart ends all its current connections.
 
 The server exposes five read tools:
 

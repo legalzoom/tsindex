@@ -39,6 +39,11 @@ filesystem view of untrusted sandboxed processes. A reachable same-user broker
 can read and modify files using its own permissions. A path supplied by a
 client carries no proof of that client's kernel sandbox.
 
+Managed session workers receive an inherited private socket for their checkout's
+index owner. It has no filesystem address for another client to open. To share
+inside a sandbox, run its own foreground daemon within the same restrictions
+and give only those harnesses its private socket and index storage.
+
 The HTTP server binds to `127.0.0.1` by default. Host and Origin validation reduce
 browser-based attacks, but do not authenticate clients. The HTTP API includes
 repository cloning, removal, and rebuild operations. Keep the default loopback

@@ -1,4 +1,4 @@
-# Preserve harness sandboxes and offer shared supervision to trusted sessions
+# Share warm indexes across trusted sessions and preserve harness sandboxes
 
 Each MCP session needs a source index, coordinated watcher ownership, and a
 bounded process lifetime. Some harnesses restrict filesystem access with a
@@ -33,31 +33,48 @@ unit repeats validation in a pre-bind hook on activation. The orchestrator
 starts without databases or watchers. A manual foreground command can also
 bind a validated private endpoint.
 
-One worker per managed connection preserves session-specific root, language,
-and refresh settings. Existing writer and watcher leases and immutable
-worktree overlays coordinate shared disk state. The supervisor atomically
-reserves a session slot during startup and accounts for it through teardown.
-Workers acknowledge successful initialization before the client receives a
-session acknowledgement. Startup failures reach the client with a failing
-exit status and bounded diagnostics.
+The shared unit is a compatible checkout's indexing runtime. It owns watcher
+registration, primary freshness, and the cache of linked-checkout refreshes.
+A dedicated process per runtime gives those resources a finite lifetime.
+Process acquisition is serialized and concurrent clients can attach while the
+owner initializes. Settings changes create a new generation. File leases still
+coordinate durable state with direct MCP, CLI writers, and older installations.
 
-A direct stop event starts teardown independently of relay-pipe progress.
-Normal EOF gets a bounded drain, followed by TERM/KILL and child reaping when
-needed. Linux and manual foreground daemons assign a process group per worker
-and clear remaining members. Linux adds parent-death signaling for the direct
-child and service-level control-group escalation with `KillMode=mixed`.
-Socket-activated macOS workers remain in launchd's job group for cleanup on
-daemon failure. Per-session teardown targets their direct worker PID. Current
-MCP worker operations run in-process. Future helpers on every platform require
-explicit containment, including helpers that leave their original process
-group. Linux's cgroup backstop covers whole-service stops, and manual daemons
-rely on their own process supervision. The proxy registers a dedicated outcome
-connection before forwarding MCP.
-The supervisor sends the reaped worker's status through that existing
-connection even while shutdown stops accepting new clients. Session listings
-are paginated, and stderr detail is retained by bytes.
+Each connection has a separate MCP worker so closing a session can interrupt
+its running edits and discard its queued requests. Workers inherit a private
+runtime channel. A request carries its own reply descriptor, and MCP request
+IDs never enter the shared channel. A stopped or crashed index owner affects
+only its attached sessions. The pool retains at most four idle owners for a
+default 60 seconds to cover short reconnects. The daemon releases all index
+owners on shutdown.
+
+The supervisor reserves a session slot during startup and holds it through
+teardown. Workers acknowledge successful initialization before the client
+receives a session acknowledgement. Startup failures reach the client with a
+failing exit status and bounded diagnostics.
+
+A direct stop event starts teardown independently of relay-pipe progress. Normal
+stdin EOF drains accepted requests while the proxy can receive results. A forced
+stop or lost client gets bounded teardown, escalation, and reaping. Linux and
+manual foreground daemons assign a process group per worker and clear remaining
+members. Linux adds parent-death signaling for the direct child and
+service-level control-group escalation with `KillMode=mixed`. Socket-activated
+macOS workers remain in launchd's job group for cleanup on daemon failure.
+Per-session teardown targets their direct worker PID. Current MCP worker
+operations run in-process. Future helpers on every platform require explicit
+containment, including helpers that leave their original process group. Linux's
+cgroup backstop covers whole-service stops, and manual daemons rely on their own
+process supervision. The proxy registers a dedicated outcome connection before
+forwarding MCP. The supervisor sends the reaped worker's status through that
+existing connection even while shutdown stops accepting new clients. Session
+listings are paginated, and stderr detail is retained by bytes.
 
 The daemon centralizes inspection and termination for trusted managed sessions.
 The direct path keeps sandboxed sessions inside the harness's existing kernel
 boundary. Both paths retain process-identity owner monitoring and the same MCP
 retrieval and editing semantics.
+
+
+The lifetime observed by this design is the transport connection and its
+owner process. A host can keep both alive while switching conversations. A
+logical conversation lease requires an explicit release signal from that host.

@@ -18,7 +18,7 @@ separate indexes or source-discovery rules.
   read views. `src/maintenance.rs` coordinates database writers, watcher
   ownership, and successful full-refresh markers across server processes.
 - `src/daemon/` implements the login-started user orchestrator (`orchestrator.rs`),
-  the thin `serve --mcp --via-daemon` stdio proxy (`proxy.rs`), and login service
+  the warm index pool (`runtime.rs`), the stdio proxy (`proxy.rs`), and service
   management (`service.rs`) for macOS `launchd` and Linux `systemd --user`.
 
 ## Checkout storage
@@ -219,12 +219,13 @@ sandbox launcher. The README includes a Linux bubblewrap command that grants
 one writable workspace and read-only runtime dependencies. Source data,
 databases with cached snippets, and caches share the harness's access policy.
 
-Trusted clients opt into shared supervision using `--mcp --via-daemon`.
-The proxy and daemon authenticate their Unix socket peers by effective user
-identity. Reaching the daemon endpoint grants that user's daemon authority,
-including source modification. The endpoint belongs outside the mount view
-of untrusted clients. Explicit transport selection keeps filesystem authority
-visible in the host configuration.
+Trusted clients opt into shared supervision using `--mcp --via-daemon`. The
+daemon authenticates clients by effective user identity. The proxy verifies the
+private endpoint and server credentials. On macOS a manager-owned listener can
+retain launchd's root creator credentials after handoff. Reaching the daemon
+endpoint grants that user's daemon authority, including source modification. The
+endpoint belongs outside the mount view of untrusted clients. Explicit transport
+selection keeps filesystem authority visible in the host configuration.
 
 The installed service uses a manager-owned Unix listening socket. systemd
 provides its listening descriptor to `tsindex daemon run --socket-activated` on
@@ -238,8 +239,31 @@ complete socket filename. Directory validation checks ownership and private
 permissions before either side connects or creates runtime files.
 
 The orchestrator starts without opening databases or registering watchers.
-It reserves a starting-session slot before launching each worker and rejects
-new sessions during shutdown. Linux and manual foreground daemons give workers
+A trusted session receives an MCP worker and a lease on a shared index owner.
+The pool serializes process creation. Its key includes the canonical checkout,
+explicit database override (which disables repo pruning), normalized language
+filters, refresh policy, effective configuration digest, and executable image.
+The digest covers the projected settings of an uninitialized linked worktree
+and is checked against the settings actually loaded by the index owner.
+
+Each index owner retains one `Runtimes` registry, including its primary
+maintenance coordinator and lazy linked-checkout cache. A private inherited
+Unix socket grants access to it. A worker requests checkout resolution over
+that socket and passes a fresh reply descriptor with `SCM_RIGHTS`. Four
+resolver threads bound concurrent index lookups. The worker executes queries
+and edits locally against the resolved snapshot. Session request IDs, queues,
+outputs, and cancellation all stay local. Killing a worker stops its edits.
+Background index maintenance can finish for other clients.
+
+The last connection releases its lease. At most four idle owners survive for a
+default 60 seconds. An index-owner crash ends its attached sessions, and the
+next connection starts a new process. The daemon retains and reaps each child. A
+private lifetime pipe wakes an index owner when the daemon dies. Linux also ties
+its parent-death signal to the long-lived pool thread. This keeps live sessions
+independent of the thread that accepted the first client.
+
+The daemon reserves a session slot before launching children and rejects new
+sessions during shutdown. Linux and manual foreground daemons give workers
 separate process groups for per-session cleanup. Linux also applies
 parent-death signaling to the direct worker. Service-level cleanup on Linux
 uses `KillMode=mixed`, allowing the supervisor to receive the initial
@@ -276,9 +300,10 @@ Per-session diagnostics retain up to 16 KiB and are fetched separately through
 Direct MCP and HTTP/watch ownership use `SessionLifecycle`. Managed MCP shares
 one orchestrator sweeper using `ProcessOwner`. Both inspect process identity,
 including start time for PID reuse. Linux reads process metadata as bytes and
-uses the thread count from the same stat record to distinguish an exited
-leader with surviving threads from an entirely exited process. See
-[ADR 0004](adrs/0004-orchestrator-daemon.md).
+uses the thread count from the same stat record to distinguish an exited leader
+with surviving threads from an entirely exited process. A connection can span
+multiple conversations when its host retains the transport and owner process.
+See [ADR 0004](adrs/0004-orchestrator-daemon.md).
 
 ## Filesystem updates
 

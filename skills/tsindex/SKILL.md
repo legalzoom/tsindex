@@ -48,7 +48,9 @@ repository README's "MCP servers and the shared daemon" section.
 Trusted unrestricted sessions can opt into the shared user daemon with
 `serve --mcp --via-daemon` after `tsindex daemon install`. This grants the
 session the daemon's filesystem authority, including `replace_symbol` writes.
-Keep the daemon socket outside an untrusted sandbox's mounted filesystem.
+Compatible trusted sessions share their warm index and watcher. Each connection
+owns its pending requests and edits. Keep the daemon socket outside an
+untrusted sandbox's mounted filesystem.
 
 To keep a
 foreground watcher attached to the current shell for CLI-only sessions that
@@ -165,7 +167,9 @@ separate `watch` only matters for CLI-only sessions.
 ## Guardrails
 
 - Keep this skill scoped to tsindex startup and code-reading behavior.
-- Only install or start the `tsindex` orchestrator daemon (`tsindex daemon install` / `tsindex daemon start`) when the user requests it or when `serve --mcp` reports the daemon is not running.
+- Install or start the orchestrator only when the user requests it. The default
+  `serve --mcp` works directly. A configured `--via-daemon` launch needs its
+  selected daemon endpoint to be available.
 - Do not add product-specific paths, repo names, patterns, or MCP tools.
 - Use tsindex for code structure, not string search.
 - Fall back gracefully to `rg` and targeted reads when MCP tools are

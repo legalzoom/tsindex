@@ -1,13 +1,156 @@
-//! Descriptor inheritance across daemon and worker exec.
+//! Transfer a session endpoint over a private Unix socket and bound the
+//! descriptors that survive an exec of a daemon, runtime, or worker.
+
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::mem::{self, size_of};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
-#[cfg(target_os = "macos")]
-use std::{mem::size_of, ptr};
-#[cfg(not(target_os = "macos"))]
-use std::mem;
+use std::ptr;
+
+const FD_MARKER: u8 = 1;
+const fn control_space(count: usize) -> usize {
+    unsafe { libc::CMSG_SPACE((count * size_of::<RawFd>()) as _) as usize }
+}
+
+#[repr(C)]
+struct Control<const N: usize> {
+    // cmsghdr requires native alignment; a plain byte array has alignment one.
+    _alignment: [libc::cmsghdr; 0],
+    bytes: [u8; N],
+}
+
+impl<const N: usize> Control<N> {
+    fn new() -> Self {
+        Self {
+            _alignment: [],
+            bytes: [0; N],
+        }
+    }
+
+    fn header(&mut self, io: &mut libc::iovec) -> libc::msghdr {
+        let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+        msg.msg_iov = io;
+        msg.msg_iovlen = 1;
+        msg.msg_control = self.bytes.as_mut_ptr().cast();
+        msg.msg_controllen = N as _;
+        msg
+    }
+}
+
+pub(super) fn send_fd(channel: &UnixStream, fd: BorrowedFd<'_>) -> io::Result<()> {
+    let mut control = Control::<{ control_space(1) }>::new();
+    let mut marker = FD_MARKER;
+    let mut iov = libc::iovec {
+        iov_base: (&raw mut marker).cast(),
+        iov_len: 1,
+    };
+    let msg = control.header(&mut iov);
+    // One payload byte associates exactly one descriptor transfer with this
+    // stream position. The sender retains ownership until sendmsg completes.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as _) as _;
+        ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>(), fd.as_raw_fd());
+    }
+    loop {
+        let n = unsafe { libc::sendmsg(channel.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
+        if n == 1 {
+            return Ok(());
+        }
+        if n == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+pub(super) fn recv_fd(channel: &UnixStream) -> io::Result<Option<OwnedFd>> {
+    // XNU installs descriptor rights before copying control data to userspace.
+    // Reserve its entire UIPC_MAX_CMSG_FD (512), also covering Linux's 253,
+    // so rejection of an oversized transfer can close every received fd.
+    let mut control = Control::<{ control_space(512) }>::new();
+    let mut marker = 0u8;
+    let mut iov = libc::iovec {
+        iov_base: (&raw mut marker).cast(),
+        iov_len: 1,
+    };
+    #[cfg(target_os = "linux")]
+    let flags = libc::MSG_CMSG_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = 0;
+    loop {
+        let mut msg = control.header(&mut iov);
+        let n = unsafe { libc::recvmsg(channel.as_raw_fd(), &mut msg, flags) };
+        if n < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if n == 0 && msg.msg_controllen == 0 {
+            return Ok(None);
+        }
+        let mut valid = n == 1 && marker == FD_MARKER && msg.msg_flags & libc::MSG_CTRUNC == 0;
+        let mut received = None;
+        // recvmsg constructs the headers. Bound each payload to the storage it
+        // actually returned, and take ownership of every fd before rejecting.
+        #[allow(clippy::unnecessary_cast)] // Darwin uses socklen_t, Linux size_t.
+        unsafe {
+            let end = msg.msg_control as usize + msg.msg_controllen as usize;
+            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+            while !cmsg.is_null() {
+                let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
+                let start = data as usize;
+                let claimed = (*cmsg).cmsg_len as usize;
+                let capacity = end - cmsg as usize;
+                if claimed < libc::CMSG_LEN(0) as usize || start > end {
+                    valid = false;
+                    break;
+                }
+                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                    let bytes = claimed.min(capacity) - (start - cmsg as usize);
+                    valid &= claimed <= capacity && bytes.is_multiple_of(size_of::<RawFd>());
+                    for i in 0..bytes / size_of::<RawFd>() {
+                        let fd = OwnedFd::from_raw_fd(ptr::read_unaligned(data.add(i)));
+                        if received.is_some() {
+                            valid = false;
+                        } else {
+                            received = Some(fd);
+                        }
+                    }
+                } else {
+                    valid = false;
+                }
+                if claimed > capacity {
+                    break;
+                }
+                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+            }
+        }
+        if !valid || received.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected one descriptor and its marker on the runtime channel",
+            ));
+        }
+        #[cfg(not(target_os = "linux"))]
+        if let Some(fd) = &received {
+            // Darwin lacks MSG_CMSG_CLOEXEC. The corresponding fork-side sweep
+            // covers a concurrent worker spawn before this fcntl completes.
+            set_fd_flags(fd.as_raw_fd(), libc::FD_CLOEXEC)?;
+        }
+        return Ok(received);
+    }
+}
 
 fn set_fd_flags(fd: RawFd, flags: libc::c_int) -> io::Result<()> {
     loop {
@@ -161,8 +304,70 @@ fn sweep_cloexec(ceiling: RawFd) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
     use std::os::fd::AsFd;
-    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    #[test]
+    fn passed_socket_stays_connected_and_close_on_exec() -> io::Result<()> {
+        let (send, receive) = UnixStream::pair()?;
+        let (session, mut peer) = UnixStream::pair()?;
+        send_fd(&send, session.as_fd())?;
+        drop(session);
+        let incoming = recv_fd(&receive)?.expect("session fd");
+        assert_ne!(
+            unsafe { libc::fcntl(incoming.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        let mut socket = UnixStream::from(incoming);
+        socket.write_all(b"ping")?;
+        let mut bytes = [0; 4];
+        peer.read_exact(&mut bytes)?;
+        assert_eq!(&bytes, b"ping");
+        drop(send);
+        assert!(recv_fd(&receive)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_runtime_transfers_close_all_received_descriptors() -> io::Result<()> {
+        let (mut send, receive) = UnixStream::pair()?;
+        send.write_all(&[FD_MARKER])?;
+        assert_eq!(
+            recv_fd(&receive).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let (session, mut peer) = UnixStream::pair()?;
+        let mut control = Control::<{ control_space(2) }>::new();
+        let mut marker = FD_MARKER;
+        let mut iov = libc::iovec {
+            iov_base: (&raw mut marker).cast(),
+            iov_len: 1,
+        };
+        let msg = control.header(&mut iov);
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN((size_of::<RawFd>() * 2) as _) as _;
+            let fds = libc::CMSG_DATA(cmsg).cast::<RawFd>();
+            ptr::write_unaligned(fds, session.as_raw_fd());
+            ptr::write_unaligned(fds.add(1), session.as_raw_fd());
+            assert_eq!(libc::sendmsg(send.as_raw_fd(), &msg, 0), 1);
+        }
+        assert_eq!(
+            recv_fd(&receive).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        drop(session);
+        peer.set_read_timeout(Some(Duration::from_secs(1)))?;
+        assert_eq!(
+            peer.read(&mut [0])?,
+            0,
+            "the receiver retained an extra descriptor"
+        );
+        Ok(())
+    }
 
     #[test]
     fn exec_keeps_only_the_requested_capability_at_its_original_number() -> io::Result<()> {

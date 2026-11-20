@@ -30,12 +30,22 @@ struct McpSession {
 
 impl McpSession {
     fn connect(socket: &Path, root: &Path, harness_name: &str) -> Result<Self> {
+        Self::connect_with(socket, root, harness_name, &["--no-refresh"])
+    }
+
+    fn connect_with(
+        socket: &Path,
+        root: &Path,
+        harness_name: &str,
+        options: &[&str],
+    ) -> Result<Self> {
         let mut child = Command::new(BIN)
             .arg("--socket")
             .arg(socket)
             .arg("--root")
             .arg(root)
-            .args(["--no-refresh", "serve", "--mcp", "--via-daemon"])
+            .args(options)
+            .args(["serve", "--mcp", "--via-daemon"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -90,7 +100,9 @@ impl McpSession {
             .responses
             .recv_timeout(Duration::from_secs(10))
             .context("timed out waiting for MCP response")??;
-        serde_json::from_str(&line).context("invalid JSON-RPC response")
+        let response: Value = serde_json::from_str(&line).context("invalid JSON-RPC response")?;
+        assert_eq!(response["id"], self.next_id, "reply to a different request");
+        Ok(response)
     }
 
     fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
@@ -234,10 +246,366 @@ fn daemon_starts_idle_without_sessions_or_watchers() -> Result<()> {
     assert_eq!(status["daemon"]["daemon_pid"], daemon.pid());
     assert_eq!(status["daemon"]["active_sessions"], 0);
     assert_eq!(status["daemon"]["total_sessions_started"], 0);
+    assert_eq!(status["daemon"]["index_runtimes"], 0);
 
     let sessions = daemon_json(&daemon.socket, &["daemon", "sessions"])?;
     assert_eq!(sessions["active"].as_array().unwrap().len(), 0);
     assert_eq!(sessions["recent"].as_array().unwrap().len(), 0);
+    Ok(())
+}
+
+fn link_checkout(main: &Path, checkout: &Path, name: &str) -> Result<()> {
+    let metadata = main.join(".git/worktrees").join(name);
+    fs::create_dir_all(&metadata)?;
+    fs::create_dir_all(checkout)?;
+    fs::write(
+        checkout.join(".git"),
+        format!("gitdir: {}\n", metadata.display()),
+    )?;
+    fs::write(metadata.join("commondir"), "../..\n")?;
+    fs::write(
+        metadata.join("gitdir"),
+        format!("{}\n", checkout.join(".git").display()),
+    )?;
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct ManagedSession {
+    session_id: String,
+    worker_pid: u32,
+    runtime_pid: u32,
+}
+
+fn managed_session(daemon: &common::TestDaemon, name: &str) -> Result<ManagedSession> {
+    let sessions = daemon_json(&daemon.socket, &["daemon", "sessions"])?;
+    let info = sessions["active"]
+        .as_array()
+        .context("missing sessions")?
+        .iter()
+        .find(|item| item["harness_name"] == name)
+        .with_context(|| format!("missing session for {name}"))?;
+    let session: ManagedSession =
+        serde_json::from_value(info.clone()).context("missing runtime or session worker PID")?;
+    assert_ne!(session.worker_pid, session.runtime_pid);
+    assert_ne!(session.runtime_pid, daemon.pid());
+    assert!(session.runtime_pid > 1 && pid_exists(session.runtime_pid));
+    Ok(session)
+}
+
+#[test]
+fn compatible_clients_share_indexing_and_keep_independent_mcp_sessions() -> Result<()> {
+    let daemon = common::TestDaemon::start_with_env(&[("TSINDEX_RUNTIME_IDLE_SECS", "60")])?;
+    let dir = tempdir_in("/tmp")?;
+    let root = dir.path();
+    build_fixture(root, "lib.py", "def shared_symbol():\n    return 1\n")?;
+
+    // Race the cold attach so admission must elect one runtime for both peers.
+    let (left, right) = thread::scope(|scope| {
+        let left = scope.spawn(|| McpSession::connect(&daemon.socket, root, "left"));
+        let right = scope.spawn(|| McpSession::connect(&daemon.socket, root, "right"));
+        (left.join().unwrap(), right.join().unwrap())
+    });
+    let (mut left, mut right) = (left?, right?);
+    let first = managed_session(&daemon, "left")?;
+    let second = managed_session(&daemon, "right")?;
+    assert_eq!(first.runtime_pid, second.runtime_pid);
+    assert_eq!(
+        daemon
+            .client()?
+            .session_detail(&first.session_id)?
+            .runtime_pid,
+        Some(first.runtime_pid)
+    );
+    assert_ne!(first.worker_pid, second.worker_pid);
+    assert_ne!(first.session_id, second.session_id);
+    assert_eq!(daemon.ping()?.index_runtimes, 1);
+
+    // Both initialized clients use request ID 2. A single crossed reply would
+    // turn one caller's hit into the other caller's miss.
+    let (hit, miss) = thread::scope(|scope| {
+        let hit = scope.spawn(|| left.call_tool("get_symbol", json!({"names":["shared_symbol"]})));
+        let miss = scope.spawn(|| right.call_tool("get_symbol", json!({"names":["absent"]})));
+        (hit.join().unwrap(), miss.join().unwrap())
+    });
+    assert_eq!(hit?["total"], 1);
+    assert_eq!(miss?["total"], 0);
+    daemon.client()?.kill_session(first.session_id)?;
+    daemon.wait_active_sessions(1, Duration::from_secs(5))?;
+    wait_pid_gone(first.worker_pid, Duration::from_secs(2))?;
+    assert_eq!(
+        right.call_tool("get_symbol", json!({"names":["shared_symbol"]}))?["total"],
+        1
+    );
+    right.close_gracefully()?;
+    daemon.wait_active_sessions(0, Duration::from_secs(3))?;
+    assert_eq!(
+        daemon.ping()?.index_runtimes,
+        1,
+        "the idle runtime stays resident"
+    );
+
+    let resumed = McpSession::connect(&daemon.socket, root, "resumed")?;
+    let reattached = managed_session(&daemon, "resumed")?;
+    assert_eq!(reattached.runtime_pid, first.runtime_pid);
+    assert_ne!(reattached.worker_pid, second.worker_pid);
+    resumed.close_gracefully()?;
+    daemon.client()?.shutdown()?;
+    wait_pid_gone(first.runtime_pid, Duration::from_secs(5))?;
+    Ok(())
+}
+
+#[test]
+fn shared_index_reuses_the_in_memory_linked_checkout_across_clients() -> Result<()> {
+    let daemon = common::TestDaemon::start_with_env(&[("TSINDEX_RUNTIME_IDLE_SECS", "60")])?;
+    let dir = tempdir_in("/tmp")?;
+    let main = dir.path().join("main");
+    let linked = dir.path().join("topic");
+    link_checkout(&main, &linked, "topic")?;
+    build_fixture(&main, "main.py", "def main_symbol():\n    return 1\n")?;
+    let mut config = TsIndexConfig::load(&main)?;
+    config.server.worktree_refresh_ms = 60_000;
+    config.write(&main)?;
+    fs::write(
+        linked.join("lib.py"),
+        "def cached_symbol():\n    return 2\n",
+    )?;
+    let old_symbol = json!({"repo":linked, "names":["cached_symbol"]});
+    let mut first = McpSession::connect(&daemon.socket, &main, "cache-first")?;
+    assert_eq!(
+        first.call_tool("get_symbol", old_symbol.clone())?["total"],
+        1
+    );
+    let warm = managed_session(&daemon, "cache-first")?;
+    first.close_gracefully()?;
+
+    // A fresh process would rebuild without this fixture's durable freshness
+    // marker and discover renamed_symbol. An already-warm checkout can serve
+    // its cached generation for the configured refresh interval.
+    let marker = tsindex::maintenance::refresh_marker_path(&tsindex::config::db_path(&linked));
+    fs::remove_file(&marker)?;
+    fs::write(
+        linked.join("lib.py"),
+        "def renamed_symbol():\n    return 3\n",
+    )?;
+    let mut second = McpSession::connect(&daemon.socket, &main, "cache-second")?;
+    assert_eq!(
+        managed_session(&daemon, "cache-second")?.runtime_pid,
+        warm.runtime_pid
+    );
+    assert_eq!(second.call_tool("get_symbol", old_symbol)?["total"], 1);
+    assert_eq!(
+        second.call_tool(
+            "get_symbol",
+            json!({"repo":linked,"names":["renamed_symbol"]})
+        )?["total"],
+        0
+    );
+    assert!(
+        !marker.exists(),
+        "a cold runtime reconciled the linked checkout"
+    );
+    second.close_gracefully()?;
+    Ok(())
+}
+
+#[test]
+fn incompatible_roots_databases_refresh_languages_and_configs_get_distinct_indexers() -> Result<()>
+{
+    let daemon = common::TestDaemon::start()?;
+    let dir = tempdir_in("/tmp")?;
+    let root = dir.path().join("first");
+    let other_root = dir.path().join("second");
+    build_fixture(&root, "lib.py", "def first_symbol():\n    return 1\n")?;
+    build_fixture(&other_root, "lib.py", "def other_symbol():\n    return 2\n")?;
+    let mut base = McpSession::connect(&daemon.socket, &root, "base")?;
+    let original = managed_session(&daemon, "base")?;
+    let external_db = dir.path().join("override.db");
+    let db = external_db.to_str().context("UTF-8 fixture path")?;
+    let default_db = tsindex::config::db_path(&root);
+    let explicit_default = default_db.to_str().context("UTF-8 fixture path")?;
+    for (name, path, options) in [
+        ("other-root", &other_root, &["--no-refresh"][..]),
+        ("other-db", &root, &["--no-refresh", "--db", db][..]),
+        // An explicit default database still changes repository pruning.
+        (
+            "explicit-default",
+            &root,
+            &["--no-refresh", "--db", explicit_default][..],
+        ),
+        ("refresh", &root, &[][..]),
+        (
+            "languages",
+            &root,
+            &["--no-refresh", "--languages", "rust"][..],
+        ),
+    ] {
+        let session = McpSession::connect_with(&daemon.socket, path, name, options)?;
+        assert_ne!(
+            managed_session(&daemon, name)?.runtime_pid,
+            original.runtime_pid,
+            "{name} reused the original runtime"
+        );
+        session.close_gracefully()?;
+    }
+    let mut config = TsIndexConfig::load(&root)?;
+    config.server.worktree_refresh_ms += 1234;
+    config.write(&root)?;
+    let changed = McpSession::connect(&daemon.socket, &root, "changed-config")?;
+    assert_ne!(
+        managed_session(&daemon, "changed-config")?.runtime_pid,
+        original.runtime_pid
+    );
+    assert_eq!(
+        base.call_tool("get_symbol", json!({"names":["first_symbol"]}))?["total"],
+        1
+    );
+    changed.close_gracefully()?;
+    base.close_gracefully()?;
+    Ok(())
+}
+
+#[test]
+fn managed_lookup_can_resolve_catalog_settings_larger_than_a_control_record() -> Result<()> {
+    let daemon = common::TestDaemon::start()?;
+    let dir = tempdir_in("/tmp")?;
+    build_fixture(dir.path(), "a.py", "def big_catalog():\n    pass\n")?;
+    let mut config = TsIndexConfig::load(dir.path())?;
+    config.ignore.extra = (0..3000)
+        .map(|n| format!("generated/vendor/component-{n}/"))
+        .collect();
+    config.write(dir.path())?;
+    let mut client = McpSession::connect(&daemon.socket, dir.path(), "large-config")?;
+    assert_eq!(
+        client.call_tool("get_symbol", json!({"names":["big_catalog"]}))?["total"],
+        1
+    );
+    client.close_gracefully()
+}
+
+#[test]
+fn a_new_session_replaces_a_stopped_index_owner() -> Result<()> {
+    let daemon = common::TestDaemon::start()?;
+    let dir = tempdir_in("/tmp")?;
+    build_fixture(dir.path(), "f.py", "def still_indexed():\n    pass\n")?;
+    let _original = McpSession::connect(&daemon.socket, dir.path(), "first")?;
+    let original_pid = managed_session(&daemon, "first")?.runtime_pid;
+    assert_eq!(
+        unsafe { libc::kill(original_pid as libc::pid_t, libc::SIGSTOP) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let state = Command::new("ps")
+            .args(["-o", "state=", "-p"])
+            .arg(original_pid.to_string())
+            .output()?;
+        if String::from_utf8_lossy(&state.stdout)
+            .trim_start()
+            .starts_with('T')
+        {
+            break;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "index owner did not stop");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut replacement = McpSession::connect(&daemon.socket, dir.path(), "replacement")?;
+    assert_ne!(
+        managed_session(&daemon, "replacement")?.runtime_pid,
+        original_pid
+    );
+    wait_pid_gone(original_pid, Duration::from_secs(3))?;
+    assert_eq!(
+        replacement.call_tool("get_symbol", json!({"names":["still_indexed"]}))?["total"],
+        1
+    );
+    replacement.close_gracefully()
+}
+
+#[test]
+fn indexer_loss_ends_only_its_attached_sessions_and_new_clients_recover() -> Result<()> {
+    let daemon = common::TestDaemon::start()?;
+    let dir = tempdir_in("/tmp")?;
+    let root = dir.path().join("first");
+    let unrelated = dir.path().join("unrelated");
+    build_fixture(&root, "a.py", "def recovered_symbol():\n    return 1\n")?;
+    build_fixture(
+        &unrelated,
+        "a.py",
+        "def unrelated_symbol():\n    return 2\n",
+    )?;
+    let mut first = McpSession::connect(&daemon.socket, &root, "first")?;
+    let mut second = McpSession::connect(&daemon.socket, &root, "second")?;
+    let mut other = McpSession::connect(&daemon.socket, &unrelated, "unrelated")?;
+    let runtime = managed_session(&daemon, "first")?.runtime_pid;
+    let backend = managed_session(&daemon, "second")?;
+    assert_eq!(runtime, backend.runtime_pid);
+    assert_ne!(runtime, managed_session(&daemon, "unrelated")?.runtime_pid);
+    assert_eq!(
+        unsafe { libc::kill(runtime as libc::pid_t, libc::SIGKILL) },
+        0
+    );
+    daemon.wait_active_sessions(1, Duration::from_secs(8))?;
+    wait_pid_gone(runtime, Duration::from_secs(3))?;
+    for session in [&mut first, &mut second] {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let status = loop {
+            if let Some(status) = session.child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                bail!("proxy did not report its runtime's exit");
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            !status.success(),
+            "runtime loss requires a failed proxy exit"
+        );
+    }
+    assert_eq!(
+        other.call_tool("get_symbol", json!({"names":["unrelated_symbol"]}))?["total"],
+        1
+    );
+    let mut recovered = McpSession::connect(&daemon.socket, &root, "recovered")?;
+    assert_ne!(managed_session(&daemon, "recovered")?.runtime_pid, runtime);
+    assert_eq!(
+        recovered.call_tool("get_symbol", json!({"names":["recovered_symbol"]}))?["total"],
+        1
+    );
+    recovered.close_gracefully()?;
+    other.close_gracefully()?;
+    Ok(())
+}
+
+#[test]
+fn idle_runtime_expires_only_after_the_final_session_releases_it() -> Result<()> {
+    let daemon = common::TestDaemon::start_with_env(&[("TSINDEX_RUNTIME_IDLE_SECS", "1")])?;
+    let dir = tempdir_in("/tmp")?;
+    build_fixture(dir.path(), "a.py", "def stable_symbol():\n    return 1\n")?;
+    let first = McpSession::connect(&daemon.socket, dir.path(), "first")?;
+    let mut second = McpSession::connect(&daemon.socket, dir.path(), "second")?;
+    let runtime = managed_session(&daemon, "first")?.runtime_pid;
+    first.close_gracefully()?;
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(managed_session(&daemon, "second")?.runtime_pid, runtime);
+    assert_eq!(
+        second.call_tool("get_symbol", json!({"names":["stable_symbol"]}))?["total"],
+        1
+    );
+    second.close_gracefully()?;
+    wait_pid_gone(runtime, Duration::from_secs(8))?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while daemon.ping()?.index_runtimes != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "status still counted the evicted runtime"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let fresh = McpSession::connect(&daemon.socket, dir.path(), "fresh")?;
+    assert_ne!(managed_session(&daemon, "fresh")?.runtime_pid, runtime);
+    fresh.close_gracefully()?;
     Ok(())
 }
 
@@ -249,16 +617,7 @@ fn orchestrator_dispatches_isolated_workers_for_two_worktree_sessions() -> Resul
     let main = dir.path().join("main");
     let wt = dir.path().join("wt-feature");
 
-    // Set up a main checkout and a sibling linked Git worktree with diverging symbols.
-    fs::create_dir_all(main.join(".git/worktrees/wt-feature"))?;
-    fs::create_dir_all(&wt)?;
-    let wt_meta = main.join(".git/worktrees/wt-feature");
-    fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_meta.display()))?;
-    fs::write(wt_meta.join("commondir"), "../..\n")?;
-    fs::write(
-        wt_meta.join("gitdir"),
-        format!("{}\n", wt.join(".git").display()),
-    )?;
+    link_checkout(&main, &wt, "wt-feature")?;
 
     build_fixture(&main, "app.py", "def from_main():\n    return 1\n")?;
     build_fixture(&wt, "app.py", "def from_worktree():\n    return 2\n")?;
@@ -321,6 +680,69 @@ fn orchestrator_dispatches_isolated_workers_for_two_worktree_sessions() -> Resul
 }
 
 #[test]
+fn daemon_normalizes_inherited_job_control_signals_before_spawning_children() -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let dir = tempdir_in("/tmp")?;
+    build_fixture(dir.path(), "lib.py", "def target():\n    return 1\n")?;
+    for termination in [libc::SIGTERM, libc::SIGINT] {
+        let daemon = common::TestDaemon::start_configured(&[], |cmd| {
+            // Only the fixture's forked child gets this launcher's signal state.
+            // The test runner and unrelated test processes retain their masks.
+            unsafe {
+                cmd.pre_exec(|| {
+                    let mut ignored: libc::sigaction = std::mem::zeroed();
+                    ignored.sa_sigaction = libc::SIG_IGN;
+                    libc::sigemptyset(&mut ignored.sa_mask);
+                    let mut blocked: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&mut blocked);
+                    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGCHLD] {
+                        ignored.sa_flags = if signal == libc::SIGCHLD {
+                            libc::SA_NOCLDWAIT
+                        } else {
+                            0
+                        };
+                        if libc::sigaction(signal, &ignored, std::ptr::null_mut()) < 0
+                            || libc::sigaddset(&mut blocked, signal) < 0
+                        {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    if libc::sigprocmask(libc::SIG_BLOCK, &blocked, std::ptr::null_mut()) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        })?;
+
+        let first = McpSession::connect(&daemon.socket, dir.path(), "inherited-signals")?;
+        let worker = managed_session(&daemon, "inherited-signals")?;
+        first.close_gracefully()?;
+        let outcome = daemon.client()?.session_detail(&worker.session_id)?;
+        assert_eq!(outcome.exit_reason.as_deref(), Some("client_eof"));
+        wait_pid_gone(worker.worker_pid, Duration::from_secs(1))?;
+
+        let (data, ready) = raw_session(&daemon.socket, dir.path())?;
+        let id = ready["session_id"].as_str().context("missing session ID")?;
+        let pid = ready["worker_pid"].as_u64().context("missing worker PID")? as u32;
+        let mut watcher = outcome_watch(&daemon.socket, id)?;
+        assert_eq!(
+            unsafe { libc::kill(daemon.pid() as libc::pid_t, termination) },
+            0
+        );
+        let mut line = String::new();
+        watcher.read_line(&mut line)?;
+        let outcome: Value = serde_json::from_str(&line)?;
+        assert_eq!(outcome["session"]["exit_reason"], "daemon_shutdown");
+        wait_pid_gone(pid, Duration::from_secs(1))?;
+        wait_pid_gone(worker.runtime_pid, Duration::from_secs(4))?;
+        drop(data);
+    }
+    Ok(())
+}
+
+#[test]
 fn proxy_sigkill_immediately_tears_down_and_reaps_worker() -> Result<()> {
     let daemon = common::TestDaemon::start()?;
     let dir = tempdir_in("/tmp")?;
@@ -339,6 +761,122 @@ fn proxy_sigkill_immediately_tears_down_and_reaps_worker() -> Result<()> {
 
     daemon.wait_active_sessions(0, Duration::from_secs(5))?;
     wait_pid_gone(worker_pid, Duration::from_secs(5))?;
+    Ok(())
+}
+
+#[test]
+fn losing_proxy_with_backpressured_worker_reaps_its_session() -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let daemon = common::TestDaemon::start()?;
+    let dir = tempdir_in("/tmp")?;
+    build_fixture(dir.path(), "lib.py", "def target():\n    return 1\n")?;
+    let mut proxy = McpSession::connect(&daemon.socket, dir.path(), "backpressure")?;
+    let sessions = daemon.client()?.list_sessions(false)?.0;
+    let pid = sessions[0].worker_pid;
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
+
+    // Fill a real proxy's stdin until backpressure reaches the harness. A
+    // stopped worker will never make that pipe writable on its own.
+    let stdin = proxy.child.stdin.as_mut().context("missing proxy stdin")?;
+    let fd = stdin.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let mut frame = br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_vec();
+    frame.resize(32 * 1024 - 1, b' ');
+    frame.push(b'\n');
+    let mut offset = 0;
+    let mut sent = 0;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if Instant::now() >= deadline || sent > 2 * tsindex::daemon::MAX_MCP_FRAME_BYTES {
+            bail!("proxy did not apply backpressure to harness writes");
+        }
+        match stdin.write(&frame[offset..]) {
+            Ok(0) => bail!("proxy stopped accepting input"),
+            Ok(n) => {
+                sent += n;
+                offset = (offset + n) % frame.len();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let mut writable = libc::pollfd {
+                    fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                let rc = unsafe { libc::poll(&mut writable, 1, 300) };
+                if rc == 0 && sent >= frame.len() {
+                    break;
+                }
+                if rc < 0
+                    && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    proxy.child.kill()?;
+    proxy.child.wait()?;
+    daemon.wait_active_sessions(0, Duration::from_secs(4))?;
+    wait_pid_gone(pid, Duration::from_secs(1))?;
+    Ok(())
+}
+
+#[test]
+fn proxy_half_close_waits_for_a_slow_accepted_call() -> Result<()> {
+    let daemon = common::TestDaemon::start()?;
+    let dir = tempdir_in("/tmp")?;
+    build_fixture(dir.path(), "lib.py", "def target():\n    return 1\n")?;
+    let mut proxy = McpSession::connect(&daemon.socket, dir.path(), "slow-request")?;
+    let pid = daemon.client()?.list_sessions(false)?.0[0].worker_pid;
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
+    let mut stdin = proxy.child.stdin.take().context("missing proxy stdin")?;
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc":"2.0","id":27,"method":"ping"})
+    )?;
+    drop(stdin);
+
+    // Keep the client connected beyond the former five-second EOF deadline.
+    // Wait until the daemon has actually seen EOF before starting the clock.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let sessions = daemon.client()?.list_sessions(false)?.0;
+        if sessions
+            .iter()
+            .any(|s| s.worker_pid == pid && s.state == tsindex::daemon::SessionState::Draining)
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            bail!("proxy did not forward stdin EOF");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_secs(6));
+    assert!(
+        daemon
+            .client()?
+            .list_sessions(false)?
+            .0
+            .iter()
+            .any(|s| s.worker_pid == pid)
+    );
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) }, 0);
+    let response = proxy.responses.recv_timeout(Duration::from_secs(3))??;
+    let response: Value = serde_json::from_str(&response)?;
+    assert_eq!(response["id"], 27);
+    assert!(response.get("result").is_some());
+    proxy.close_gracefully()?;
+    daemon.wait_active_sessions(0, Duration::from_secs(2))?;
     Ok(())
 }
 
@@ -504,6 +1042,14 @@ fn daemon_rejects_duplicate_instance_and_recovers_stale_socket_after_hard_kill()
 }
 
 fn raw_session(socket: &Path, root: &Path) -> Result<(std::os::unix::net::UnixStream, Value)> {
+    raw_session_version(socket, root, env!("CARGO_PKG_VERSION"))
+}
+
+fn raw_session_version(
+    socket: &Path,
+    root: &Path,
+    version: &str,
+) -> Result<(std::os::unix::net::UnixStream, Value)> {
     use std::os::unix::net::UnixStream;
     let mut stream = UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -512,7 +1058,7 @@ fn raw_session(socket: &Path, root: &Path) -> Result<(std::os::unix::net::UnixSt
         "{}",
         json!({
             "op": "start_session", "protocol": tsindex::daemon::PROTOCOL_VERSION,
-            "client_version": env!("CARGO_PKG_VERSION"), "root": root,
+            "client_version": version, "root": root,
             "client_pid": std::process::id(), "no_refresh": true,
         })
     )?;
@@ -571,6 +1117,43 @@ fn worker_config_errors_are_returned_before_session_ready() -> Result<()> {
         "{stderr}"
     );
     daemon.wait_active_sessions(0, Duration::from_secs(5))?;
+    Ok(())
+}
+
+#[test]
+fn inherited_descriptor_limit_preserves_controls_at_full_capacity() -> Result<()> {
+    let daemon = common::TestDaemon::start_with_nofile(96)?;
+    let client = daemon.client()?;
+    let capacity = client.ping()?.max_sessions.context("missing capacity")?;
+    assert!(
+        (1..10).contains(&capacity),
+        "unexpected low-limit capacity {capacity}"
+    );
+    let dir = tempdir_in("/tmp")?;
+    let mut clients = Vec::new();
+    for i in 0..capacity {
+        let project = dir.path().join(i.to_string());
+        fs::create_dir(&project)?;
+        build_fixture(&project, "lib.py", "def target(): return 1\n")?;
+        let (stream, reply) = raw_session(&daemon.socket, &project)?;
+        assert_eq!(reply["kind"], "session_ready", "{reply}");
+        let watch = outcome_watch(&daemon.socket, reply["session_id"].as_str().unwrap())?;
+        clients.push((stream, watch));
+    }
+    let (_stream, reply) = raw_session(&daemon.socket, &dir.path().join("0"))?;
+    assert_eq!(reply["kind"], "error");
+    assert!(
+        reply["error"]
+            .as_str()
+            .unwrap()
+            .contains("maximum concurrent sessions")
+    );
+    let full = client.ping()?;
+    assert_eq!(full.active_sessions, capacity);
+    assert_eq!(full.max_sessions, Some(capacity));
+    assert_eq!(client.kill_all()?.len(), capacity);
+    drop(clients);
+    daemon.wait_active_sessions(0, Duration::from_secs(3))?;
     Ok(())
 }
 
@@ -818,6 +1401,9 @@ fn active_session_accepts_only_one_outcome_watcher() -> Result<()> {
     let (stream, ready) = raw_session(&daemon.socket, dir.path())?;
     let id = ready["session_id"].as_str().unwrap();
     let mut watcher = outcome_watch(&daemon.socket, id)?;
+    // A raw watcher may signal it has finished sending and keep reading the
+    // worker outcome. This is different from losing both proxy connections.
+    watcher.get_ref().shutdown(std::net::Shutdown::Write)?;
     let mut duplicate = std::os::unix::net::UnixStream::connect(&daemon.socket)?;
     duplicate.set_read_timeout(Some(Duration::from_secs(5)))?;
     writeln!(
@@ -838,6 +1424,77 @@ fn active_session_accepts_only_one_outcome_watcher() -> Result<()> {
         "killed_by_user"
     );
     drop(stream);
+    Ok(())
+}
+
+#[test]
+fn compatible_wire_protocol_accepts_a_different_cli_package_version() -> Result<()> {
+    let daemon = common::TestDaemon::start()?;
+    let dir = tempdir_in("/tmp")?;
+    build_fixture(dir.path(), "a.py", "def target():\n    return 1\n")?;
+    let (mut stream, ready) = raw_session_version(&daemon.socket, dir.path(), "17.42.1")?;
+    assert_eq!(ready["kind"], "session_ready", "{ready}");
+    writeln!(
+        stream,
+        "{}",
+        json!({"jsonrpc":"2.0", "id":9, "method":"ping"})
+    )?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response)?;
+    let reply: Value = serde_json::from_str(&response)?;
+    assert_eq!(reply["id"], 9);
+    assert!(reply.get("result").is_some());
+    Ok(())
+}
+
+#[test]
+fn losing_outcome_connection_releases_worker_even_while_data_socket_stays_open() -> Result<()> {
+    let daemon = common::TestDaemon::start()?;
+    let dir = tempdir_in("/tmp")?;
+    build_fixture(dir.path(), "a.py", "def target():\n    return 1\n")?;
+    let (data, ready) = raw_session(&daemon.socket, dir.path())?;
+    let pid = ready["worker_pid"].as_u64().context("worker PID")? as u32;
+    let id = ready["session_id"].as_str().context("session ID")?;
+    let watcher = outcome_watch(&daemon.socket, id)?;
+    // Hold the data socket open, so it cannot provide the teardown signal.
+    // The verified outcome connection is sufficient to notice proxy loss.
+    drop(watcher);
+    daemon.wait_active_sessions(0, Duration::from_secs(4))?;
+    assert_eq!(
+        daemon.client()?.session_detail(id)?.exit_reason.as_deref(),
+        Some("client_disconnected")
+    );
+    wait_pid_gone(pid, Duration::from_secs(1))?;
+    drop(data);
+    Ok(())
+}
+
+#[test]
+fn adjacent_frames_at_the_limit_arrive_before_eof_on_the_real_transport() -> Result<()> {
+    let daemon = common::TestDaemon::start()?;
+    let dir = tempdir_in("/tmp")?;
+    build_fixture(dir.path(), "a.py", "def target():\n    return 1\n")?;
+    let (mut stream, ready) = raw_session(&daemon.socket, dir.path())?;
+    assert_eq!(ready["kind"], "session_ready");
+    stream.set_write_timeout(Some(Duration::from_secs(6)))?;
+    let mut first = br#"{"jsonrpc":"2.0","id":11,"method":"ping"}"#.to_vec();
+    first.resize(tsindex::daemon::MAX_MCP_FRAME_BYTES - 1, b' ');
+    stream.write_all(&first)?;
+    stream.write_all(b"\n{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"ping\"}\n")?;
+    // Keeping stdin live ensures both responses are driven by the frames
+    // themselves, with no extra write or EOF to kick the relay.
+    let mut incoming = BufReader::new(stream);
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let mut response = String::new();
+        incoming.read_line(&mut response)?;
+        let reply: Value = serde_json::from_str(&response)?;
+        assert!(reply.get("result").is_some());
+        ids.push(reply["id"].as_u64().context("ping reply ID")?);
+    }
+    ids.sort();
+    assert_eq!(ids, [11, 12]);
     Ok(())
 }
 
@@ -908,6 +1565,7 @@ fn session_detail_prunes_escaped_stderr_to_the_encoded_frame_budget() -> Result<
     fs::create_dir(&root)?;
     fs::copy(BIN, &exe)?;
     let child = Command::new(&exe)
+        .env("TSINDEX_TEST_RUNTIME_EXE", BIN)
         .arg("--socket")
         .arg(&socket)
         .args(["daemon", "run"])
@@ -937,7 +1595,9 @@ fn session_detail_prunes_escaped_stderr_to_the_encoded_frame_budget() -> Result<
         "protocol": tsindex::daemon::PROTOCOL_VERSION,
         "version": env!("CARGO_PKG_VERSION"),
     });
-    let mut script = format!("#!/bin/sh\nprintf '%s\\n' '{readiness}'\n");
+    let mut script = format!(
+        "#!/bin/sh\nfor arg do\n  if [ \"$arg\" = index-runtime ]; then exec \"$TSINDEX_TEST_RUNTIME_EXE\" \"$@\"; fi\ndone\nprintf '%s\\n' '{readiness}'\n"
+    );
     let mut original_stderr = Vec::new();
     for index in 0..12 {
         let diagnostic = format!(

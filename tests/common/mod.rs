@@ -28,6 +28,33 @@ impl TestDaemon {
     }
 
     pub fn start_with_env(extra_env: &[(&str, &str)]) -> Result<Self> {
+        Self::start_configured(extra_env, |_| {})
+    }
+
+    pub fn start_with_nofile(nofile: libc::rlim_t) -> Result<Self> {
+        Self::start_configured(&[], |cmd| {
+            use std::os::unix::process::CommandExt;
+            // Restrict the isolated daemon and its own children only.
+            unsafe {
+                cmd.pre_exec(move || {
+                    let mut limit: libc::rlimit = std::mem::zeroed();
+                    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    limit.rlim_cur = limit.rlim_cur.min(nofile);
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        })
+    }
+
+    pub fn start_configured(
+        extra_env: &[(&str, &str)],
+        configure: impl FnOnce(&mut Command),
+    ) -> Result<Self> {
         // Use `/tmp` directly so the Unix socket path stays well below macOS's
         // 104-byte `sun_path` limit even when $TMPDIR is deeply nested.
         let dir = tempfile::tempdir_in("/tmp")?;
@@ -43,6 +70,7 @@ impl TestDaemon {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(File::create(&log)?);
+        configure(&mut cmd);
         let child = cmd.spawn().context("failed to spawn test orchestrator")?;
         let mut daemon = Self {
             _dir: dir,

@@ -882,7 +882,9 @@ fn installation_waits_for_legacy_daemon_exit_before_binding() -> Result<()> {
                     uptime_secs: 0,
                     socket: socket.clone(),
                     active_sessions: 0,
+                    max_sessions: Some(128),
                     total_sessions_started: 0,
+                    index_runtimes: 0,
                 })
             };
             serde_json::to_writer(&mut stream, &response)?;

@@ -31,7 +31,7 @@ use crate::model::{
 use crate::watch::under_any;
 use crate::watch::{ChangeReceiver, WatchRegistry, changes};
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Runtime {
     pub root: PathBuf,
     pub db_path: PathBuf,
@@ -47,7 +47,9 @@ pub struct Runtime {
     /// additive read-path migration could not run (e.g. a read-only
     /// filesystem). Reads then project `0 AS partial` instead of `f.partial`
     /// so a v3 index stays readable; `partial` simply reports `false`.
+    #[serde(skip)]
     legacy_partial: AtomicBool,
+    #[serde(skip)]
     pub(crate) private_stage: bool,
 }
 

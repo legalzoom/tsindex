@@ -133,13 +133,13 @@ impl BufRead for CancellableStdin {
 
 pub fn serve_mcp(runtime: Runtime) -> Result<()> {
     spawn_parent_watchdog()?;
-    serve_mcp_worker(runtime)
+    serve_mcp_worker(&Runtimes::new(runtime))
 }
 
 /// Serve MCP over stdio without spawning a per-process parent-PID watchdog.
 /// Used by orchestrator-managed per-session worker processes whose lifecycle
 /// is supervised directly by the daemon.
-pub(crate) fn serve_mcp_worker(runtime: Runtime) -> Result<()> {
+pub(crate) fn serve_mcp_worker(runtime: &dyn ToolResolver) -> Result<()> {
     let stdout = io::stdout();
     #[cfg(unix)]
     let input = CancellableStdin::new()?;
@@ -151,22 +151,21 @@ pub(crate) fn serve_mcp_worker(runtime: Runtime) -> Result<()> {
     let input = io::BufReader::new(io::stdin());
     #[cfg(not(unix))]
     let cancellation = Arc::new(TransportCancellation::default());
-    serve_mcp_io(&runtime, input, stdout, cancellation)
+    serve_mcp_io(runtime, input, stdout, cancellation)
 }
 
 /// The stdio JSON-RPC loop, split from `serve_mcp` so tests can drive it with
 /// an in-memory reader/writer.
 fn serve_mcp_io(
-    runtime: &Runtime,
+    runtime: &dyn ToolResolver,
     input: impl BufRead,
     output: impl Write + Send,
     cancellation: Arc<TransportCancellation>,
 ) -> Result<()> {
-    let runtimes = Runtimes::new(runtime.clone());
     serve_mcp_transport(
         input,
         output,
-        |line| handle_json_rpc_line(&runtimes, line),
+        |line| handle_json_rpc_line(runtime, line),
         cancellation,
     )
 }
@@ -260,9 +259,9 @@ pub fn spawn_parent_watchdog() -> Result<()> {
     crate::lifecycle::spawn_session_handler(None)
 }
 
-fn handle_json_rpc_line(runtime: &Runtimes, line: &str) -> Result<Option<Value>> {
+fn handle_json_rpc_line(runtime: &dyn ToolResolver, line: &str) -> Result<Option<Value>> {
     Ok(match serde_json::from_str::<Value>(line) {
-        Ok(request) => handle_request_with_runtimes(runtime, request)?,
+        Ok(request) => handle_resolved_request(runtime, request)?,
         Err(error) => Some(json_rpc_error(
             None,
             -32700,
@@ -763,6 +762,10 @@ pub fn handle_request(runtime: &Runtime, request: Value) -> Result<Option<Value>
 }
 
 pub fn handle_request_with_runtimes(runtime: &Runtimes, request: Value) -> Result<Option<Value>> {
+    handle_resolved_request(runtime, request)
+}
+
+fn handle_resolved_request(runtime: &dyn ToolResolver, request: Value) -> Result<Option<Value>> {
     let id = request.get("id").cloned();
     let Some(method) = request.get("method").and_then(Value::as_str) else {
         return Ok(Some(json_rpc_error(id, -32600, "missing method")));
@@ -928,8 +931,37 @@ fn is_invalid_params(error: &anyhow::Error) -> bool {
     error.downcast_ref::<InvalidParams>().is_some()
 }
 
-fn call_tool(
-    runtimes: &Runtimes,
+/// Only checkout selection and freshness belong to the shared index owner.
+/// Each session executes the actual query or edit in its own process.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct PreparedTool {
+    runtime: Runtime,
+    repo: Option<String>,
+    aliases: std::collections::HashMap<String, String>,
+}
+
+pub(crate) trait ToolResolver: Sync {
+    fn prepare(&self, repo: Option<&str>, live_query: bool) -> Result<PreparedTool>;
+}
+
+impl ToolResolver for Runtimes {
+    fn prepare(&self, repo: Option<&str>, live_query: bool) -> Result<PreparedTool> {
+        let (runtime, repo) = if live_query {
+            self.resolve_live_query(repo)?
+        } else {
+            self.resolve(repo)?
+        };
+        let aliases = self.repo_aliases(&runtime)?;
+        Ok(PreparedTool {
+            runtime,
+            repo,
+            aliases,
+        })
+    }
+}
+
+fn call_tool<R: ToolResolver + ?Sized>(
+    runtimes: &R,
     name: &str,
     mut arguments: Value,
     writable: bool,
@@ -942,18 +974,17 @@ fn call_tool(
     // Live primary queries must reach their unready-index fallback without
     // waiting for a full refresh of unrelated sources. Indexed and editing
     // tools still establish freshness through the ordinary resolver.
-    let (runtime, repo) = if name == "query" {
-        runtimes.resolve_live_query(repo)?
-    } else {
-        runtimes.resolve(repo)?
-    };
+    let PreparedTool {
+        runtime,
+        repo,
+        aliases,
+    } = runtimes.prepare(repo, name == "query")?;
     if let Some(repo) = repo {
         arguments["repo"] = Value::String(repo);
     }
     let mut result = dispatch_tool(&runtime, name, arguments, writable)?;
     // Keep returned repo identifiers usable as inputs even when a basename
     // collision disambiguates an existing index's stored repo name.
-    let aliases = runtimes.repo_aliases(&runtime)?;
     if !aliases.is_empty() {
         rewrite_repo_names(&mut result, &aliases);
     }
@@ -3548,7 +3579,7 @@ mod tests {
 
         let mut output = Vec::new();
         serve_mcp_io(
-            &runtime,
+            &Runtimes::new(runtime),
             io::Cursor::new(input),
             &mut output,
             Arc::new(TransportCancellation::default()),

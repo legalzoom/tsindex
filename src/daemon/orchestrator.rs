@@ -4,7 +4,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::fd::AsRawFd;
+use std::net::Shutdown;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
@@ -34,9 +35,13 @@ const MAX_STDERR_LINE_BYTES: usize = 2048;
 const MAX_PENDING_CONNECTIONS: usize = 32;
 const SESSION_PAGE_SIZE: usize = 8;
 const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(2);
-const GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const EXITED_WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const FORCED_EOF_GRACE: Duration = Duration::from_millis(800);
 const SIGTERM_GRACE: Duration = Duration::from_secs(2);
+// An exited leader can leave both pipe writers with a surviving descendant.
+// This fallback bounds detection even when no descriptor changes readiness.
+const CHILD_EXIT_PROBE: Duration = Duration::from_secs(1);
+const RELAY_QUEUE_BYTES: usize = 64 * 1024;
 const POLL_WAIT_STEP: Duration = Duration::from_millis(25);
 
 static SIGNAL_STOP: AtomicBool = AtomicBool::new(false);
@@ -144,7 +149,10 @@ impl Drop for SignalGuard {
 struct SessionHandle {
     info: Mutex<SessionInfo>,
     owner: Option<ProcessOwner>,
-    completed: Condvar,
+    // One socketpair carries two independent one-shot notifications. Closing
+    // a write half wakes the other reader even if it enters poll later.
+    supervisor_wake: UnixStream,
+    outcome_wake: UnixStream,
     watcher_registered: AtomicBool,
     forced_stop: AtomicBool,
     stop_reason: Mutex<Option<String>>,
@@ -174,9 +182,7 @@ impl SessionHandle {
         // Publish the reason before releasing the cancellation flag, so a
         // supervisor that observes cancellation always has its causal outcome.
         self.forced_stop.store(true, Ordering::Release);
-        // The session poll loop observes cancellation within one poll turn.
-        // Keep the data stream open until reaping and outcome publication, so
-        // clients can distinguish a clean stop from an unexpected daemon death.
+        let _ = self.outcome_wake.shutdown(Shutdown::Write);
     }
 
     fn record_stderr(&self, line: String) {
@@ -192,16 +198,83 @@ impl SessionHandle {
     }
 }
 
+// One index owner retains its control socket, stdin lifetime pipe and a slot
+// for a native child handle (a pidfd on platforms that provide one).
+const RUNTIME_FDS: usize = 3;
+// A pending control owns its socket, a duplicate writer, and can briefly open
+// one process-identity file while authenticating an owner.
+const PENDING_FDS: usize = 3;
+// During a concurrent worker spawn, all six worker pipe ends and both exec
+// status descriptors can coexist. Charge those eight and a child handle,
+// both data-socket fds, the wake pair, a distinct index owner, one watcher
+// socket, and two retired wake pairs still held by a watcher or owner sweep.
+const SESSION_FDS: usize = 8 + 1 + 2 + 2 + RUNTIME_FDS + 1 + 4;
+// The pool serializes runtime spawns. Beyond that owner's retained fds, its
+// receiver, child-side stdin, null stdout and exec status pair take five.
+// Reserve one concurrent process inspection and one accept-before-admission.
+const HOUSEKEEPING_FDS: usize = 5 + 1 + 1;
+
+fn descriptor_admission(requested: usize) -> io::Result<(usize, usize)> {
+    let reserve = HOUSEKEEPING_FDS + super::runtime::MAX_IDLE * RUNTIME_FDS;
+    let wanted = reserve
+        .saturating_add(MAX_PENDING_CONNECTIONS * PENDING_FDS)
+        .saturating_add(requested.saturating_mul(SESSION_FDS));
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Count only unoccupied, allocatable numbers after the listener, lock and
+    // signal wakeup have opened. This also counts inherited descriptors and
+    // works when a sandbox hides procfs. Stop once both requested caps fit.
+    let ceiling = limit.rlim_cur.min(i32::MAX as libc::rlim_t) as i32;
+    let mut free = 0usize;
+    for fd in 3..ceiling {
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::EBADF) => free += 1,
+                Some(libc::EINTR) => continue,
+                _ => return Err(error),
+            }
+            if free >= wanted {
+                break;
+            }
+        }
+    }
+    // When space is tight, reserve one pending control per affordable session,
+    // up to the normal handshake cap. Give spare capacity back to controls
+    // when an operator has explicitly configured a smaller session maximum.
+    let usable = free.saturating_sub(reserve);
+    let pending = (usable / (PENDING_FDS + SESSION_FDS)).clamp(1, MAX_PENDING_CONNECTIONS);
+    let sessions = requested.min(usable.saturating_sub(pending * PENDING_FDS) / SESSION_FDS);
+    // With no affordable sessions the runtime pool stays empty. Keep controls
+    // available to explain the zero capacity and to stop the daemon cleanly.
+    let control_space = if sessions == 0 {
+        free.saturating_sub(2)
+    } else {
+        usable - sessions * SESSION_FDS
+    };
+    let pending = MAX_PENDING_CONNECTIONS.min(control_space / PENDING_FDS);
+    if pending == 0 {
+        return Err(io::Error::other(
+            "descriptor limit too low to serve daemon controls",
+        ));
+    }
+    Ok((sessions, pending))
+}
+
 struct DaemonCore {
     paths: DaemonPaths,
     worker_executable: std::path::PathBuf,
     worker_groups: bool,
+    runtimes: super::runtime::RuntimePool,
     instance_id: String,
     pending_connections: AtomicUsize,
     outcome_watchers: AtomicUsize,
     started_at: u64,
     started_instant: Instant,
     max_sessions: usize,
+    max_pending: usize,
     next_session_seq: AtomicU64,
     total_sessions_started: AtomicU64,
     shutdown: AtomicBool,
@@ -216,11 +289,12 @@ struct DaemonCore {
 
 impl DaemonCore {
     fn new(paths: DaemonPaths, wake_writer: UnixStream, worker_groups: bool) -> Result<Self> {
-        let max_sessions = std::env::var("TSINDEX_MAX_SESSIONS")
+        let requested = std::env::var("TSINDEX_MAX_SESSIONS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|&value| value > 0)
             .unwrap_or(DEFAULT_MAX_SESSIONS);
+        let (max_sessions, max_pending) = descriptor_admission(requested)?;
         let worker_executable = crate::daemon::service::invocation_binary()
             .context("failed to locate worker executable")?;
         // A random boot nonce prevents a stale destructive session ID from
@@ -232,12 +306,14 @@ impl DaemonCore {
             paths,
             worker_executable,
             worker_groups,
+            runtimes: super::runtime::RuntimePool::new()?,
             instance_id,
             pending_connections: AtomicUsize::new(0),
             outcome_watchers: AtomicUsize::new(0),
             started_at: unix_now_secs(),
             started_instant: Instant::now(),
             max_sessions,
+            max_pending,
             next_session_seq: AtomicU64::new(1),
             total_sessions_started: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
@@ -278,7 +354,9 @@ impl DaemonCore {
             uptime_secs: self.started_instant.elapsed().as_secs(),
             socket: self.paths.socket_path.clone(),
             active_sessions,
+            max_sessions: Some(self.max_sessions),
             total_sessions_started: self.total_sessions_started.load(Ordering::Acquire),
+            index_runtimes: self.runtimes.resident(),
         }
     }
 
@@ -388,15 +466,11 @@ impl DaemonCore {
             // Invalid watchers leave ownership with the outer handler through
             // its error reply, including any bounded write wait.
             drop(pending.take());
-            write_json_line(writer, &DaemonResponse::Watching)?;
-            let mut info = handle.info.lock().unwrap_or_else(|e| e.into_inner());
-            while info.state != SessionState::Exited {
-                info = handle
-                    .completed
-                    .wait(info)
-                    .unwrap_or_else(|e| e.into_inner());
+            if let Err(error) = write_json_line(writer, &DaemonResponse::Watching) {
+                handle.request_stop("client_disconnected");
+                return Err(error);
             }
-            info.clone()
+            wait_for_outcome(&handle, writer)?
         } else {
             let session = self
                 .recent_sessions
@@ -441,7 +515,7 @@ impl DaemonCore {
                 recent.pop_front();
             }
             recent.push_back(snapshot);
-            handle.completed.notify_all();
+            let _ = handle.supervisor_wake.shutdown(Shutdown::Write);
             // Publish history before removing the active handle. A watcher
             // registering concurrently can always find one complete record.
             active.remove(session_id);
@@ -474,7 +548,9 @@ struct ActiveThreadGuard {
 
 impl ActiveThreadGuard {
     fn try_enter(core: Arc<DaemonCore>) -> Option<Self> {
-        let ceiling = MAX_PENDING_CONNECTIONS.saturating_add(core.max_sessions.saturating_mul(2));
+        let ceiling = core
+            .max_pending
+            .saturating_add(core.max_sessions.saturating_mul(2));
         let mut count = core
             .active_threads
             .lock()
@@ -664,6 +740,7 @@ pub fn run_orchestrator(paths: DaemonPaths, require_activation: bool) -> Result<
     core.kill_all("daemon_shutdown");
     core.wait_for_threads(Duration::from_secs(10));
     let _ = sweeper.join();
+    core.runtimes.stop();
     eprintln!("tsindex daemon stopped (pid {})", std::process::id());
     result
 }
@@ -963,6 +1040,9 @@ fn handle_connection(
             write_json_line(&mut writer, &response)?;
         }
         DaemonRequest::WatchSession { session_id } => {
+            // The watcher reads only its initial request. Keep one socket fd
+            // for the lifetime of its response, including final delivery.
+            drop(reader);
             let mut pending = Some(pending);
             let mut watcher_lease = None;
             if let Err(error) = core.watch_session(
@@ -1037,15 +1117,6 @@ fn handle_start_session(
         return Ok(());
     }
 
-    if req.client_version != env!("CARGO_PKG_VERSION") {
-        write_json_line(
-            &mut writer,
-            &DaemonResponse::Error {
-                error: "CLI and daemon versions differ; run `tsindex daemon restart`".into(),
-            },
-        )?;
-        return Ok(());
-    }
     if !req.root.exists() {
         write_json_line(
             &mut writer,
@@ -1087,36 +1158,7 @@ fn handle_start_session(
     let seq = core.next_session_seq.fetch_add(1, Ordering::Relaxed);
     let session_id = format!("{}-{seq}", core.instance_id);
     let tracked_owner_pid = owner.as_ref().map(ProcessOwner::pid);
-    let handle = Arc::new(SessionHandle {
-        info: Mutex::new(SessionInfo {
-            session_id: session_id.clone(),
-            state: SessionState::Starting,
-            root: req.root.clone(),
-            db: req.db.clone(),
-            languages: req.languages.clone(),
-            no_refresh: req.no_refresh,
-            worker_pid: 0,
-            client_pid,
-            owner_pid: tracked_owner_pid,
-            harness_name: None,
-            harness_version: None,
-            started_at: unix_now_secs(),
-            ended_at: None,
-            last_activity_at: unix_now_secs(),
-            requests_received: 0,
-            responses_sent: 0,
-            tool_calls: 0,
-            exit_reason: None,
-            recent_stderr: Vec::new(),
-        }),
-        owner,
-        completed: Condvar::new(),
-        watcher_registered: AtomicBool::new(false),
-        forced_stop: AtomicBool::new(false),
-        stop_reason: Mutex::new(None),
-        stderr_lines: Mutex::new(VecDeque::new()),
-    });
-    {
+    let handle = {
         let mut active = core
             .active_sessions
             .lock()
@@ -1124,6 +1166,7 @@ fn handle_start_session(
         // Reserve before spawning while holding the same lock shutdown uses to
         // enumerate sessions. Starting workers are visible to cancellation.
         if core.is_shutting_down() || active.len() >= core.max_sessions {
+            drop(active);
             write_json_line(
                 &mut writer,
                 &DaemonResponse::Error {
@@ -1132,8 +1175,42 @@ fn handle_start_session(
             )?;
             return Ok(());
         }
+        // Allocate wake descriptors only after this slot is reserved.
+        let (supervisor_wake, outcome_wake) = UnixStream::pair()?;
+        let handle = Arc::new(SessionHandle {
+            info: Mutex::new(SessionInfo {
+                session_id: session_id.clone(),
+                state: SessionState::Starting,
+                root: req.root.clone(),
+                db: req.db.clone(),
+                languages: req.languages.clone(),
+                no_refresh: req.no_refresh,
+                runtime_pid: None,
+                worker_pid: 0,
+                client_pid,
+                owner_pid: tracked_owner_pid,
+                harness_name: None,
+                harness_version: None,
+                started_at: unix_now_secs(),
+                ended_at: None,
+                last_activity_at: unix_now_secs(),
+                requests_received: 0,
+                responses_sent: 0,
+                tool_calls: 0,
+                exit_reason: None,
+                recent_stderr: Vec::new(),
+            }),
+            owner,
+            supervisor_wake,
+            outcome_wake,
+            watcher_registered: AtomicBool::new(false),
+            forced_stop: AtomicBool::new(false),
+            stop_reason: Mutex::new(None),
+            stderr_lines: Mutex::new(VecDeque::new()),
+        });
         active.insert(session_id.clone(), Arc::clone(&handle));
-    }
+        handle
+    };
     // The Starting record now bounds the handler through startup and teardown.
     drop(pending);
     let result = run_session(&core, &req, &session_id, &handle, reader, &mut writer);
@@ -1155,10 +1232,13 @@ fn handle_start_session(
         && starting
     {
         // Startup errors are still control frames, keeping MCP stdout clean.
-        let mut detail = format!("MCP worker startup failed: {error:#}");
+        let mut detail = format!("MCP session initialization failed: {error:#}");
         truncate_text(&mut detail, 8192);
         let _ = write_json_line(&mut writer, &DaemonResponse::Error { error: detail });
     }
+    // Release the handler’s descriptors before returning this admission slot.
+    drop(writer);
+    drop(handle);
     core.finish_session(&session_id, reason.clone());
     eprintln!("tsindex: ended session {session_id} (reason: {reason})");
     Ok(())
@@ -1204,7 +1284,10 @@ fn read_control_deadline(reader: &mut BufReader<UnixStream>, timeout: Duration) 
             events: libc::POLLIN,
             revents: 0,
         }];
-        poll(&mut fds)?;
+        poll(
+            &mut fds,
+            Some(deadline.saturating_duration_since(Instant::now())),
+        )?;
     }
 }
 
@@ -1214,7 +1297,7 @@ impl PendingConnection {
     fn try_acquire(core: &Arc<DaemonCore>) -> Option<Self> {
         core.pending_connections
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                (count < MAX_PENDING_CONNECTIONS).then_some(count + 1)
+                (count < core.max_pending).then_some(count + 1)
             })
             .ok()
             .map(|_| Self(Arc::clone(core)))
@@ -1254,20 +1337,38 @@ fn run_session(
     reader: BufReader<UnixStream>,
     writer: &mut UnixStream,
 ) -> Result<String> {
-    let mut child = spawn_worker(req, &core.worker_executable, core.worker_groups)?;
+    let runtime = core.runtimes.acquire(req, &core.worker_executable)?;
+    let mut child = spawn_worker(
+        &core.worker_executable,
+        core.worker_groups,
+        &runtime.channel,
+        &req.root,
+    )?;
     let worker_pid = child.id();
-    handle
-        .info
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .worker_pid = worker_pid;
+    {
+        let mut session = handle.info.lock().unwrap_or_else(|p| p.into_inner());
+        session.worker_pid = worker_pid;
+        session.runtime_pid = Some(runtime.pid);
+    }
     core.total_sessions_started.fetch_add(1, Ordering::Relaxed);
     let result = supervise_session(&mut child, core, handle, reader, writer, session_id);
     // Closing every pipe first makes waits independent of inherited pipe ends.
     drop(child.stdin.take());
     drop(child.stdout.take());
     drop(child.stderr.take());
-    let status_note = reap_worker(&mut child, worker_pid, core.worker_groups);
+    let status_note = match reap_worker(&mut child, core.worker_groups) {
+        Ok(status) if !status.success() => Some(format!("worker_status_{status}")),
+        Ok(_) => None,
+        Err(error) => Some(format!("worker_wait_failed: {error}")),
+    };
+    if result
+        .as_ref()
+        .is_err_and(|err| err.is::<WorkerStartupTimeout>())
+        || child.try_wait().ok().flatten().and_then(|exit| exit.code())
+            == Some(super::runtime::LOOKUP_TIMEOUT_EXIT)
+    {
+        core.runtimes.retire(&runtime);
+    }
     // Global shutdown can precede the accept loop's kill_all snapshot. Record
     // that cause locally before a forced exit status can replace the outcome.
     if core.is_shutting_down() {
@@ -1282,31 +1383,28 @@ fn run_session(
 }
 
 fn spawn_worker(
-    req: &StartSessionRequest,
     executable: &std::path::Path,
     worker_groups: bool,
+    runtime: &UnixStream,
+    root: &std::path::Path,
 ) -> Result<Child> {
     let mut cmd = Command::new(executable);
-    cmd.arg("--root").arg(&req.root);
-    if let Some(db) = &req.db {
-        cmd.arg("--db").arg(db);
-    }
-    for language in &req.languages {
-        cmd.arg("--languages").arg(language);
-    }
-    if req.no_refresh {
-        cmd.arg("--no-refresh");
-    }
-    cmd.args(["daemon", "worker"]);
-    if req.root.is_dir() {
-        cmd.current_dir(&req.root);
-    }
-    cmd.stdin(Stdio::piped())
+    cmd.args(["daemon", "worker", "--runtime-fd"])
+        .arg(runtime.as_raw_fd().to_string())
+        .current_dir(root)
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    super::fds::prepare_exec(&mut cmd, Some(runtime.as_fd()))?;
+    configure_child(&mut cmd, worker_groups, libc::SIGTERM);
+    cmd.spawn().context("failed to spawn MCP worker")
+}
+
+pub(super) fn configure_child(cmd: &mut Command, worker_groups: bool, death_signal: libc::c_int) {
     #[cfg(target_os = "linux")]
     let parent_pid = std::process::id() as libc::pid_t;
-    super::fds::prepare_exec(&mut cmd, None)?;
+    #[cfg(not(target_os = "linux"))]
+    let _ = death_signal;
     // SAFETY: these are async-signal-safe syscalls in the fork/exec interval.
     unsafe {
         cmd.pre_exec(move || {
@@ -1331,7 +1429,7 @@ fn spawn_worker(
             }
             #[cfg(target_os = "linux")]
             {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) != 0 {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, death_signal, 0, 0, 0) != 0 {
                     return Err(io::Error::last_os_error());
                 }
                 if libc::getppid() != parent_pid {
@@ -1341,8 +1439,6 @@ fn spawn_worker(
             Ok(())
         });
     }
-    cmd.spawn()
-        .context("failed to spawn worker; restart the daemon after upgrading tsindex")
 }
 
 fn nonblocking(fd: libc::c_int) -> io::Result<()> {
@@ -1353,36 +1449,172 @@ fn nonblocking(fd: libc::c_int) -> io::Result<()> {
     Ok(())
 }
 
-fn poll(fds: &mut [libc::pollfd]) -> io::Result<()> {
-    let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 25) };
+fn interest(fd: libc::c_int, events: libc::c_short) -> libc::pollfd {
+    libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    }
+}
+
+fn poll(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> io::Result<()> {
+    let millis = timeout.map_or(-1, |duration| {
+        duration
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .min(i32::MAX as u128) as i32
+    });
+    let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, millis) };
     if rc < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
         return Err(io::Error::last_os_error());
     }
     Ok(())
 }
 
-fn read_available(reader: &mut impl Read, output: &mut Vec<u8>, max: usize) -> Result<bool> {
-    let mut bytes = [0u8; 8192];
-    // One bounded read per turn keeps a noisy stream from starving cancellation.
-    match reader.read(&mut bytes) {
-        Ok(0) => Ok(true),
-        Ok(n) => {
-            if output.len() + n > max {
-                bail!("stream exceeded maximum length of {max} bytes");
+fn peer_stopped_reading(stream: &UnixStream) -> io::Result<bool> {
+    // Darwin also reports HUP for a peer's write half-close on a read filter.
+    // Probe only the write filter to distinguish loss of the response reader.
+    let mut write = [interest(stream.as_raw_fd(), libc::POLLOUT)];
+    poll(&mut write, Some(Duration::ZERO))?;
+    Ok(write[0].revents & (libc::POLLHUP | libc::POLLERR) != 0)
+}
+
+fn wait_for_outcome(handle: &SessionHandle, client: &UnixStream) -> Result<SessionInfo> {
+    let mut watch_input = true;
+    loop {
+        {
+            let info = handle.info.lock().unwrap_or_else(|e| e.into_inner());
+            if info.state == SessionState::Exited {
+                return Ok(info.clone());
             }
-            output.extend_from_slice(&bytes[..n]);
-            Ok(false)
         }
+        // The proxy keeps this independent connection open while its data
+        // stream drains. Losing the proxy must also interrupt a full relay.
+        let mut fds = [
+            interest(handle.outcome_wake.as_raw_fd(), libc::POLLIN),
+            interest(
+                if watch_input { client.as_raw_fd() } else { -1 },
+                libc::POLLIN,
+            ),
+        ];
+        poll(&mut fds, (!watch_input).then_some(CHILD_EXIT_PROBE))?;
+        if fds[0].revents != 0 {
+            continue;
+        }
+        if !watch_input || fds[1].revents != 0 {
+            if peer_stopped_reading(client)? {
+                handle.request_stop("client_disconnected");
+                bail!("proxy disconnected while waiting for its worker");
+            }
+            // A raw watcher may half-close after subscribing and still read the
+            // outcome. Stop polling its permanently readable input in that case.
+            watch_input = false;
+        }
+    }
+}
+
+fn read_chunk(reader: &mut impl Read, bytes: &mut [u8]) -> io::Result<Option<usize>> {
+    debug_assert!(!bytes.is_empty());
+    match reader.read(bytes) {
+        Ok(n) => Ok(Some(n)),
         Err(error)
             if matches!(
                 error.kind(),
                 io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
             ) =>
         {
-            Ok(false)
+            Ok(None)
         }
-        Err(error) => Err(error.into()),
+        Err(error) => Err(error),
     }
+}
+
+/// Retain an unfinished input frame until it passes the length limit. A
+/// rejected prefix must never reach the worker as a final JSON request on EOF.
+#[derive(Default)]
+struct ClientFrames {
+    bytes: Vec<u8>,
+    sent: usize,
+    ready: usize,
+}
+
+impl ClientFrames {
+    fn has_ready(&self) -> bool {
+        self.sent != self.ready
+    }
+
+    fn push(&mut self, chunk: &[u8], limit: usize, mut observe: impl FnMut(&[u8])) -> Result<()> {
+        debug_assert!(!self.has_ready());
+        // One read can finish a maximum-size request and begin the next one.
+        // Validate each frame, keeping at most one frame plus one read buffered.
+        for part in chunk.split_inclusive(|byte| *byte == b'\n') {
+            if self.bytes.len() - self.ready + part.len() > limit {
+                bail!("client request exceeds MCP frame limit");
+            }
+            self.bytes.extend_from_slice(part);
+            if part.last() == Some(&b'\n') {
+                observe(&self.bytes[self.ready..]);
+                self.ready = self.bytes.len();
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, observe: impl FnOnce(&[u8])) {
+        if self.bytes.len() > self.ready {
+            observe(&self.bytes[self.ready..]);
+            self.ready = self.bytes.len();
+        }
+    }
+
+    fn flush(&mut self, writer: &mut impl Write) -> io::Result<()> {
+        let bytes = &self.bytes[self.sent..self.ready];
+        match writer.write(bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => self.sent += n,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+        if self.sent == self.ready {
+            // Compact once after the entire batch is delivered. Its trailing
+            // partial frame is at most one read, even after a very large request.
+            self.bytes.copy_within(self.ready.., 0);
+            self.bytes.truncate(self.bytes.len() - self.ready);
+            self.sent = 0;
+            self.ready = 0;
+            if self.bytes.capacity() > 2 * RELAY_QUEUE_BYTES {
+                self.bytes.shrink_to(RELAY_QUEUE_BYTES);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn observe_output_chunk(handle: &SessionHandle, length: &mut usize, bytes: &[u8]) -> Result<()> {
+    let mut responses = 0;
+    for part in bytes.split_inclusive(|byte| *byte == b'\n') {
+        *length += part.len();
+        if *length > MAX_MCP_FRAME_BYTES {
+            bail!("worker response exceeds MCP frame limit");
+        }
+        if part.last() == Some(&b'\n') {
+            *length = 0;
+            responses += 1;
+        }
+    }
+    if responses > 0 {
+        let mut info = handle.info.lock().unwrap_or_else(|e| e.into_inner());
+        info.responses_sent += responses;
+        info.last_activity_at = unix_now_secs();
+    }
+    Ok(())
 }
 
 fn flush_pending(writer: &mut impl Write, pending: &mut VecDeque<u8>) -> io::Result<()> {
@@ -1439,6 +1671,16 @@ fn capture_stderr(child: &mut Child, handle: &SessionHandle, partial: &mut Vec<u
     }
 }
 
+#[derive(Debug)]
+struct WorkerStartupTimeout;
+
+impl std::fmt::Display for WorkerStartupTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("worker initialization timed out")
+    }
+}
+impl std::error::Error for WorkerStartupTimeout {}
+
 fn supervise_session(
     child: &mut Child,
     core: &DaemonCore,
@@ -1466,9 +1708,11 @@ fn supervise_session(
         nonblocking(fd)?;
     }
     let startup_deadline = Instant::now() + STARTUP_IO_TIMEOUT;
+    let mut startup_probe = Instant::now() + CHILD_EXIT_PROBE;
     let mut ready_bytes = Vec::new();
     let mut stderr_partial = Vec::new();
     let mut stderr_eof = false;
+    let mut chunk = [0u8; 8192];
     loop {
         if core.is_shutting_down() {
             handle.request_stop("daemon_shutdown");
@@ -1476,35 +1720,37 @@ fn supervise_session(
         if handle.forced_stop.load(Ordering::Acquire) {
             bail!("session cancelled during startup");
         }
-        let mut peer = libc::pollfd {
-            fd: reader.get_ref().as_raw_fd(),
-            events: 0,
-            revents: 0,
-        };
-        unsafe {
-            libc::poll(&mut peer, 1, 0);
-        }
-        if peer.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+        if peer_stopped_reading(reader.get_ref())? {
             bail!("client disconnected during worker initialization");
         }
         if !stderr_eof {
             stderr_eof = capture_stderr(child, handle, &mut stderr_partial);
         }
-        let ended = read_available(
-            child.stdout.as_mut().unwrap(),
-            &mut ready_bytes,
-            MAX_CONTROL_LINE_BYTES,
-        )?;
-        if let Some(end) = ready_bytes.iter().position(|b| *b == b'\n') {
+        let room = chunk.len().min(MAX_CONTROL_LINE_BYTES - ready_bytes.len());
+        if room == 0 {
+            bail!("worker readiness acknowledgement exceeds maximum length");
+        }
+        let read = read_chunk(child.stdout.as_mut().unwrap(), &mut chunk[..room])?;
+        if let Some(n) = read {
+            ready_bytes.extend_from_slice(&chunk[..n]);
+        }
+        if let Some(end) = memchr::memchr(b'\n', &ready_bytes) {
             let ready: WorkerReady = serde_json::from_slice(&ready_bytes[..end])
                 .context("invalid worker readiness acknowledgement")?;
-            if ready.protocol != PROTOCOL_VERSION || ready.version != env!("CARGO_PKG_VERSION") {
-                bail!("worker version/protocol differs from daemon; run `tsindex daemon restart`");
+            if ready.protocol != PROTOCOL_VERSION {
+                bail!("worker protocol differs from daemon; run `tsindex daemon restart`");
             }
             ready_bytes.drain(..=end);
             break;
         }
-        if ended {
+        // A descendant may retain stdout after the leader exits before
+        // readiness. Diagnose the leader without waiting for that pipe's EOF.
+        let mut leader_exited = false;
+        if read.is_none() && Instant::now() >= startup_probe {
+            leader_exited = child_has_exited(child.id())?;
+            startup_probe = Instant::now() + CHILD_EXIT_PROBE;
+        }
+        if read == Some(0) || leader_exited {
             if !stderr_eof {
                 capture_stderr(child, handle, &mut stderr_partial);
             }
@@ -1515,21 +1761,16 @@ fn supervise_session(
             bail!("worker exited before initialization: {detail}");
         }
         if Instant::now() >= startup_deadline {
-            bail!("worker initialization timed out");
+            return Err(WorkerStartupTimeout.into());
         }
         let mut fds = [
-            libc::pollfd {
-                fd: stdout_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: if stderr_eof { -1 } else { stderr_fd },
-                events: libc::POLLIN,
-                revents: 0,
-            },
+            interest(stdout_fd, libc::POLLIN),
+            interest(if stderr_eof { -1 } else { stderr_fd }, libc::POLLIN),
+            interest(handle.supervisor_wake.as_raw_fd(), libc::POLLIN),
+            interest(reader.get_ref().as_raw_fd(), 0),
         ];
-        poll(&mut fds)?;
+        let timeout = startup_deadline.saturating_duration_since(Instant::now());
+        poll(&mut fds, Some(timeout.min(CHILD_EXIT_PROBE)))?;
     }
     // Publish readiness state before the acknowledgement can reach a client
     // that immediately establishes its outcome watcher on another connection.
@@ -1554,156 +1795,143 @@ fn supervise_session(
     reader.get_ref().set_nonblocking(true)?;
     let _ = writer.set_write_timeout(None);
     let _ = reader.get_ref().set_read_timeout(None);
-    let mut input_line = Vec::new();
-    let mut input_scan = 0;
-    let mut to_worker = VecDeque::new();
+    let mut input = ClientFrames::default();
+    let mut output_line_bytes = 0;
+    observe_output_chunk(handle, &mut output_line_bytes, &ready_bytes)?;
     let mut to_client: VecDeque<u8> = ready_bytes.into();
     let mut input_eof = false;
     let mut output_eof = false;
-    let mut drain_deadline = None;
-    let mut output_line_bytes = 0usize;
+    let mut drain_deadline: Option<Instant> = None;
+    let mut worker_exited = false;
+    let mut next_probe = Instant::now() + CHILD_EXIT_PROBE;
+    let socket = reader.get_ref().as_raw_fd();
     loop {
-        // This deadline is evaluated regardless of progress on any data pipe.
         if core.is_shutting_down() {
             handle.request_stop("daemon_shutdown");
         }
         if handle.forced_stop.load(Ordering::Acquire) {
             return Ok("session_cancelled".into());
         }
-        if child_has_exited(child.id())? {
-            drain_deadline.get_or_insert(Instant::now() + GRACEFUL_DRAIN_TIMEOUT);
-            if output_eof && to_client.is_empty() {
-                return Ok(if input_eof {
-                    "client_eof".into()
-                } else {
-                    "worker_exited".into()
-                });
+        let now = Instant::now();
+        let probe_due = now >= next_probe;
+        if !worker_exited && probe_due {
+            worker_exited = child_has_exited(child.id())?;
+            next_probe = now + CHILD_EXIT_PROBE;
+            if worker_exited {
+                drain_deadline = Some(now + EXITED_WORKER_DRAIN_TIMEOUT);
             }
         }
-        if drain_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        if worker_exited && output_eof && to_client.is_empty() {
+            return Ok(if input_eof {
+                "client_eof"
+            } else {
+                "worker_exited"
+            }
+            .into());
+        }
+        if drain_deadline.is_some_and(|deadline| now >= deadline) {
             return Ok("drain_timeout".into());
         }
-        if input_eof && to_worker.is_empty() {
+        if input_eof && !input.has_ready() {
             drop(child.stdin.take());
         }
-        if input_eof && output_eof && to_client.is_empty() {
-            return Ok("client_eof".into());
+
+        let read_input = !input_eof && child.stdin.is_some() && !input.has_ready();
+        let read_output = !output_eof && to_client.len() < RELAY_QUEUE_BYTES;
+        let mut socket_events = if read_input { libc::POLLIN } else { 0 };
+        if !to_client.is_empty() {
+            socket_events |= libc::POLLOUT;
         }
-        // poll reports HUP/ERR even with an empty event mask. Remove
-        // inactive/closed endpoints to avoid spinning during bounded drain.
-        let socket_events = if !input_eof && to_worker.len() < MAX_MCP_FRAME_BYTES {
-            libc::POLLIN
-        } else {
-            0
-        } | if !to_client.is_empty() {
-            libc::POLLOUT
-        } else {
-            0
-        };
         let mut fds = [
-            libc::pollfd {
-                fd: if socket_events == 0 {
-                    -1
-                } else {
-                    reader.get_ref().as_raw_fd()
-                },
-                events: socket_events,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: if child.stdin.is_some() && !to_worker.is_empty() {
-                    stdin_fd
-                } else {
-                    -1
-                },
-                events: if to_worker.is_empty() {
-                    0
-                } else {
-                    libc::POLLOUT
-                },
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: if output_eof || to_client.len() >= MAX_MCP_FRAME_BYTES {
-                    -1
-                } else {
-                    stdout_fd
-                },
-                events: if to_client.len() < MAX_MCP_FRAME_BYTES {
-                    libc::POLLIN
-                } else {
-                    0
-                },
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: if stderr_eof { -1 } else { stderr_fd },
-                events: libc::POLLIN,
-                revents: 0,
-            },
+            interest(if socket_events == 0 { -1 } else { socket }, socket_events),
+            interest(if input.has_ready() { stdin_fd } else { -1 }, libc::POLLOUT),
+            interest(if read_output { stdout_fd } else { -1 }, libc::POLLIN),
+            interest(if stderr_eof { -1 } else { stderr_fd }, libc::POLLIN),
+            interest(handle.supervisor_wake.as_raw_fd(), libc::POLLIN),
         ];
-        poll(&mut fds)?;
-        if !stderr_eof {
-            stderr_eof = capture_stderr(child, handle, &mut stderr_partial);
+        // Control framing may already have read some MCP bytes. Waiting on the
+        // underlying socket would strand them until another kernel event.
+        let already_buffered = read_input && !reader.buffer().is_empty();
+        let deadline = if worker_exited {
+            drain_deadline.unwrap()
+        } else {
+            drain_deadline.map_or(next_probe, |deadline| deadline.min(next_probe))
+        };
+        let timeout = if already_buffered {
+            Duration::ZERO
+        } else {
+            deadline.saturating_duration_since(now)
+        };
+        poll(&mut fds, Some(timeout))?;
+        if fds[4].revents != 0 {
+            continue;
         }
-        if !input_eof && to_worker.len() < MAX_MCP_FRAME_BYTES {
-            // Drain buffered complete frames before taking additional input so
-            // a burst of valid small messages cannot be mistaken for one large
-            // frame while the worker applies backpressure.
-            let mut blocked_frame = false;
-            while let Some(relative_end) = memchr::memchr(b'\n', &input_line[input_scan..]) {
-                let end = input_scan + relative_end;
-                if to_worker.len() + end + 1 > MAX_MCP_FRAME_BYTES {
-                    blocked_frame = true;
-                    break;
-                }
-                let frame: Vec<u8> = input_line.drain(..=end).collect();
-                input_scan = 0;
-                observe_client_message(handle, &frame);
-                to_worker.extend(frame);
-            }
-            if !blocked_frame {
-                input_scan = input_line.len();
-            }
-            let eof = if blocked_frame {
-                false
-            } else {
-                read_available(&mut reader, &mut input_line, MAX_MCP_FRAME_BYTES)?
-            };
-            if eof {
-                // A final unterminated frame remains valid JSON-RPC input.
-                to_worker.extend(input_line.drain(..));
-                input_eof = true;
-                drain_deadline = Some(Instant::now() + GRACEFUL_DRAIN_TIMEOUT);
-                handle.info.lock().unwrap_or_else(|e| e.into_inner()).state =
-                    SessionState::Draining;
-            }
-        }
-        if !to_worker.is_empty()
-            && let Some(stdin) = child.stdin.as_mut()
-            && flush_pending(stdin, &mut to_worker).is_err()
+
+        // The outcome watcher independently wakes a managed session on full
+        // proxy loss. Raw sessions can also close while pipe pressure (or a
+        // previous half-close) has removed their data fd from the read set.
+        let peer_events = fds[0].revents;
+        if (peer_events & (libc::POLLHUP | libc::POLLERR) != 0 || (probe_due && !read_input))
+            && peer_stopped_reading(reader.get_ref())?
         {
-            return Ok("worker_stdin_closed".into());
+            return Ok("client_disconnected".into());
         }
-        if !output_eof && to_client.len() < MAX_MCP_FRAME_BYTES {
-            let mut chunk = Vec::new();
-            output_eof = read_available(child.stdout.as_mut().unwrap(), &mut chunk, 8192)?;
-            for byte in &chunk {
-                output_line_bytes += 1;
-                if output_line_bytes > MAX_MCP_FRAME_BYTES {
-                    bail!("worker response exceeds MCP frame limit");
-                }
-                if *byte == b'\n' {
-                    output_line_bytes = 0;
-                    let mut info = handle.info.lock().unwrap_or_else(|e| e.into_inner());
-                    info.responses_sent += 1;
-                    info.last_activity_at = unix_now_secs();
-                }
+        if fds[3].revents != 0 {
+            stderr_eof = capture_stderr(child, handle, &mut stderr_partial);
+            if stderr_eof {
+                next_probe = Instant::now();
             }
-            to_client.extend(chunk);
         }
+        if read_input && (already_buffered || peer_events != 0) {
+            match read_chunk(&mut reader, &mut chunk)? {
+                Some(0) => {
+                    input.finish(|frame| observe_client_message(handle, frame));
+                    input_eof = true;
+                    // stdin EOF leaves the response reader open. Accepted tool
+                    // calls retain their ordinary runtime while it is present.
+                    handle.info.lock().unwrap_or_else(|e| e.into_inner()).state =
+                        SessionState::Draining;
+                }
+                Some(n) => {
+                    input.push(&chunk[..n], MAX_MCP_FRAME_BYTES, |frame| {
+                        observe_client_message(handle, frame)
+                    })?;
+                }
+                None => {}
+            }
+        }
+        if input.has_ready()
+            && let Some(stdin) = child.stdin.as_mut()
+            && input.flush(stdin).is_err()
+        {
+            // A worker can close stdin and still have a final response queued.
+            drop(child.stdin.take());
+            input = ClientFrames::default();
+        }
+        if read_output && fds[2].revents != 0 {
+            let room = chunk.len().min(RELAY_QUEUE_BYTES - to_client.len());
+            match read_chunk(child.stdout.as_mut().unwrap(), &mut chunk[..room])? {
+                Some(0) => {
+                    output_eof = true;
+                    // Closing stdout can precede process exit. Give the leader
+                    // one scheduling turn before inspecting its status again.
+                    next_probe = Instant::now() + POLL_WAIT_STEP;
+                }
+                Some(n) => {
+                    observe_output_chunk(handle, &mut output_line_bytes, &chunk[..n])?;
+                    to_client.extend(&chunk[..n]);
+                }
+                None => {}
+            }
+        }
+        let pending_before_write = to_client.len();
         if flush_pending(writer, &mut to_client).is_err() {
             return Ok("client_disconnected".into());
+        }
+        if worker_exited && to_client.len() < pending_before_write {
+            // A dead worker's inherited pipe writers cannot hold the session
+            // open forever. Allow the response to drain while it makes progress.
+            drain_deadline = Some(Instant::now() + EXITED_WORKER_DRAIN_TIMEOUT);
         }
     }
 }
@@ -1767,19 +1995,24 @@ fn observe_client_message(handle: &SessionHandle, raw: &[u8]) {
 /// group signals have been sent prevents a reused PGID selecting other work.
 /// https://man7.org/linux/man-pages/man2/waitid.2.html
 fn child_has_exited(pid: u32) -> io::Result<bool> {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    let result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(unsafe { info.si_pid() } != 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
-    Ok(unsafe { info.si_pid() } != 0)
 }
 
 #[cfg(target_os = "linux")]
@@ -1833,12 +2066,15 @@ fn parse_process_group(stat: &[u8]) -> io::Result<(u32, bool)> {
 }
 
 /// Reap the direct worker and terminate remaining members of its process group.
-fn reap_worker(child: &mut Child, worker_pid: u32, worker_groups: bool) -> Option<String> {
+fn reap_worker(child: &mut Child, worker_groups: bool) -> io::Result<std::process::ExitStatus> {
+    let worker_pid = child.id();
+    // ECHILD means this daemon no longer reserves the leader's PID. Propagate
+    // it before sending a signal to either the numeric PID or its group.
     let deadline = Instant::now() + FORCED_EOF_GRACE;
-    while Instant::now() < deadline && !child_has_exited(worker_pid).unwrap_or(true) {
+    while Instant::now() < deadline && !child_has_exited(worker_pid)? {
         thread::sleep(POLL_WAIT_STEP);
     }
-    let exited = child_has_exited(worker_pid).unwrap_or(false);
+    let exited = child_has_exited(worker_pid)?;
     // A zombie leader retains its PID/PGID through the final group signal.
     // Linux adopts orphaned helpers so they can be reaped per owned group.
     if worker_groups || !exited {
@@ -1846,7 +2082,7 @@ fn reap_worker(child: &mut Child, worker_pid: u32, worker_groups: bool) -> Optio
         signal_worker(worker_pid, libc::SIGCONT, worker_groups);
         let deadline = Instant::now() + SIGTERM_GRACE;
         while Instant::now() < deadline {
-            let leader_exited = child_has_exited(worker_pid).unwrap_or(false);
+            let leader_exited = child_has_exited(worker_pid)?;
             if !worker_groups && leader_exited {
                 break;
             }
@@ -1860,9 +2096,12 @@ fn reap_worker(child: &mut Child, worker_pid: u32, worker_groups: bool) -> Optio
             }
             thread::sleep(POLL_WAIT_STEP);
         }
-        signal_worker(worker_pid, libc::SIGKILL, worker_groups);
+        let leader_exited = child_has_exited(worker_pid)?;
+        if worker_groups || !leader_exited {
+            signal_worker(worker_pid, libc::SIGKILL, worker_groups);
+        }
     }
-    let status = child.wait().ok();
+    let status = child.wait()?;
     #[cfg(target_os = "linux")]
     if worker_groups {
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -1882,9 +2121,7 @@ fn reap_worker(child: &mut Child, worker_pid: u32, worker_groups: bool) -> Optio
             }
         }
     }
-    status
-        .filter(|status| !status.success())
-        .map(|status| format!("worker_status_{status}"))
+    Ok(status)
 }
 
 fn signal_worker(pid: u32, signal: libc::c_int, group: bool) {
@@ -1905,6 +2142,34 @@ fn signal_worker(pid: u32, signal: libc::c_int, group: bool) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn complete_frames_use_their_own_limit_across_a_coalesced_read() -> Result<()> {
+        // The final read completes an exactly-at-limit request, contains a
+        // second request, and begins a third. No additional input is coming.
+        const LIMIT: usize = 128;
+        let mut first = br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.to_vec();
+        first.resize(LIMIT - 1, b' ');
+        first.push(b'\n');
+        let second = b"{\"id\":2}\n";
+        let final_frame = b"{\"id\":3}";
+        let mut input = ClientFrames::default();
+        let mut observed = Vec::new();
+        let mut observe = |frame: &[u8]| observed.push(frame.to_vec());
+        input.push(&first[..LIMIT - 2], LIMIT, &mut observe)?;
+        assert!(!input.has_ready());
+        let tail = [&first[LIMIT - 2..], second, &final_frame[..2]].concat();
+        input.push(&tail, LIMIT, &mut observe)?;
+        let mut sink = Vec::new();
+        input.flush(&mut sink)?;
+        assert_eq!(sink, [&first[..], second].concat());
+        input.push(&final_frame[2..], LIMIT, &mut observe)?;
+        input.finish(&mut observe);
+        input.flush(&mut sink)?;
+        assert_eq!(sink, [&first[..], second, final_frame].concat());
+        assert_eq!(observed, [first.as_slice(), second, final_frame]);
+        Ok(())
+    }
+
     fn test_session_request(root: &std::path::Path) -> StartSessionRequest {
         StartSessionRequest {
             protocol: PROTOCOL_VERSION,
@@ -1920,6 +2185,7 @@ mod tests {
     }
 
     fn test_session_handle(root: &std::path::Path, id: &str) -> Arc<SessionHandle> {
+        let (supervisor_wake, outcome_wake) = UnixStream::pair().unwrap();
         Arc::new(SessionHandle {
             info: Mutex::new(SessionInfo {
                 session_id: id.to_string(),
@@ -1928,6 +2194,7 @@ mod tests {
                 db: None,
                 languages: Vec::new(),
                 no_refresh: true,
+                runtime_pid: None,
                 worker_pid: 0,
                 client_pid: std::process::id(),
                 owner_pid: None,
@@ -1943,7 +2210,8 @@ mod tests {
                 recent_stderr: Vec::new(),
             }),
             owner: None,
-            completed: Condvar::new(),
+            supervisor_wake,
+            outcome_wake,
             watcher_registered: AtomicBool::new(false),
             forced_stop: AtomicBool::new(false),
             stop_reason: Mutex::new(None),
@@ -1960,7 +2228,7 @@ mod tests {
         let mut core = DaemonCore::new(paths.clone(), wake_writer, true)?;
         core.max_sessions = 1;
         let core = Arc::new(core);
-        let ceiling = MAX_PENDING_CONNECTIONS + 2;
+        let ceiling = core.max_pending + 2;
         let mut guards: Vec<_> = (0..ceiling)
             .map(|_| ActiveThreadGuard::try_enter(Arc::clone(&core)).unwrap())
             .collect();
@@ -2178,7 +2446,7 @@ mod tests {
         // Reserve all permits before starting handlers. Once the first kill
         // publishes cancellation, an early dispatch-time release is observable
         // deterministically, without waiting for the four-second deadline.
-        let permits: Vec<_> = (0..MAX_PENDING_CONNECTIONS)
+        let permits: Vec<_> = (0..core.max_pending)
             .map(|_| PendingConnection::try_acquire(&core).unwrap())
             .collect();
         thread::scope(|scope| -> Result<()> {
@@ -2212,7 +2480,7 @@ mod tests {
             }
             assert_eq!(
                 core.pending_connections.load(Ordering::Acquire),
-                MAX_PENDING_CONNECTIONS
+                core.max_pending
             );
             assert!(PendingConnection::try_acquire(&core).is_none());
             // Free the fake worker without waiting on real child processes.
@@ -2307,6 +2575,43 @@ mod tests {
         assert!(error.contains("kernel-verified peer PID") && error.contains("serve --mcp"));
         assert_eq!(core.total_sessions_started.load(Ordering::Acquire), 0);
         assert!(core.active_sessions.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn closing_worker_stdout_does_not_finish_a_live_half_closed_session() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let marker = dir.path().join("completed");
+        let paths = DaemonPaths::resolve(Some(&dir.path().join("d.sock")))?;
+        let (_wake_reader, wake_writer) = UnixStream::pair()?;
+        let core = DaemonCore::new(paths, wake_writer, true)?;
+        let handle = test_session_handle(dir.path(), "finishing");
+        let (client, mut server) = UnixStream::pair()?;
+        let reader = BufReader::new(server.try_clone()?);
+        client.shutdown(Shutdown::Write)?;
+        let ready =
+            serde_json::json!({"protocol": PROTOCOL_VERSION, "version": env!("CARGO_PKG_VERSION")});
+        // This worker closes its reply pipe, then completes a side effect
+        // belonging to the accepted work before exiting successfully.
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                r#"printf '%s\n' "$1"; cat >/dev/null; exec 1>&- 2>&-; sleep 1; echo done > "$2""#,
+                "finishing-worker",
+            ])
+            .arg(ready.to_string())
+            .arg(&marker)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let outcome =
+            supervise_session(&mut child, &core, &handle, reader, &mut server, "finishing");
+        let finished_before_outcome = marker.is_file();
+        drop(child.stdin.take());
+        let status = child.wait()?;
+        assert_eq!(outcome?, "client_eof");
+        assert!(status.success() && finished_before_outcome);
         Ok(())
     }
 
@@ -2508,7 +2813,7 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         let descendant: libc::pid_t = fs::read_to_string(&pid_file)?.trim().parse()?;
-        reap_worker(&mut fixture.child, worker_pid, true);
+        reap_worker(&mut fixture.child, true)?;
         // The reaper released the PID, so this guard must never signal again.
         fixture.armed = false;
         // Linux orphan zombies may await PID1 outside the orchestrator's

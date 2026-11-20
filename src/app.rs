@@ -100,7 +100,7 @@ pub enum Command {
     #[command(about = "List Git worktrees and their index status without indexing them.")]
     Worktrees,
     #[command(
-        about = "Connect an MCP session through the orchestrator daemon, or start the HTTP server."
+        about = "Serve MCP directly or connect through the trusted daemon, or start the HTTP server."
     )]
     Serve(ServeCommand),
     #[command(
@@ -468,7 +468,18 @@ pub enum DaemonAction {
     Uninstall,
     /// Internal per-session MCP worker spawned by the orchestrator daemon.
     #[command(hide = true)]
-    Worker,
+    Worker {
+        #[arg(long)]
+        runtime_fd: i32,
+    },
+    /// Internal owner of a compatible checkout's warm indexing state.
+    #[command(hide = true)]
+    IndexRuntime {
+        #[arg(long)]
+        runtime_fd: i32,
+        #[arg(long)]
+        config_digest: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -756,9 +767,19 @@ fn manage_daemon(cli: &Cli, command: &DaemonCommand) -> Result<()> {
     use crate::daemon::{DaemonClient, DaemonPaths, orchestrator, service};
 
     match &command.action {
-        DaemonAction::Worker => with_runtime(cli, |runtime| {
-            let runtime = runtime.with_jobs(0);
-            spawn_background_watch(cli, &runtime)?;
+        DaemonAction::IndexRuntime {
+            runtime_fd,
+            config_digest,
+        } => crate::daemon::runtime::serve_index(*runtime_fd, || {
+            with_runtime(cli, |runtime| {
+                let runtime = runtime.with_jobs(0);
+                crate::daemon::runtime::verify_config(&runtime.config, config_digest)?;
+                spawn_background_watch(cli, &runtime)?;
+                Ok(crate::worktrees::Runtimes::new(runtime))
+            })
+        }),
+        DaemonAction::Worker { runtime_fd } => {
+            let resolver = crate::daemon::runtime::SessionResolver::connect(*runtime_fd)?;
             crate::daemon::write_json_line(
                 &mut std::io::stdout(),
                 &crate::daemon::WorkerReady {
@@ -766,8 +787,8 @@ fn manage_daemon(cli: &Cli, command: &DaemonCommand) -> Result<()> {
                     version: env!("CARGO_PKG_VERSION").to_string(),
                 },
             )?;
-            crate::mcp::serve_mcp_worker(runtime)
-        }),
+            crate::mcp::serve_mcp_worker(&resolver)
+        }
         DaemonAction::Run { socket_activated } => {
             let paths = DaemonPaths::resolve(cli.socket.as_deref())?;
             orchestrator::run_orchestrator(paths, *socket_activated)
@@ -845,13 +866,19 @@ fn manage_daemon(cli: &Cli, command: &DaemonCommand) -> Result<()> {
                         println!("status: running");
                         println!("pid: {}", status.daemon_pid);
                         println!("version: {}", status.version);
-                        if status.version != cli_version {
+                        if status.protocol != crate::daemon::PROTOCOL_VERSION {
                             println!(
-                                "warning: CLI is v{cli_version}; run `tsindex daemon restart` to upgrade"
+                                "control protocol differs from the CLI; run `tsindex daemon restart`"
                             );
+                        } else if status.version != cli_version {
+                            println!("CLI v{cli_version} uses the same control protocol");
                         }
                         println!("uptime: {}s", status.uptime_secs);
+                        println!("resident index runtimes: {}", status.index_runtimes);
                         println!("socket: {}", status.socket.display());
+                        if let Some(capacity) = status.max_sessions {
+                            println!("session limit: {capacity}");
+                        }
                         println!(
                             "sessions: {} active ({} total)",
                             status.active_sessions, status.total_sessions_started
@@ -897,10 +924,12 @@ fn manage_daemon(cli: &Cli, command: &DaemonCommand) -> Result<()> {
                             .owner_pid
                             .map_or_else(|| "-".to_string(), |pid| pid.to_string());
                         println!(
-                            "{}\t{:?}\tworker={}\towner={}\tharness={}\treqs={}\ttools={}\t{}",
+                            "{}\t{:?}\tworker={}\truntime={}\towner={}\tharness={}\treqs={}\ttools={}\t{}",
                             s.session_id,
                             s.state,
                             s.worker_pid,
+                            s.runtime_pid
+                                .map_or_else(|| "-".into(), |pid| pid.to_string()),
                             owner,
                             harness,
                             s.requests_received,
@@ -1097,7 +1126,7 @@ fn check_full_build_failures(stats: &BuildStats) -> Result<()> {
     Ok(())
 }
 
-fn with_runtime(cli: &Cli, f: impl FnOnce(Runtime) -> Result<()>) -> Result<()> {
+fn with_runtime<T>(cli: &Cli, f: impl FnOnce(Runtime) -> Result<T>) -> Result<T> {
     let root = resolve_root(cli.root.as_deref())?;
     if cli.db.is_none()
         && !db_path(&root).exists()
@@ -1510,7 +1539,17 @@ mod tests {
             ]
             .as_slice(),
             ["tsindex", "daemon", "run"].as_slice(),
-            ["tsindex", "daemon", "worker"].as_slice(),
+            ["tsindex", "daemon", "worker", "--runtime-fd", "3"].as_slice(),
+            [
+                "tsindex",
+                "daemon",
+                "index-runtime",
+                "--runtime-fd",
+                "3",
+                "--config-digest",
+                "digest",
+            ]
+            .as_slice(),
             ["tsindex", "watch"].as_slice(),
             ["tsindex", "serve", "--http"].as_slice(),
             ["tsindex", "build"].as_slice(),
@@ -1591,7 +1630,17 @@ mod tests {
             ]
             .as_slice(),
             ["tsindex", "daemon", "uninstall"].as_slice(),
-            ["tsindex", "daemon", "worker"].as_slice(),
+            ["tsindex", "daemon", "worker", "--runtime-fd", "3"].as_slice(),
+            [
+                "tsindex",
+                "daemon",
+                "index-runtime",
+                "--runtime-fd",
+                "3",
+                "--config-digest",
+                "digest",
+            ]
+            .as_slice(),
         ] {
             assert!(
                 Cli::try_parse_from(argv).is_ok(),

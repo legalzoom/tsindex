@@ -805,7 +805,7 @@ fn mcp_watcher_skips_dependency_symlinks_and_refreshes_source() -> Result<()> {
         Command::new(BIN)
             .arg("--root")
             .arg(&root)
-            .args(["daemon", "worker"])
+            .args(["serve", "--mcp"])
             // Each step below waits out one debounce window; keep it short.
             .env("TSINDEX_WATCH_DEBOUNCE_MS", "200")
             // Never written, but it must stay open: the server exits on stdin EOF.

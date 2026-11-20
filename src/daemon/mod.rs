@@ -10,6 +10,8 @@ pub mod orchestrator;
 #[cfg(unix)]
 pub mod proxy;
 #[cfg(unix)]
+pub(crate) mod runtime;
+#[cfg(unix)]
 pub mod service;
 
 use std::env;
@@ -24,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::mcp::tsindex_home;
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const STARTUP_IO_TIMEOUT: Duration = Duration::from_secs(120);
 pub const MAX_MCP_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CONTROL_LINE_BYTES: usize = 64 * 1024;
@@ -425,6 +427,9 @@ pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub languages: Vec<String>,
     pub no_refresh: bool,
+    /// Shared index owner. The worker PID below executes this session's requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_pid: Option<u32>,
     pub worker_pid: u32,
     pub client_pid: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -455,7 +460,11 @@ pub struct DaemonStatus {
     pub uptime_secs: u64,
     pub socket: PathBuf,
     pub active_sessions: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_sessions: Option<usize>,
     pub total_sessions_started: u64,
+    #[serde(default)]
+    pub index_runtimes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -539,8 +548,12 @@ pub(crate) fn read_bounded_line(reader: &mut impl BufRead, max_bytes: usize) -> 
 }
 
 pub(crate) fn write_json_line(writer: &mut impl Write, value: &impl Serialize) -> Result<()> {
+    write_bounded_json(writer, value, MAX_CONTROL_LINE_BYTES)
+}
+
+fn write_bounded_json(writer: &mut impl Write, value: &impl Serialize, limit: usize) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
-    if bytes.len() + 1 > MAX_CONTROL_LINE_BYTES {
+    if bytes.len() + 1 > limit {
         bail!("control frame exceeds maximum length");
     }
     writer.write_all(&bytes)?;

@@ -368,7 +368,6 @@ impl Runtimes {
                 self.primary.jobs
             };
             let checkout = checkout.clone();
-            let previous = entry.runtime.clone();
             let worker_state = Arc::clone(&state);
             let generation = entry.started.checked_add(1).ok_or_else(|| {
                 anyhow!("worktree refresh generation exhausted; restart the server")
@@ -380,18 +379,11 @@ impl Runtimes {
                 .spawn(move || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                         || -> Result<(Runtime, Instant)> {
-                            let runtime = match previous {
-                                Some(runtime)
-                                    if runtime
-                                        .config
-                                        .repos
-                                        .first()
-                                        .is_some_and(|r| r.name == checkout.name) =>
-                                {
-                                    runtime
-                                }
-                                _ => open_checkout(&checkout, &config, languages)?.with_jobs(jobs),
-                            };
+                            // The index and cached generation remain warm. At
+                            // each reconciliation, reload the checkout's own
+                            // settings so a long-lived owner observes edits.
+                            let runtime =
+                                open_checkout(&checkout, &config, languages)?.with_jobs(jobs);
                             let refreshed = crate::maintenance::reconcile_if_due(&runtime)?;
                             Ok((runtime, refreshed))
                         },

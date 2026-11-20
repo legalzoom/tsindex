@@ -200,6 +200,26 @@ fn freshness_deletion_and_late_discovery_work_without_watchers() -> Result<()> {
 }
 
 #[test]
+fn a_warm_linked_checkout_reloads_its_own_settings_on_reconciliation() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let runtimes = Runtimes::new(fixture.runtime()?);
+    fs::write(
+        fixture.one.join("optional.py"),
+        "def optional_symbol():\n    pass\n",
+    )?;
+    let query = json!({"repo":"branch-one", "names":["optional_symbol"]});
+    assert_eq!(call(&runtimes, "get_symbol", query.clone())?["total"], 1);
+    let mut config = TsIndexConfig::load(&fixture.one)?;
+    let rules = fixture.one.join("extra.ignore");
+    fs::write(&rules, "optional.py\n")?;
+    config.ignore.extra.push(rules.to_str().unwrap().to_owned());
+    config.write(&fixture.one)?;
+    std::thread::sleep(std::time::Duration::from_millis(45));
+    assert_eq!(call(&runtimes, "get_symbol", query)?["total"], 0);
+    Ok(())
+}
+
+#[test]
 fn collisions_are_disambiguated_and_absolute_paths_resolve() -> Result<()> {
     let f = Fixture::new()?;
     let collision = f.main.parent().unwrap().join("elsewhere/main");

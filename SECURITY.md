@@ -18,6 +18,22 @@ tsindex reads source code from repositories you configure. Only expose its MCP
 connection to trusted clients. The MCP `replace_symbol` tool can change source
 files; HTTP does not expose that tool.
 
+The default `serve --mcp` executes in its launcher's environment. To enforce a
+harness's filesystem sandbox, launch the MCP executable inside that sandbox.
+Some hosts launch MCP servers outside their shell sandbox, so configure their
+MCP command through the platform's sandbox launcher. The Linux example in
+[README.md](README.md#mcp-servers-and-the-shared-daemon) exposes one workspace
+and runtime libraries. Include writable index and cache locations in the
+sandbox's grants. An index database can contain cached source snippets, so
+apply the same read policy to a database as to its indexed sources.
+
+`serve --mcp --via-daemon` explicitly authorizes a trusted session to use the
+shared daemon's user authority. Both socket peers verify the effective user
+identity, and the socket lives in a private user directory. Keep that endpoint
+outside the filesystem view of untrusted sandboxed processes. A reachable
+same-user broker can read and modify files using its own permissions. A
+path supplied by a client carries no proof of that client's kernel sandbox.
+
 The HTTP server binds to `127.0.0.1` by default. Host and Origin validation reduce
 browser-based attacks, but do not authenticate clients. The HTTP API includes
 repository cloning, removal, and rebuild operations. Keep the default loopback

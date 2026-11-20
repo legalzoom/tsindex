@@ -28,7 +28,21 @@ jobs:
             ~/.cargo/registry
             target
           key: ${{ runner.os }}-test-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Prepare sandbox and user service validation
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          test_uid="$(id -u)"
+          sudo systemctl start "user@${test_uid}.service"
+          echo "XDG_RUNTIME_DIR=/run/user/${test_uid}" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${test_uid}/bus" >> "$GITHUB_ENV"
       - name: Run tests
+        env:
+          TSINDEX_REQUIRE_SANDBOX: "1"
+          TSINDEX_REQUIRE_SYSTEMD: "1"
         run: cargo test --locked
       # Fetch the immutable writer independently: squash/rebase merges and
       # branch deletion can remove it from the main checkout's fetched history.
@@ -76,7 +90,7 @@ jobs:
           cargo audit --deny warnings
 
   macos-clippy:
-    name: macOS clippy
+    name: macOS clippy and lifecycle
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
@@ -95,6 +109,10 @@ jobs:
           key: ${{ runner.os }}-clippy-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - name: Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Test daemon and activation lifecycle
+        run: |
+          cargo test --locked --lib daemon::
+          cargo test --locked --test daemon --test service_activation
 
   secrets:
     name: secret scan

@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 use std::fs::{self, File};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -30,6 +31,7 @@ impl TestDaemon {
         // Use `/tmp` directly so the Unix socket path stays well below macOS's
         // 104-byte `sun_path` limit even when $TMPDIR is deeply nested.
         let dir = tempfile::tempdir_in("/tmp")?;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
         let socket = dir.path().join("d.sock");
         let log = dir.path().join("daemon.log");
 

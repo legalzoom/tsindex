@@ -399,7 +399,7 @@ impl Client {
             command.arg("--no-refresh");
         }
         command
-            .args(["daemon", "worker"])
+            .args(["serve", "--mcp"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(fs::File::create(&log)?);

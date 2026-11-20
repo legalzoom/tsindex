@@ -109,7 +109,7 @@ impl McpClient {
             .arg(root)
             // The primary is already built. Worktree requests still use their
             // ordinary on-demand refresh, without unrelated watcher traffic.
-            .args(["--no-refresh", "serve", "--mcp"])
+            .args(["--no-refresh", "serve", "--mcp", "--via-daemon"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(fs::File::create(&stderr)?)

@@ -37,12 +37,20 @@ index refresh as an eager warm-up, and exits:
 tsindex --root <target> update
 ```
 
-The startup script refreshes the index on demand and exits without starting a
-repo watcher. `serve --mcp` connects to the long-standing `tsindex` orchestrator
-daemon (which starts idle at login via `tsindex daemon install`, or manually via
-`tsindex daemon start`) and spawns a managed per-session MCP worker that runs
-its own watcher for the lifetime of that session. If the daemon is not running,
-`serve --mcp` fails fast telling the harness to start or install it. To keep a
+The startup script refreshes the index on demand and exits. The default
+`serve --mcp` runs directly in its launcher's environment, owns a coordinated
+watcher for its session, and tracks its harness process. Configure this command
+inside the harness's sandbox to retain its filesystem restrictions. For hosts
+that launch MCP outside the shell sandbox, configure an explicit sandbox
+launcher around the MCP command. See the Linux bubblewrap recipe in the
+repository README's "MCP servers and the shared daemon" section.
+
+Trusted unrestricted sessions can opt into the shared user daemon with
+`serve --mcp --via-daemon` after `tsindex daemon install`. This grants the
+session the daemon's filesystem authority, including `replace_symbol` writes.
+Keep the daemon socket outside an untrusted sandbox's mounted filesystem.
+
+To keep a
 foreground watcher attached to the current shell for CLI-only sessions that
 never start `serve --mcp`, run:
 

@@ -57,7 +57,7 @@ impl Server {
         let mut child = Command::new(BIN)
             .arg("--root")
             .arg(root)
-            .args(["daemon", "worker"])
+            .args(["serve", "--mcp"])
             .env("TSINDEX_WATCH_DEBOUNCE_MS", "50")
             .envs(environment.iter().copied())
             .stdin(Stdio::piped())

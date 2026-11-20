@@ -339,7 +339,8 @@ tsindex --root /path/to/main worktrees --json
 - `query`: Runs a raw tree-sitter query for one or more languages.
 - `worktrees`: Lists checkout names, paths, index status, and last update times.
 - `repos`: Lists, adds, and removes repos in the catalog.
-- `serve`: Connects an MCP stdio session through the orchestrator daemon, or starts the HTTP server.
+- `serve` runs an MCP stdio server or the HTTP server.
+  `--mcp --via-daemon` opts into the shared user daemon.
 - `daemon`: Installs, starts, stops, inspects, and manages the login-started orchestrator daemon and its active sessions.
 
 You can inspect per-command help with:
@@ -366,7 +367,9 @@ tsindex query '(function_definition name: (identifier) @fn)' --language python -
 
 - `--root`: Workspace root to index or query.
 - `--db`: Override the SQLite database path.
-- `--socket`: Override the orchestrator daemon Unix socket path (defaults to `$TSINDEX_SOCKET`, `$TSINDEX_HOME/daemon.sock`, or the platform runtime socket).
+- `--socket` overrides the orchestrator daemon Unix socket path. Defaults are
+  `$TSINDEX_SOCKET`, `$TSINDEX_HOME/run/daemon.sock`, or the platform runtime
+  socket.
 - `--languages <lang>`: Restrict work to one or more explicit languages
   (repeatable). `query` accepts either `--language <lang>` or repeated
   `--languages <lang>` options to query several grammars.
@@ -376,62 +379,120 @@ tsindex query '(function_definition name: (identifier) @fn)' --language python -
 
 Several query commands also support `--repo` to restrict results to one configured repo.
 
-## Orchestrator daemon & MCP server
+## MCP servers and the shared daemon
 
-On macOS and Linux, MCP sessions are managed by a standalone, long-standing
-orchestrator daemon that starts automatically at login and remains idle (with
-zero open databases or filesystem watchers) until an agent harness connects.
-
-Install and start the login service (`launchd` LaunchAgent on macOS,
-`systemd --user` on Linux):
-
-```bash
-tsindex daemon install
-```
-
-Or manage the daemon manually:
-
-```bash
-tsindex daemon start          # start in the background (idempotent)
-tsindex daemon status         # show daemon PID, version, socket, and active sessions
-tsindex daemon sessions       # list active MCP sessions (--all includes recent)
-tsindex daemon kill <id>      # terminate a single session (--all for every session)
-tsindex daemon restart        # gracefully restart (e.g. after upgrading tsindex)
-tsindex daemon stop           # gracefully drain and stop the daemon and its workers
-tsindex daemon uninstall      # stop and remove the login service
-```
-
-Agent harnesses invoke the same stdio MCP command as before:
+The default MCP command runs inside the environment that launches it. Use it
+when a harness launches tools inside a filesystem sandbox or container.
 
 ```bash
 tsindex --root /path/to/repo serve --mcp
 ```
 
-`serve --mcp` acts as a thin stdio proxy over the orchestrator's private Unix
-socket (`~/.tsindex/run/daemon.sock` on macOS, `$XDG_RUNTIME_DIR/tsindex/daemon.sock`
-on Linux, or `--socket` / `$TSINDEX_SOCKET`). If the orchestrator is not
-running, `serve --mcp` fails fast with an error instructing the harness/user to
-run `tsindex daemon start` or `tsindex daemon install`.
-
-For each connected harness session, the orchestrator spawns an isolated
-per-session MCP worker child process (so concurrent sessions working on the
-same repository in different Git worktrees stay isolated), bridges JSON-RPC
-traffic, monitors the owning harness PID (or explicit `--session-pid`) from a
-single centralized sweeper, and deterministically terminates and reaps the
-worker when the harness disconnects, crashes, or exits.
-
-When a wrapper launches the MCP proxy, pass the actual session process PID:
+The process inherits the launcher's filesystem permissions, mount view, and
+kernel restrictions. It coordinates indexes and watchers through the existing
+file leases and exits when its owning harness ends. A wrapper can identify the
+actual owner explicitly.
 
 ```bash
 tsindex --root /path/to/repo serve --mcp --session-pid 12345
 ```
 
-Explicit `--session-pid` ownership also continues to work directly with
-`serve --http` and `watch`, and `watch --exit-with-parent` monitors its
-immediate parent. On macOS and Linux, owner monitoring checks process start
-time to detect PID reuse and treats fully exited zombie processes as ended
-(while on Linux an exited thread-group leader with surviving worker threads
-remains alive, and non-UTF-8 process names are handled safely).
+Some harnesses launch MCP servers outside their shell sandbox. Configure the
+MCP executable itself through the harness's sandbox launcher in that case.
+Grant the server the source trees, index databases, and cache locations that
+it needs. An allowed database may already contain source snippets, including
+snippets from other repositories in a catalog.
+
+On Linux, this bubblewrap example exposes runtime libraries, the executable,
+and one writable workspace. Use absolute paths for both variables. The empty
+mount namespace keeps the login daemon's socket and the rest of the home
+directory outside the server's view. Its separate network namespace also
+blocks access to host loopback services. The example requires bubblewrap with
+unprivileged user, PID, and network namespaces available.
+
+```bash
+workspace="/absolute/path/to/repo"
+tsindex_binary="$(command -v tsindex)"
+bwrap --unshare-user --unshare-pid --unshare-net \
+  --die-with-parent --new-session \
+  --ro-bind /usr /usr --ro-bind /bin /bin \
+  --ro-bind /lib /lib --ro-bind-try /lib64 /lib64 \
+  --proc /proc --dev /dev --tmpfs /tmp \
+  --bind "$workspace" /workspace \
+  --ro-bind "$tsindex_binary" /tsindex \
+  --chdir /workspace --setenv HOME /workspace/.tsindex/home \
+  --setenv TSINDEX_HOME /workspace/.tsindex/home \
+  /tsindex --root /workspace serve --mcp
+```
+
+`TSINDEX_REQUIRE_SANDBOX=1 cargo test --locked --test sandbox` exercises this
+boundary and fails if the sandbox runtime is unavailable.
+
+Keep a shared daemon socket outside the mount view of untrusted harnesses.
+Access to that socket grants the daemon's user authority, including source
+reads and `replace_symbol` writes. Unix peer credentials authenticate the user
+identity. The kernel sandbox applies to the process launched inside it.
+
+### Trusted sessions through the daemon
+
+For trusted MCP clients, opt into a shared user orchestrator on macOS or Linux.
+
+```bash
+tsindex daemon install
+tsindex --root /path/to/repo serve --mcp --via-daemon
+```
+
+The login service manager owns the private Unix socket and starts the
+orchestrator on demand. `launchd` provides the socket on macOS and a
+`systemd --user` socket unit provides it on Linux. The idle orchestrator opens
+zero databases and filesystem watchers. It launches one worker per connection,
+so each session keeps its own checkout and language settings while file leases
+coordinate shared index state. Installation, service start, and launchd
+bootstrap validate endpoint ownership and file type before the manager binds
+its reserved socket. The Linux socket unit also runs a pre-bind validation
+hook when activated.
+
+```bash
+tsindex daemon start          # activate the installed service or start manually
+tsindex daemon status         # show service, socket, and active session count
+tsindex daemon sessions       # list active sessions
+tsindex daemon sessions --all # include recent sessions
+tsindex daemon sessions --id <id> # fetch one session and recent worker stderr
+tsindex daemon kill <id>      # terminate one session (--all for every session)
+tsindex daemon restart        # restart after a binary upgrade
+tsindex daemon stop           # stop accepting sessions and tear down workers
+tsindex daemon uninstall      # stop and remove the login service
+```
+
+`$TSINDEX_HOME/run/daemon.sock` overrides the platform runtime location.
+`--socket` and `$TSINDEX_SOCKET` select a custom endpoint. Use a dedicated,
+private directory for it. The installed service persists the resolved endpoint,
+including environment-derived overrides. Manual foreground operation uses
+`tsindex daemon run` and the same ownership and permissions checks.
+
+Managed startup acknowledges a session after its worker initializes. A
+dedicated outcome connection carries its final status through daemon stop and
+restart, while the MCP socket carries protocol messages. Worker
+startup errors reach the client's stderr and produce a failing exit status.
+Normal stdin EOF drains accepted requests. Explicit termination uses a bounded
+shutdown deadline independently of worker pipe progress, then terminates and
+reaps the worker. Linux and manual foreground daemons also clear its owned
+process group. Socket-activated macOS workers remain in launchd's job group
+for cleanup on daemon failure, with direct child termination per session.
+Current MCP workers run their operations in-process. A helper that creates a
+new process group can escape per-session group cleanup, so future helpers on
+all platforms require explicit containment. Linux service-wide stops retain
+the cgroup backstop. Manual daemons rely on their own process supervision.
+Session summaries are paginated. Worker diagnostics retain up to 16 KiB per
+session. Managed MCP frames have a
+16 MiB byte limit, and worker initialization has a 120-second deadline. A
+managed proxy closes a stream after 30 seconds without write progress, and
+detects daemon hangup while stdout is blocked.
+
+Direct MCP, managed MCP, `serve --http --session-pid`, and
+`watch --session-pid` check owner process identity. Linux inspects process
+start time to distinguish PID reuse and an exited zombie process from a leader
+with surviving threads. `watch --exit-with-parent` tracks its immediate parent.
 
 The server exposes five read tools:
 

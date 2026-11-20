@@ -396,9 +396,15 @@ pub struct QueryCommand {
 pub struct ServeCommand {
     #[arg(
         long,
-        help = "Attach an MCP stdio session through the running orchestrator daemon."
+        help = "Serve MCP over stdio in the calling harness's environment."
     )]
     mcp: bool,
+    #[arg(
+        long,
+        requires = "mcp",
+        help = "Use the shared user daemon for MCP. Grants the session the daemon's filesystem authority; use only for trusted clients."
+    )]
+    via_daemon: bool,
     #[arg(long, help = "Serve the same primitives over a small HTTP JSON API.")]
     http: bool,
     #[arg(long, help = "Port for --http. Defaults to the configured HTTP port.")]
@@ -421,7 +427,7 @@ pub struct ServeCommand {
     #[arg(
         long,
         value_parser = clap::value_parser!(u32).range(1..=i32::MAX as i64),
-        help = "Owning Codex/Claude/etc. session PID (must be inspectable). For MCP, monitored by the orchestrator daemon; for HTTP, monitors the owner locally."
+        help = "Owning session PID (must be inspectable). Managed MCP tracks it in the daemon; direct MCP and HTTP track it locally."
     )]
     session_pid: Option<u32>,
 }
@@ -435,7 +441,13 @@ pub struct DaemonCommand {
 #[derive(Debug, Subcommand)]
 pub enum DaemonAction {
     #[command(about = "Run the orchestrator daemon in the foreground (used by launchd/systemd).")]
-    Run,
+    Run {
+        #[arg(long, hide = true)]
+        socket_activated: bool,
+    },
+    /// Validate the reserved endpoint before a service manager binds it.
+    #[command(hide = true)]
+    CheckSocket,
     #[command(about = "Start the orchestrator daemon in the background (idempotent).")]
     Start,
     #[command(about = "Gracefully stop the running orchestrator daemon and its active sessions.")]
@@ -466,6 +478,12 @@ pub struct DaemonSessionsArgs {
         help = "Include recently exited sessions in addition to active ones."
     )]
     all: bool,
+    #[arg(
+        long,
+        conflicts_with = "all",
+        help = "Show one session and its recent stderr."
+    )]
+    id: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -690,11 +708,17 @@ pub fn run() -> Result<()> {
             Ok(())
         }),
         Command::Serve(ref command) => {
-            if command.mcp {
+            if command.via_daemon {
                 return run_mcp_via_daemon(&cli, command);
             }
             with_runtime(&cli, |runtime| {
                 let runtime = runtime.with_jobs(0);
+                // Direct MCP inherits the harness's kernel sandbox. Delegating
+                // to the login daemon requires an explicit trusted-client opt-in.
+                if command.mcp {
+                    spawn_background_watch(&cli, &runtime)?;
+                    return crate::mcp::serve_mcp(runtime);
+                }
                 refresh_if_needed(&cli, &runtime)?;
                 if !cli.no_refresh {
                     crate::maintenance::register_primary(&runtime, false);
@@ -735,11 +759,22 @@ fn manage_daemon(cli: &Cli, command: &DaemonCommand) -> Result<()> {
         DaemonAction::Worker => with_runtime(cli, |runtime| {
             let runtime = runtime.with_jobs(0);
             spawn_background_watch(cli, &runtime)?;
+            crate::daemon::write_json_line(
+                &mut std::io::stdout(),
+                &crate::daemon::WorkerReady {
+                    protocol: crate::daemon::PROTOCOL_VERSION,
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                },
+            )?;
             crate::mcp::serve_mcp_worker(runtime)
         }),
-        DaemonAction::Run => {
+        DaemonAction::Run { socket_activated } => {
             let paths = DaemonPaths::resolve(cli.socket.as_deref())?;
-            orchestrator::run_orchestrator(paths)
+            orchestrator::run_orchestrator(paths, *socket_activated)
+        }
+        DaemonAction::CheckSocket => {
+            let paths = DaemonPaths::resolve(cli.socket.as_deref())?;
+            service::check_socket(&paths)
         }
         DaemonAction::Start => {
             let paths = DaemonPaths::resolve(cli.socket.as_deref())?;
@@ -842,6 +877,10 @@ fn manage_daemon(cli: &Cli, command: &DaemonCommand) -> Result<()> {
         }
         DaemonAction::Sessions(args) => {
             let paths = DaemonPaths::resolve(cli.socket.as_deref())?;
+            if let Some(id) = &args.id {
+                let session = DaemonClient::new(paths).session_detail(id)?;
+                return print_json(&session);
+            }
             let (active, recent) = DaemonClient::new(paths).list_sessions(args.all)?;
             if cli.json {
                 print_json(&json!({
@@ -960,9 +999,11 @@ fn build_stats_json(stats: &BuildStats) -> serde_json::Value {
 
 fn should_start_parent_watchdog(command: &Command) -> bool {
     match command {
-        // MCP sessions are supervised centrally by the orchestrator daemon;
-        // only direct HTTP (--session-pid) and watch processes run a local watchdog.
-        Command::Serve(command) => !command.mcp && command.session_pid.is_some(),
+        // The daemon tracks managed workers. Direct servers retain local owner
+        // monitoring, including when the harness keeps their stdin open.
+        Command::Serve(command) => {
+            !command.via_daemon && (command.mcp || command.session_pid.is_some())
+        }
         Command::Watch(args) => args.exit_with_parent || args.session_pid.is_some(),
         _ => false,
     }
@@ -1441,8 +1482,10 @@ mod tests {
     }
 
     #[test]
-    fn parent_watchdog_starts_for_direct_http_and_watch_not_daemon_proxied_mcp() {
+    fn parent_watchdog_starts_for_direct_servers_and_watch() {
         for argv in [
+            ["tsindex", "serve", "--mcp"].as_slice(),
+            ["tsindex", "serve", "--mcp", "--session-pid", "42"].as_slice(),
             ["tsindex", "watch", "--exit-with-parent"].as_slice(),
             ["tsindex", "serve", "--http", "--session-pid", "42"].as_slice(),
             ["tsindex", "serve", "--session-pid", "42"].as_slice(),
@@ -1456,8 +1499,16 @@ mod tests {
         }
 
         for argv in [
-            ["tsindex", "serve", "--mcp"].as_slice(),
-            ["tsindex", "serve", "--mcp", "--session-pid", "42"].as_slice(),
+            ["tsindex", "serve", "--mcp", "--via-daemon"].as_slice(),
+            [
+                "tsindex",
+                "serve",
+                "--mcp",
+                "--via-daemon",
+                "--session-pid",
+                "42",
+            ]
+            .as_slice(),
             ["tsindex", "daemon", "run"].as_slice(),
             ["tsindex", "daemon", "worker"].as_slice(),
             ["tsindex", "watch"].as_slice(),
@@ -1472,6 +1523,17 @@ mod tests {
                 !should_start_parent_watchdog(&cli.command),
                 "local watchdog should not start for {argv:?}"
             );
+        }
+    }
+
+    #[test]
+    fn managed_transport_requires_explicit_mcp_selection() {
+        assert!(Cli::try_parse_from(["tsindex", "serve", "--via-daemon"]).is_err());
+        let cli = Cli::try_parse_from(["tsindex", "serve", "--mcp", "--via-daemon"])
+            .expect("managed MCP should parse");
+        match cli.command {
+            Command::Serve(args) => assert!(args.via_daemon),
+            other => panic!("expected serve command, got {other:?}"),
         }
     }
 
@@ -1511,6 +1573,7 @@ mod tests {
     fn daemon_subcommands_and_global_socket_parse() {
         for argv in [
             ["tsindex", "daemon", "run"].as_slice(),
+            ["tsindex", "daemon", "check-socket"].as_slice(),
             ["tsindex", "--socket", "/tmp/d.sock", "daemon", "start"].as_slice(),
             ["tsindex", "daemon", "stop", "--socket", "/tmp/d.sock"].as_slice(),
             ["tsindex", "daemon", "restart"].as_slice(),

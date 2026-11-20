@@ -119,6 +119,33 @@ impl ProcessOwner {
         Self::capture_with(owner_pid, explicit, excluded_pids, process_start_time)
     }
 
+    /// A daemon may disappear after answering a control ping. Preserve
+    /// inspection errors while treating an already-ended process as absent.
+    pub(crate) fn capture_if_running(pid: u32, excluded_pids: &[u32]) -> Result<Option<Self>> {
+        Self::capture_if_running_with(pid, excluded_pids, process_start_time)
+    }
+
+    fn capture_if_running_with(
+        pid: u32,
+        excluded_pids: &[u32],
+        inspect: impl FnOnce(libc::pid_t) -> io::Result<Option<(u64, u64)>>,
+    ) -> Result<Option<Self>> {
+        let pid = Self::validate_pid(pid, excluded_pids)?;
+        Ok(inspect(pid)
+            .with_context(|| format!("cannot inspect process PID {pid}"))?
+            .map(|started_at| Self { pid, started_at }))
+    }
+
+    fn validate_pid(pid: u32, excluded_pids: &[u32]) -> Result<libc::pid_t> {
+        if pid == 0 || pid > i32::MAX as u32 || excluded_pids.contains(&pid) {
+            bail!(
+                "session PID must identify another process (1..={})",
+                i32::MAX
+            );
+        }
+        Ok(pid as libc::pid_t)
+    }
+
     fn capture_with(
         owner_pid: Option<u32>,
         explicit: bool,
@@ -137,28 +164,17 @@ impl ProcessOwner {
         if !explicit && pid <= 1 {
             return Ok(None);
         }
-        if pid == 0 || pid > i32::MAX as u32 || excluded_pids.contains(&pid) {
-            bail!(
-                "session PID must identify another process (1..={})",
-                i32::MAX
-            );
-        }
+        let pid = Self::validate_pid(pid, excluded_pids)?;
         if explicit {
-            let started_at = inspect(pid as libc::pid_t)
+            let started_at = inspect(pid)
                 .with_context(|| format!("cannot inspect session PID {pid}"))?
                 .with_context(|| format!("session PID {pid} has already exited"))?;
-            Ok(Some(Self {
-                pid: pid as libc::pid_t,
-                started_at,
-            }))
+            Ok(Some(Self { pid, started_at }))
         } else {
             // Inferred owners must not break launches when process inspection
             // is restricted; fall back to Unix socket EOF tracking if needed.
-            match inspect(pid as libc::pid_t) {
-                Ok(Some(started_at)) => Ok(Some(Self {
-                    pid: pid as libc::pid_t,
-                    started_at,
-                })),
+            match inspect(pid) {
+                Ok(Some(started_at)) => Ok(Some(Self { pid, started_at })),
                 Ok(None) => bail!("session PID {pid} has already exited"),
                 Err(_) => Ok(None),
             }
@@ -462,6 +478,30 @@ mod tests {
         assert!(ProcessOwner::capture_with(Some(42), true, &[42], |_| Ok(Some((1, 1)))).is_err());
         assert!(ProcessOwner::capture_with(Some(99), true, &[], |_| Ok(None)).is_err());
         assert!(ProcessOwner::capture_with(None, true, &[], |_| Ok(Some((1, 1)))).is_err());
+    }
+
+    #[test]
+    fn process_owner_control_capture_treats_exited_process_as_absent() -> Result<()> {
+        assert!(ProcessOwner::capture_if_running_with(99, &[], |_| Ok(None))?.is_none());
+        assert!(ProcessOwner::capture_with(Some(99), true, &[], |_| Ok(None)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn process_owner_control_capture_preserves_inspection_errors_and_pid_validation() {
+        let error = ProcessOwner::capture_if_running_with(99, &[], |_| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "restricted process inspection",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(ProcessOwner::capture_if_running_with(0, &[], |_| Ok(None)).is_err());
+        assert!(ProcessOwner::capture_if_running_with(99, &[99], |_| Ok(None)).is_err());
     }
 
     #[test]

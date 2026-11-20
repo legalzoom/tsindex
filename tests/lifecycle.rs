@@ -55,7 +55,7 @@ fn explicit_session_exit(args: &[&str], check_alive: bool, reap_owner: bool) -> 
     let dir = fixture()?;
     let log = dir.path().join("server.log");
     let is_mcp = args.contains(&"--mcp");
-    let daemon = if is_mcp {
+    let daemon = if args.contains(&"--via-daemon") {
         Some(common::TestDaemon::start()?)
     } else {
         None
@@ -134,6 +134,11 @@ fn mcp_tracks_explicit_owner_and_stays_alive_until_it_exits() -> Result<()> {
 }
 
 #[test]
+fn managed_mcp_tracks_explicit_owner() -> Result<()> {
+    explicit_session_exit(&["serve", "--mcp", "--via-daemon"], false, true)
+}
+
+#[test]
 fn http_exits_when_the_session_becomes_a_zombie() -> Result<()> {
     explicit_session_exit(&["serve", "--http", "--port", "0"], false, false)
 }
@@ -155,7 +160,7 @@ fn missing_owner_fails_before_index_initialization() -> Result<()> {
         .arg(&daemon.socket)
         .arg("--root")
         .arg(dir.path())
-        .args(["serve", "--mcp", "--session-pid"])
+        .args(["serve", "--mcp", "--via-daemon", "--session-pid"])
         .arg(owner.0.id().to_string())
         .output()?;
     assert!(!output.status.success());
@@ -169,8 +174,8 @@ fn missing_owner_fails_before_index_initialization() -> Result<()> {
     Ok(())
 }
 
-fn wrapper_exit(explicit_owner: bool) -> Result<()> {
-    let daemon = common::TestDaemon::start()?;
+fn wrapper_exit(explicit_owner: bool, via_daemon: bool) -> Result<()> {
+    let daemon = via_daemon.then(common::TestDaemon::start).transpose()?;
     let dir = fixture()?;
     let log = dir.path().join("server.log");
     let mut owner = if explicit_owner {
@@ -184,8 +189,6 @@ fn wrapper_exit(explicit_owner: bool) -> Result<()> {
     command
         .args(["-c", "exec 3<&0; \"$@\" <&3 & wait", "session"])
         .arg(BIN)
-        .arg("--socket")
-        .arg(&daemon.socket)
         .arg("--root")
         .arg(dir.path())
         .args(["--no-refresh", "serve", "--mcp"])
@@ -193,6 +196,12 @@ fn wrapper_exit(explicit_owner: bool) -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(fs::File::create(&log)?)
         .process_group(0);
+    if let Some(daemon) = &daemon {
+        command
+            .arg("--socket")
+            .arg(&daemon.socket)
+            .arg("--via-daemon");
+    }
     if let Some(owner) = &owner {
         command.arg("--session-pid").arg(owner.0.id().to_string());
     }
@@ -229,23 +238,30 @@ fn wrapper_exit(explicit_owner: bool) -> Result<()> {
     }
     // EOF on stdout proves the proxy and worker exited, independent of logs.
     received.recv_timeout(Duration::from_secs(8))??;
-    daemon.wait_active_sessions(0, Duration::from_secs(5))?;
-    let daemon_log = daemon.read_log();
-    assert!(
-        daemon_log.contains(&format!("owner PID {session_pid} exited; shutting down")),
-        "{daemon_log}"
-    );
+    if let Some(daemon) = daemon {
+        daemon.wait_active_sessions(0, Duration::from_secs(5))?;
+        let daemon_log = daemon.read_log();
+        assert!(
+            daemon_log.contains(&format!("owner PID {session_pid} exited; shutting down")),
+            "{daemon_log}"
+        );
+    }
     Ok(())
 }
 
 #[test]
 fn mcp_exits_when_its_default_parent_dies_with_stdin_still_open() -> Result<()> {
-    wrapper_exit(false)
+    wrapper_exit(false, false)
 }
 
 #[test]
 fn explicit_owner_keeps_server_alive_after_wrapper_exit() -> Result<()> {
-    wrapper_exit(true)
+    wrapper_exit(true, false)
+}
+
+#[test]
+fn managed_mcp_exits_when_its_parent_dies() -> Result<()> {
+    wrapper_exit(false, true)
 }
 
 #[test]
@@ -259,7 +275,13 @@ fn disconnected_stderr_does_not_prevent_shutdown() -> Result<()> {
             .arg(&daemon.socket)
             .arg("--root")
             .arg(dir.path())
-            .args(["--no-refresh", "serve", "--mcp", "--session-pid"])
+            .args([
+                "--no-refresh",
+                "serve",
+                "--mcp",
+                "--via-daemon",
+                "--session-pid",
+            ])
             .arg(owner.0.id().to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -361,7 +383,13 @@ mod linux_owners {
                 .arg(&daemon.socket)
                 .arg("--root")
                 .arg(dir.path())
-                .args(["--no-refresh", "serve", "--mcp", "--session-pid"])
+                .args([
+                    "--no-refresh",
+                    "serve",
+                    "--mcp",
+                    "--via-daemon",
+                    "--session-pid",
+                ])
                 .arg(owner.0.id().to_string())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())

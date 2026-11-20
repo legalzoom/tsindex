@@ -3,6 +3,7 @@
 
 use std::env;
 use std::fs::{self, OpenOptions};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -10,18 +11,24 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::daemon::{DaemonClient, DaemonPaths, DaemonStatus};
-use crate::maintenance::FileLease;
+use crate::daemon::{DaemonClient, DaemonPaths, DaemonStatus, ensure_private_dir};
+use crate::lifecycle::ProcessOwner;
 use crate::mcp::home_path;
 
 pub const MACOS_SERVICE_LABEL: &str = "com.legalzoom.tsindex.daemon";
 pub const LINUX_SERVICE_NAME: &str = "tsindex.service";
+pub const LINUX_SOCKET_NAME: &str = "tsindex.socket";
 #[cfg(target_os = "macos")]
 const DEFAULT_MACOS_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-const START_TIMEOUT: Duration = Duration::from_secs(5);
-const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const START_TIMEOUT: Duration = Duration::from_secs(30);
+const STOP_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Deserialize, Serialize)]
+struct InstalledEndpoint {
+    socket: PathBuf,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ServiceInfo {
@@ -72,10 +79,24 @@ pub fn render_launchd_plist(
     log_path: &Path,
     path_env: &str,
 ) -> String {
+    let home = env::var_os("TSINDEX_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    render_launchd_plist_with_home(binary, socket, log_path, path_env, home.as_deref())
+}
+
+fn render_launchd_plist_with_home(
+    binary: &Path,
+    socket: Option<&Path>,
+    log_path: &Path,
+    path_env: &str,
+    home: Option<&Path>,
+) -> String {
     let mut args = vec![
         binary.to_string_lossy().into_owned(),
         "daemon".to_string(),
         "run".to_string(),
+        "--socket-activated".to_string(),
     ];
     if let Some(socket) = socket {
         args.push("--socket".to_string());
@@ -87,6 +108,25 @@ pub fn render_launchd_plist(
         .collect();
     let log = xml_escape(&log_path.to_string_lossy());
     let path_env = xml_escape(path_env);
+    let default_paths = DaemonPaths::resolve(None).ok();
+    let socket = socket.or_else(|| {
+        default_paths
+            .as_ref()
+            .map(|paths| paths.socket_path.as_path())
+    });
+    let socket = xml_escape(
+        &socket
+            .unwrap_or(Path::new("/invalid/tsindex.sock"))
+            .to_string_lossy(),
+    );
+    let home_env = home
+        .map(|value| {
+            format!(
+                "        <key>TSINDEX_HOME</key>\n        <string>{}</string>\n",
+                xml_escape(&value.to_string_lossy())
+            )
+        })
+        .unwrap_or_default();
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -98,13 +138,26 @@ pub fn render_launchd_plist(
     <key>ProgramArguments</key>
     <array>
 {rendered_args}    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
+    <key>Sockets</key>
     <dict>
-        <key>SuccessfulExit</key>
-        <false/>
+        <key>Listeners</key>
+        <dict>
+            <key>SockType</key>
+            <string>stream</string>
+            <key>SockPathName</key>
+            <string>{socket}</string>
+            <key>SockPathMode</key>
+            <integer>384</integer>
+        </dict>
     </dict>
+    <key>ThrottleInterval</key>
+    <integer>2</integer>
+    <key>ExitTimeOut</key>
+    <integer>15</integer>
+    <key>Umask</key>
+    <integer>63</integer>
+    <key>AbandonProcessGroup</key>
+    <false/>
     <key>StandardOutPath</key>
     <string>{log}</string>
     <key>StandardErrorPath</key>
@@ -113,7 +166,7 @@ pub fn render_launchd_plist(
     <dict>
         <key>PATH</key>
         <string>{path_env}</string>
-    </dict>
+{home_env}    </dict>
 </dict>
 </plist>
 "#
@@ -122,26 +175,68 @@ pub fn render_launchd_plist(
 
 /// Render a Linux `systemd --user` service unit for `tsindex daemon run`.
 pub fn render_systemd_unit(binary: &Path, socket: Option<&Path>) -> String {
-    let mut exec_start = format!("{} daemon run", systemd_quote(&binary.to_string_lossy()));
+    let home = env::var_os("TSINDEX_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    render_systemd_unit_with_home(binary, socket, home.as_deref())
+}
+
+fn render_systemd_unit_with_home(
+    binary: &Path,
+    socket: Option<&Path>,
+    home: Option<&Path>,
+) -> String {
+    let mut exec_start = format!(
+        "{} daemon run --socket-activated",
+        systemd_quote(&binary.to_string_lossy())
+    );
     if let Some(socket) = socket {
         exec_start.push_str(" --socket ");
         exec_start.push_str(&systemd_quote(&socket.to_string_lossy()));
     }
+    let home_env = home
+        .map(|value| {
+            format!(
+                "Environment={}\n",
+                systemd_environment_quote(&format!("TSINDEX_HOME={}", value.to_string_lossy()))
+            )
+        })
+        .unwrap_or_default();
     format!(
         r#"[Unit]
 Description=tsindex code-navigation orchestrator daemon
-After=default.target
+Requires=tsindex.socket
+After=tsindex.socket
 
 [Service]
 Type=simple
 ExecStart={exec_start}
 Restart=on-failure
 RestartSec=2
-
-[Install]
-WantedBy=default.target
+KillMode=mixed
+TimeoutStopSec=15
+UMask=0077
+{home_env}
 "#
     )
+}
+
+/// The manager owns this endpoint across service restarts. Activating the socket
+/// starts the foreground supervisor only when a client first connects.
+pub fn render_systemd_socket(binary: &Path, socket: &Path) -> String {
+    // A socket unit can be started at login without going through the CLI.
+    // Validate the endpoint before systemd is allowed to replace its pathname.
+    // https://www.freedesktop.org/software/systemd/man/latest/systemd.socket.html
+    format!(
+        "[Unit]\nDescription=tsindex activation socket\n\n[Socket]\nExecStartPre={} --socket {} daemon check-socket\nListenStream={}\nSocketMode=0600\nDirectoryMode=0700\nAccept=no\n\n[Install]\nWantedBy=sockets.target\n",
+        systemd_quote(&binary.to_string_lossy()),
+        systemd_quote(&socket.to_string_lossy()),
+        socket.to_string_lossy().replace('%', "%%")
+    )
+}
+
+fn systemd_environment_quote(value: &str) -> String {
+    systemd_quote(value).replace("$$", "$")
 }
 
 fn xml_escape(value: &str) -> String {
@@ -167,6 +262,9 @@ fn systemd_quote(value: &str) -> String {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
             '%' => out.push_str("%%"),
+            '$' => out.push_str("$$"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
             _ => out.push(ch),
         }
     }
@@ -181,7 +279,14 @@ fn resolve_binary(binary_override: Option<&Path>) -> Result<PathBuf> {
     };
     binary
         .canonicalize()
-        .with_context(|| format!("tsindex binary does not exist at {}", binary.display()))
+        .with_context(|| format!("tsindex binary does not exist at {}", binary.display()))?;
+    // Persist an installation symlink rather than its versioned package target.
+    // Package upgrades can replace that symlink while this daemon is running.
+    if binary.is_absolute() {
+        Ok(binary)
+    } else {
+        Ok(env::current_dir()?.join(binary))
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -191,8 +296,22 @@ fn write_file_atomically(path: &Path, contents: &str) -> Result<()> {
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    fs::write(&tmp, contents).with_context(|| format!("failed to write {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("failed to install {}", path.display()))?;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("failed to create {}", tmp.display()))?;
+    let result = (|| {
+        file.write_all(contents.as_bytes())?;
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result.with_context(|| format!("failed to install {}", path.display()))?;
     Ok(())
 }
 
@@ -223,277 +342,619 @@ fn wait_for_daemon_ready(paths: &DaemonPaths, timeout: Duration) -> Result<Daemo
     }
 }
 
-fn wait_for_daemon_stopped(paths: &DaemonPaths, timeout: Duration) -> Result<()> {
-    let client = DaemonClient::new(paths.clone());
+fn wait_for_daemon_exit(owner: &ProcessOwner, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
-    loop {
-        let ping_alive = client.ping().is_ok();
-        let lock_free = !paths.lock_path.exists()
-            || matches!(FileLease::try_acquire(&paths.lock_path), Ok(Some(_)));
-        if !ping_alive && lock_free {
-            return Ok(());
-        }
+    while !owner.has_ended() {
         if Instant::now() >= deadline {
             bail!(
-                "timed out waiting for tsindex daemon at {} to stop",
-                paths.socket_path.display()
+                "timed out waiting for tsindex daemon PID {} to exit",
+                owner.pid()
             );
         }
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(25));
     }
+    Ok(())
+}
+
+fn capture_running_daemon(paths: &DaemonPaths) -> Result<Option<ProcessOwner>> {
+    let status = match DaemonClient::new(paths.clone()).ping() {
+        Ok(status) => status,
+        Err(_) => return Ok(None),
+    };
+    ProcessOwner::capture_if_running(status.daemon_pid, &[std::process::id()])
+}
+
+fn stop_captured_daemon(paths: &DaemonPaths, owner: Option<ProcessOwner>) -> Result<bool> {
+    let Some(owner) = owner else { return Ok(false) };
+    if !owner.has_ended() {
+        let shutdown = DaemonClient::new(paths.clone()).shutdown();
+        // The initial PR #18 build used a flat lease path and removed its socket
+        // late in shutdown. Wait for the captured process, without creating a
+        // new lease or connecting again after its listener has closed.
+        if let Err(timeout) = wait_for_daemon_exit(&owner, STOP_TIMEOUT) {
+            return Err(shutdown.err().unwrap_or(timeout));
+        }
+    }
+    Ok(true)
 }
 
 fn read_log_tail(log_path: &Path) -> String {
-    let Ok(contents) = fs::read_to_string(log_path) else {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = fs::File::open(log_path) else {
         return String::new();
     };
+    let _ = file.seek(SeekFrom::End(-8192));
+    let mut bytes = Vec::new();
+    if file.take(8192).read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    let contents = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = contents.lines().collect();
     let start = lines.len().saturating_sub(15);
     lines[start..].join("\n")
 }
 
-/// Install and start the OS login service (`launchd` on macOS, `systemd --user`
-/// on Linux).
+/// Install and activate the user service at the resolved endpoint.
 pub fn install_service(
     paths: &DaemonPaths,
-    socket_override: Option<&Path>,
+    _socket_override: Option<&Path>,
     binary_override: Option<&Path>,
 ) -> Result<(ServiceInfo, DaemonStatus)> {
+    let endpoint_exists = validate_socket_node(paths)?;
     let binary = resolve_binary(binary_override)?;
+    ensure_private_dir(paths.socket_dir()?)?;
+    crate::daemon::orchestrator::prepare_metadata_dir(paths)?;
     if let Some(log_dir) = paths.log_path.parent() {
-        fs::create_dir_all(log_dir)
-            .with_context(|| format!("failed to create log directory {}", log_dir.display()))?;
+        ensure_private_dir(log_dir)?;
     }
+    let owner = capture_running_daemon(paths)?;
+    // Selecting an unrelated live endpoint must fail before stopping a current
+    // installation at another endpoint. A known installed listener may be
+    // unresponsive while its service manager remains able to stop it.
+    if endpoint_exists && owner.is_none() && !installed_endpoint_matches(paths).unwrap_or(false) {
+        check_socket(paths)?;
+    }
+    if inspect_service().installed {
+        stop_os_service()?;
+    }
+    stop_captured_daemon(paths, owner)?;
+    check_socket(paths)?;
+    install_platform_service(paths, &binary)?;
+    write_file_atomically(
+        &endpoint_file(),
+        &serde_json::to_string(&InstalledEndpoint {
+            socket: paths.socket_path.clone(),
+        })?,
+    )?;
+    start_os_service()?;
+    let status = wait_for_daemon_ready(paths, START_TIMEOUT)?;
+    Ok((inspect_service(), status))
+}
 
-    // Stop any previously running daemon so the service manager owns the live instance.
-    let _ = stop_daemon(paths);
+/// Validate immediately before a new listener is bound, including automatic
+/// systemd socket-unit activation at login. Stop existing listeners first.
+pub fn check_socket(paths: &DaemonPaths) -> Result<()> {
+    if !validate_socket_node(paths)? {
+        return Ok(());
+    }
+    match crate::daemon::connect_with_timeout(&paths.socket_path, Duration::from_millis(300)) {
+        Ok(_) => bail!(
+            "refusing to replace a live listening socket {}",
+            paths.socket_path.display()
+        ),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error).context("cannot verify existing socket; refusing replacement"),
+    }
+}
 
-    install_platform_service(paths, &binary, socket_override)
+fn validate_socket_node(paths: &DaemonPaths) -> Result<bool> {
+    let bytes = paths.socket_path.as_os_str().as_encoded_bytes();
+    // ListenStream parses a raw value, trims trailing whitespace, and treats a
+    // terminal backslash as a line continuation. Reject ambiguous paths before
+    // creating service files or asking a manager to bind the endpoint.
+    if paths.socket_path.to_str().is_none()
+        || bytes.iter().any(u8::is_ascii_control)
+        || bytes.last().is_some_and(u8::is_ascii_whitespace)
+        || bytes.last() == Some(&b'\\')
+    {
+        bail!("service socket path cannot be represented safely in an activation unit");
+    }
+    match fs::symlink_metadata(paths.socket_dir()?) {
+        Ok(_) => crate::daemon::validate_private_dir(paths.socket_dir()?)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error).context("failed to inspect socket directory"),
+    }
+    let metadata = match fs::symlink_metadata(&paths.socket_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("failed to inspect service socket endpoint"),
+    };
+    if !metadata.file_type().is_socket() || metadata.uid() != crate::daemon::current_uid() {
+        bail!(
+            "refusing to replace non-socket or foreign endpoint {}",
+            paths.socket_path.display()
+        );
+    }
+    Ok(true)
+}
+
+fn resolved_service_home() -> Result<Option<PathBuf>> {
+    env::var_os("TSINDEX_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|home| {
+            // A login manager starts in its own working directory. Preserve the
+            // installer's interpretation of a relative telemetry/cache path.
+            if home.is_absolute() {
+                Ok(home)
+            } else {
+                Ok(env::current_dir()?.join(home))
+            }
+        })
+        .transpose()
+}
+
+fn endpoint_file() -> PathBuf {
+    service_file_path().with_extension("json")
+}
+
+fn installed_endpoint_matches(paths: &DaemonPaths) -> Result<bool> {
+    if !inspect_service().installed {
+        return Ok(false);
+    }
+    let installed = match fs::read(endpoint_file()) {
+        Ok(bytes) => serde_json::from_slice::<InstalledEndpoint>(&bytes)
+            .context("invalid service endpoint metadata; run `tsindex daemon install` again")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // The initial PR #18 build persisted its endpoint only in the
+            // generated command. Read that format so upgrades retain manager
+            // ownership even before the service has been reinstalled.
+            InstalledEndpoint {
+                socket: endpoint_from_service()?,
+            }
+        }
+        Err(error) => return Err(error).context("failed to read installed service endpoint"),
+    };
+    Ok(installed.socket == paths.socket_path)
+}
+
+fn legacy_default_socket() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    if let Some(runtime) = env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        let path = PathBuf::from(runtime).join("tsindex/daemon.sock");
+        if path.as_os_str().as_encoded_bytes().len() <= 100 {
+            return path;
+        }
+    }
+    let path = home_path(".tsindex/run/daemon.sock");
+    if path.as_os_str().as_encoded_bytes().len() <= 100 {
+        path
+    } else {
+        PathBuf::from(format!(
+            "/tmp/tsindex-{}/daemon.sock",
+            crate::daemon::current_uid()
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn endpoint_from_service() -> Result<PathBuf> {
+    let source = fs::read_to_string(service_file_path())?;
+    let command = source
+        .lines()
+        .find_map(|line| line.strip_prefix("ExecStart="))
+        .context("installed service has no ExecStart; run `tsindex daemon install` again")?;
+    let mut args = Vec::new();
+    let mut remaining = command.trim();
+    // Our original renderer emitted JSON-compatible double-quoted paths and
+    // plain command words. Decode that finite format without executing a shell.
+    while !remaining.is_empty() {
+        if remaining.starts_with('"') {
+            let mut quoted = serde_json::Deserializer::from_str(remaining).into_iter::<String>();
+            let argument = quoted
+                .next()
+                .transpose()?
+                .context("missing service argument")?;
+            remaining = &remaining[quoted.byte_offset()..];
+            args.push(argument.replace("%%", "%"));
+        } else {
+            let end = remaining
+                .find(char::is_whitespace)
+                .unwrap_or(remaining.len());
+            args.push(remaining[..end].to_string());
+            remaining = &remaining[end..];
+        }
+        remaining = remaining.trim_start();
+    }
+    Ok(args
+        .windows(2)
+        .find(|pair| pair[0] == "--socket")
+        .map(|pair| PathBuf::from(&pair[1]))
+        .unwrap_or_else(legacy_default_socket))
 }
 
 #[cfg(target_os = "macos")]
-fn install_platform_service(
-    paths: &DaemonPaths,
-    binary: &Path,
-    socket_override: Option<&Path>,
-) -> Result<(ServiceInfo, DaemonStatus)> {
-    let plist_path = service_file_path();
-    let path_env = env::var("PATH")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| DEFAULT_MACOS_PATH.to_string());
-    let plist = render_launchd_plist(binary, socket_override, &paths.log_path, &path_env);
-    write_file_atomically(&plist_path, &plist)?;
+fn endpoint_from_service() -> Result<PathBuf> {
+    endpoint_from_launchd_plist(&fs::read_to_string(service_file_path())?)
+}
 
-    let domain = format!("gui/{}", crate::daemon::current_uid());
-    let service_target = format!("{domain}/{MACOS_SERVICE_LABEL}");
-    let _ = Command::new("launchctl")
-        .args(["bootout", &service_target])
-        .status();
+#[cfg(any(target_os = "macos", test))]
+fn endpoint_from_launchd_plist(source: &str) -> Result<PathBuf> {
+    let args = source
+        .split_once("<key>ProgramArguments</key>")
+        .and_then(|(_, value)| value.split_once("<array>"))
+        .and_then(|(_, value)| value.split_once("</array>"))
+        .map(|(value, _)| value)
+        .context("installed service has no ProgramArguments")?;
+    let values: Vec<String> = args
+        .split("<string>")
+        .skip(1)
+        .filter_map(|part| part.split_once("</string>").map(|(value, _)| value))
+        .map(|value| {
+            value
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"")
+                .replace("&apos;", "'")
+                .replace("&amp;", "&")
+        })
+        .collect();
+    Ok(values
+        .windows(2)
+        .find(|pair| pair[0] == "--socket")
+        .map(|pair| PathBuf::from(&pair[1]))
+        .unwrap_or_else(legacy_default_socket))
+}
 
-    let output = Command::new("launchctl")
-        .args(["bootstrap", &domain])
-        .arg(&plist_path)
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn endpoint_from_service() -> Result<PathBuf> {
+    Ok(legacy_default_socket())
+}
+
+fn manager_output(command: &mut Command, operation: &str) -> Result<()> {
+    let output = command
         .output()
-        .context("failed to invoke launchctl bootstrap")?;
+        .with_context(|| format!("failed to {operation}"))?;
     if !output.status.success() {
         bail!(
-            "launchctl bootstrap failed: {}",
+            "{operation} failed ({}): {}",
+            output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let status = wait_for_daemon_ready(paths, START_TIMEOUT)?;
-    Ok((inspect_service(), status))
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn install_platform_service(
-    paths: &DaemonPaths,
-    binary: &Path,
-    socket_override: Option<&Path>,
-) -> Result<(ServiceInfo, DaemonStatus)> {
-    let unit_path = service_file_path();
-    let unit = render_systemd_unit(binary, socket_override);
-    write_file_atomically(&unit_path, &unit)?;
-
-    let reload = Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .output()
-        .context("failed to invoke `systemctl --user daemon-reload`")?;
-    if !reload.status.success() {
-        bail!(
-            "systemctl --user daemon-reload failed: {}",
-            String::from_utf8_lossy(&reload.stderr).trim()
-        );
+fn install_platform_service(paths: &DaemonPaths, binary: &Path) -> Result<()> {
+    let service = service_file_path();
+    if service.is_file() && !service.with_extension("socket").exists() {
+        // The legacy service was enabled directly under default.target. Remove
+        // its startup link before enabling the on-demand socket definition.
+        manager_output(
+            Command::new("systemctl").args(["--user", "disable", LINUX_SERVICE_NAME]),
+            "disable legacy user service",
+        )?;
     }
-
-    let enable = Command::new("systemctl")
-        .args(["--user", "enable", "--now", LINUX_SERVICE_NAME])
-        .output()
-        .context("failed to invoke `systemctl --user enable --now`")?;
-    if !enable.status.success() {
-        bail!(
-            "systemctl --user enable --now failed: {}",
-            String::from_utf8_lossy(&enable.stderr).trim()
-        );
-    }
-
-    let status = wait_for_daemon_ready(paths, START_TIMEOUT)?;
-    Ok((inspect_service(), status))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn install_platform_service(
-    _paths: &DaemonPaths,
-    _binary: &Path,
-    _socket_override: Option<&Path>,
-) -> Result<(ServiceInfo, DaemonStatus)> {
-    bail!("login service installation is supported on macOS (launchd) and Linux (systemd --user)")
-}
-
-/// Stop, disable, and remove the OS login service.
-pub fn uninstall_service(paths: &DaemonPaths) -> Result<PathBuf> {
-    let _ = stop_daemon(paths);
-    let service_file = service_file_path();
-    uninstall_platform_service(&service_file)?;
-    Ok(service_file)
+    write_file_atomically(
+        &service,
+        &render_systemd_unit_with_home(
+            binary,
+            Some(&paths.socket_path),
+            resolved_service_home()?.as_deref(),
+        ),
+    )?;
+    write_file_atomically(
+        &service.with_extension("socket"),
+        &render_systemd_socket(binary, &paths.socket_path),
+    )?;
+    manager_output(
+        Command::new("systemctl").args(["--user", "daemon-reload"]),
+        "reload user service definitions",
+    )?;
+    // Only the socket is enabled at login. Its first request starts the service.
+    manager_output(
+        Command::new("systemctl").args(["--user", "enable", LINUX_SOCKET_NAME]),
+        "enable activation socket",
+    )
 }
 
 #[cfg(target_os = "macos")]
-fn uninstall_platform_service(service_file: &Path) -> Result<()> {
-    let service_target = format!("gui/{}/{MACOS_SERVICE_LABEL}", crate::daemon::current_uid());
-    let _ = Command::new("launchctl")
-        .args(["bootout", &service_target])
-        .status();
-    if service_file.exists() {
-        fs::remove_file(service_file)
-            .with_context(|| format!("failed to remove LaunchAgent {}", service_file.display()))?;
-    }
-    Ok(())
+fn install_platform_service(paths: &DaemonPaths, binary: &Path) -> Result<()> {
+    let path_env = env::var("PATH")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_MACOS_PATH.to_string());
+    write_file_atomically(
+        &service_file_path(),
+        &render_launchd_plist_with_home(
+            binary,
+            Some(&paths.socket_path),
+            &paths.log_path,
+            &path_env,
+            resolved_service_home()?.as_deref(),
+        ),
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn install_platform_service(_paths: &DaemonPaths, _binary: &Path) -> Result<()> {
+    bail!("login service installation requires launchd or systemd --user")
 }
 
 #[cfg(target_os = "linux")]
-fn uninstall_platform_service(service_file: &Path) -> Result<()> {
-    let _ = Command::new("systemctl")
-        .args(["--user", "disable", "--now", LINUX_SERVICE_NAME])
-        .status();
-    if service_file.exists() {
-        fs::remove_file(service_file)
-            .with_context(|| format!("failed to remove systemd unit {}", service_file.display()))?;
+fn start_os_service() -> Result<()> {
+    let unit = if service_file_path().with_extension("socket").is_file() {
+        LINUX_SOCKET_NAME
+    } else {
+        LINUX_SERVICE_NAME
+    };
+    manager_output(
+        Command::new("systemctl").args(["--user", "start", unit]),
+        "start user service endpoint",
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn service_target() -> String {
+    format!(
+        "gui/{}/{}",
+        crate::daemon::current_uid(),
+        MACOS_SERVICE_LABEL
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn start_os_service() -> Result<()> {
+    // A stopped job has been booted out, so reload it to restore its socket.
+    let loaded = Command::new("launchctl")
+        .args(["print", &service_target()])
+        .output()
+        .context("failed to inspect launchd service")?;
+    if loaded.status.success() {
+        if !fs::read_to_string(service_file_path())?.contains("<key>Sockets</key>") {
+            manager_output(
+                Command::new("launchctl").args(["kickstart", &service_target()]),
+                "start legacy launchd service",
+            )?;
+        }
+        return Ok(());
     }
-    let _ = Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .status();
-    Ok(())
+    let socket = endpoint_from_service()?;
+    check_socket(&DaemonPaths::resolve(Some(&socket))?)?;
+    let domain = format!("gui/{}", crate::daemon::current_uid());
+    manager_output(
+        Command::new("launchctl")
+            .args(["bootstrap", &domain])
+            .arg(service_file_path()),
+        "bootstrap launchd service",
+    )
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn uninstall_platform_service(_service_file: &Path) -> Result<()> {
-    Ok(())
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn start_os_service() -> Result<()> {
+    bail!("login service management requires launchd or systemd --user")
 }
 
-/// Start the orchestrator daemon (idempotent if already running).
+#[cfg(target_os = "linux")]
+fn stop_os_service() -> Result<()> {
+    // Stop the endpoint and service together so readiness probes cannot activate
+    // a replacement while the old supervisor drains its sessions.
+    if service_file_path().with_extension("socket").is_file() {
+        return manager_output(
+            Command::new("systemctl").args([
+                "--user",
+                "stop",
+                LINUX_SOCKET_NAME,
+                LINUX_SERVICE_NAME,
+            ]),
+            "stop activation socket and service",
+        );
+    }
+    // An installed legacy unit can be absent from the running manager's cache.
+    // Absence needs no stop, while connection/authorization errors still fail.
+    let state = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            "--property=LoadState",
+            "--value",
+            LINUX_SERVICE_NAME,
+        ])
+        .output()?;
+    if String::from_utf8_lossy(&state.stdout).trim() == "not-found" {
+        return Ok(());
+    }
+    if !state.status.success() {
+        bail!(
+            "cannot inspect legacy user service: {}",
+            String::from_utf8_lossy(&state.stderr).trim()
+        );
+    }
+    manager_output(
+        Command::new("systemctl").args(["--user", "stop", LINUX_SERVICE_NAME]),
+        "stop legacy user service",
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn stop_os_service() -> Result<()> {
+    let loaded = Command::new("launchctl")
+        .args(["print", &service_target()])
+        .output()
+        .context("failed to inspect launchd service")?;
+    if !loaded.status.success() {
+        return Ok(());
+    }
+    manager_output(
+        Command::new("launchctl").args(["bootout", &service_target()]),
+        "stop launchd service",
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn stop_os_service() -> Result<()> {
+    bail!("login service management requires launchd or systemd --user")
+}
+
+/// Stop and remove the installed service, socket definition, and endpoint record.
+pub fn uninstall_service(paths: &DaemonPaths) -> Result<PathBuf> {
+    let service = service_file_path();
+    let had_service = service.is_file();
+    let had_socket = service.with_extension("socket").is_file();
+    if had_service {
+        if !installed_endpoint_matches(paths)? {
+            bail!("installed service uses another socket; select its endpoint before uninstalling");
+        }
+        let owner = capture_running_daemon(paths)?;
+        stop_os_service()?;
+        stop_captured_daemon(paths, owner)?;
+    } else if had_socket {
+        stop_os_service()?;
+    } else {
+        stop_detached_daemon(paths)?;
+        return Ok(service);
+    }
+    #[cfg(target_os = "linux")]
+    manager_output(
+        Command::new("systemctl").args([
+            "--user",
+            "disable",
+            if had_socket {
+                LINUX_SOCKET_NAME
+            } else {
+                LINUX_SERVICE_NAME
+            },
+        ]),
+        "disable installed endpoint",
+    )?;
+    for file in [
+        service.clone(),
+        service.with_extension("socket"),
+        endpoint_file(),
+    ] {
+        match fs::remove_file(&file) {
+            Ok(()) => (),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to remove {}", file.display()));
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    manager_output(
+        Command::new("systemctl").args(["--user", "daemon-reload"]),
+        "reload user service definitions",
+    )?;
+    Ok(service)
+}
+
+/// Start the selected endpoint through its installed manager or as a manual daemon.
 pub fn start_daemon(paths: &DaemonPaths, socket_override: Option<&Path>) -> Result<DaemonStatus> {
+    validate_socket_node(paths)?;
+    if installed_endpoint_matches(paths)? {
+        start_os_service()?;
+        return wait_for_daemon_ready(paths, START_TIMEOUT);
+    }
     let client = DaemonClient::new(paths.clone());
     if let Ok(status) = client.ping() {
         return Ok(status);
     }
-
-    let use_os_service = socket_override.is_none()
-        && env::var_os("TSINDEX_SOCKET").is_none_or(|v| v.is_empty())
-        && env::var_os("TSINDEX_HOME").is_none_or(|v| v.is_empty())
-        && inspect_service().installed;
-
-    if use_os_service && try_start_os_service()? {
-        return wait_for_daemon_ready(paths, START_TIMEOUT);
-    }
-
+    check_socket(paths)?;
     spawn_detached_daemon(paths, socket_override)?;
     wait_for_daemon_ready(paths, START_TIMEOUT)
 }
 
-#[cfg(target_os = "macos")]
-fn try_start_os_service() -> Result<bool> {
-    let domain = format!("gui/{}", crate::daemon::current_uid());
-    let target = format!("{domain}/{MACOS_SERVICE_LABEL}");
-    let kickstart = Command::new("launchctl")
-        .args(["kickstart", &target])
-        .status();
-    if matches!(kickstart, Ok(status) if status.success()) {
-        return Ok(true);
-    }
-    let plist = service_file_path();
-    let bootstrap = Command::new("launchctl")
-        .args(["bootstrap", &domain])
-        .arg(&plist)
-        .status();
-    Ok(matches!(bootstrap, Ok(status) if status.success()))
-}
-
-#[cfg(target_os = "linux")]
-fn try_start_os_service() -> Result<bool> {
-    let status = Command::new("systemctl")
-        .args(["--user", "start", LINUX_SERVICE_NAME])
-        .status();
-    Ok(matches!(status, Ok(s) if s.success()))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn try_start_os_service() -> Result<bool> {
-    Ok(false)
-}
-
-fn spawn_detached_daemon(paths: &DaemonPaths, socket_override: Option<&Path>) -> Result<()> {
+fn spawn_detached_daemon(paths: &DaemonPaths, _socket_override: Option<&Path>) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     let binary = resolve_binary(None)?;
+    ensure_private_dir(paths.socket_dir()?)?;
+    crate::daemon::orchestrator::prepare_metadata_dir(paths)?;
     if let Some(log_dir) = paths.log_path.parent() {
-        fs::create_dir_all(log_dir)
-            .with_context(|| format!("failed to create log directory {}", log_dir.display()))?;
+        ensure_private_dir(log_dir)?;
     }
     let log_file = OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&paths.log_path)
         .with_context(|| format!("failed to open daemon log {}", paths.log_path.display()))?;
-    let log_err = log_file.try_clone()?;
-
-    let mut cmd = Command::new(binary);
-    if let Some(socket) = socket_override {
-        cmd.arg("--socket").arg(socket);
+    if !log_file.metadata()?.is_file() {
+        bail!("daemon log must be a regular file");
     }
-    cmd.args(["daemon", "run"])
+    let log_err = log_file.try_clone()?;
+    let mut cmd = Command::new(binary);
+    cmd.arg("--socket")
+        .arg(&paths.socket_path)
+        .args(["daemon", "run"])
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_err));
-
-    // Detach into its own session so closing the calling terminal does not
-    // send SIGHUP to the long-standing orchestrator.
     unsafe {
         cmd.pre_exec(|| {
-            let _ = libc::setsid();
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
-
     cmd.spawn()
         .context("failed to spawn detached tsindex daemon")?;
     Ok(())
 }
 
-/// Gracefully stop the running orchestrator daemon. Returns `true` if a
-/// running daemon was stopped, or `false` if none was running.
-pub fn stop_daemon(paths: &DaemonPaths) -> Result<bool> {
-    let client = DaemonClient::new(paths.clone());
-    if client.ping().is_err() {
-        return Ok(false);
-    }
-    client.shutdown()?;
-    wait_for_daemon_stopped(paths, STOP_TIMEOUT)?;
-    Ok(true)
+fn stop_detached_daemon(paths: &DaemonPaths) -> Result<bool> {
+    let owner = capture_running_daemon(paths)?;
+    stop_captured_daemon(paths, owner)
 }
 
-/// Restart the orchestrator daemon cleanly.
+/// Stop activation as well as the worker-owning service at an installed endpoint.
+pub fn stop_daemon(paths: &DaemonPaths) -> Result<bool> {
+    if installed_endpoint_matches(paths)? {
+        let owner = capture_running_daemon(paths)?;
+        stop_os_service()?;
+        stop_captured_daemon(paths, owner)?;
+        return Ok(true);
+    }
+    stop_detached_daemon(paths)
+}
+
+/// Keep a manager-owned listener available while its supervisor is replaced.
 pub fn restart_daemon(paths: &DaemonPaths, socket_override: Option<&Path>) -> Result<DaemonStatus> {
-    let _ = stop_daemon(paths)?;
+    validate_socket_node(paths)?;
+    if installed_endpoint_matches(paths)? {
+        start_os_service()?;
+        #[cfg(target_os = "linux")]
+        manager_output(
+            Command::new("systemctl").args(["--user", "restart", LINUX_SERVICE_NAME]),
+            "restart user service",
+        )?;
+        #[cfg(target_os = "macos")]
+        {
+            let owner = capture_running_daemon(paths)?;
+            if fs::read_to_string(service_file_path())?.contains("<key>Sockets</key>") {
+                // Keep the registered socket while the old process completes
+                // cleanup. Only the final readiness probe activates its successor.
+                stop_captured_daemon(paths, owner)?;
+            } else {
+                // Legacy jobs self-bind and require bootout/bootstrap. Their
+                // delayed socket cleanup must finish before the replacement.
+                stop_os_service()?;
+                stop_captured_daemon(paths, owner)?;
+                start_os_service()?;
+            }
+        }
+        return wait_for_daemon_ready(paths, START_TIMEOUT);
+    }
+    stop_detached_daemon(paths)?;
     start_daemon(paths, socket_override)
 }
 
@@ -514,9 +975,41 @@ mod tests {
         assert!(plist.contains("<string>daemon</string>"));
         assert!(plist.contains("<string>run</string>"));
         assert!(plist.contains("<string>/tmp/a&amp;b/daemon.sock</string>"));
-        assert!(plist.contains("<key>RunAtLoad</key>"));
-        assert!(plist.contains("<key>SuccessfulExit</key>"));
+        assert!(plist.contains("<key>Sockets</key>"));
+        assert!(plist.contains("<key>SockPathMode</key>"));
         assert!(plist.contains("<false/>"));
+        let throttle = plist
+            .split("<key>ThrottleInterval</key>")
+            .nth(1)
+            .unwrap()
+            .split("<integer>")
+            .nth(1)
+            .unwrap()
+            .split("</integer>")
+            .next()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!(
+            START_TIMEOUT.as_secs() > throttle,
+            "readiness timeout must cover launchd's restart throttle"
+        );
+    }
+
+    #[test]
+    fn legacy_launchd_program_arguments_preserve_xml_escaped_socket_paths() -> Result<()> {
+        let legacy = r#"<plist><dict>
+<key>ProgramArguments</key><array>
+<string>/usr/local/bin/tsindex</string><string>daemon</string><string>run</string>
+<string>--socket</string><string>/private/a&amp;b/sock&quot;name</string>
+</array><key>RunAtLoad</key><true/>
+<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+</dict></plist>"#;
+        assert_eq!(
+            endpoint_from_launchd_plist(legacy)?,
+            PathBuf::from("/private/a&b/sock\"name")
+        );
+        Ok(())
     }
 
     #[test]
@@ -526,16 +1019,16 @@ mod tests {
             Some(Path::new("/run/user/1000/tsindex/daemon.sock")),
         );
         assert!(unit.contains(
-            "ExecStart=\"/home/dev/.cargo/bin/tsindex\" daemon run --socket \"/run/user/1000/tsindex/daemon.sock\""
+            "ExecStart=\"/home/dev/.cargo/bin/tsindex\" daemon run --socket-activated --socket \"/run/user/1000/tsindex/daemon.sock\""
         ));
         assert!(unit.contains("Restart=on-failure"));
-        assert!(unit.contains("WantedBy=default.target"));
+        assert!(unit.contains("KillMode=mixed"));
     }
 
     #[test]
     fn systemd_unit_omits_socket_flag_when_using_defaults() {
         let unit = render_systemd_unit(Path::new("/usr/bin/tsindex"), None);
-        assert!(unit.contains("ExecStart=\"/usr/bin/tsindex\" daemon run\n"));
-        assert!(!unit.contains("--socket"));
+        assert!(unit.contains("ExecStart=\"/usr/bin/tsindex\" daemon run --socket-activated\n"));
+        assert!(!unit.contains("--socket "));
     }
 }

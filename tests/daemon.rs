@@ -7,6 +7,7 @@ mod common;
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -34,7 +35,7 @@ impl McpSession {
             .arg(socket)
             .arg("--root")
             .arg(root)
-            .args(["--no-refresh", "serve", "--mcp"])
+            .args(["--no-refresh", "serve", "--mcp", "--via-daemon"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -195,6 +196,7 @@ fn daemon_json(socket: &Path, args: &[&str]) -> Result<Value> {
 #[test]
 fn serve_mcp_fails_fast_when_daemon_is_not_running() -> Result<()> {
     let dir = tempdir_in("/tmp")?;
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
     let missing_socket = dir.path().join("missing.sock");
     let workspace = dir.path().join("repo");
     fs::create_dir_all(&workspace)?;
@@ -204,7 +206,7 @@ fn serve_mcp_fails_fast_when_daemon_is_not_running() -> Result<()> {
         .arg(&missing_socket)
         .arg("--root")
         .arg(&workspace)
-        .args(["serve", "--mcp"])
+        .args(["serve", "--mcp", "--via-daemon"])
         .stdin(Stdio::null())
         .output()?;
 
@@ -243,6 +245,7 @@ fn daemon_starts_idle_without_sessions_or_watchers() -> Result<()> {
 fn orchestrator_dispatches_isolated_workers_for_two_worktree_sessions() -> Result<()> {
     let daemon = common::TestDaemon::start()?;
     let dir = tempdir_in("/tmp")?;
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
     let main = dir.path().join("main");
     let wt = dir.path().join("wt-feature");
 
@@ -321,6 +324,7 @@ fn orchestrator_dispatches_isolated_workers_for_two_worktree_sessions() -> Resul
 fn proxy_sigkill_immediately_tears_down_and_reaps_worker() -> Result<()> {
     let daemon = common::TestDaemon::start()?;
     let dir = tempdir_in("/tmp")?;
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
     let repo = dir.path().join("repo");
     build_fixture(&repo, "lib.py", "def alive():\n    return True\n")?;
 
@@ -342,6 +346,7 @@ fn proxy_sigkill_immediately_tears_down_and_reaps_worker() -> Result<()> {
 fn daemon_kill_terminates_single_session_and_kill_all_clears_remaining() -> Result<()> {
     let daemon = common::TestDaemon::start()?;
     let dir = tempdir_in("/tmp")?;
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
     let repo = dir.path().join("repo");
     build_fixture(&repo, "lib.py", "def target():\n    return 42\n")?;
 
@@ -386,6 +391,7 @@ fn daemon_kill_terminates_single_session_and_kill_all_clears_remaining() -> Resu
 #[test]
 fn daemon_start_restart_and_stop_manage_detached_lifecycle_and_reap_workers() -> Result<()> {
     let dir = tempdir_in("/tmp")?;
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
     let socket = dir.path().join("detached.sock");
     let repo = dir.path().join("repo");
     build_fixture(&repo, "lib.py", "def booted():\n    return 1\n")?;
@@ -449,6 +455,7 @@ fn daemon_rejects_duplicate_instance_and_recovers_stale_socket_after_hard_kill()
     let mut daemon = common::TestDaemon::start()?;
     let socket = daemon.socket.clone();
     let dir = tempdir_in("/tmp")?;
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
     let repo = dir.path().join("repo");
     build_fixture(&repo, "lib.py", "def recovered():\n    return 7\n")?;
 
@@ -493,5 +500,546 @@ fn daemon_rejects_duplicate_instance_and_recovers_stale_socket_after_hard_kill()
     let hit = s2.call_tool("get_symbol", json!({ "names": ["recovered"] }))?;
     assert_eq!(hit["matches"].as_array().unwrap().len(), 1);
     s2.close_gracefully()?;
+    Ok(())
+}
+
+fn raw_session(socket: &Path, root: &Path) -> Result<(std::os::unix::net::UnixStream, Value)> {
+    use std::os::unix::net::UnixStream;
+    let mut stream = UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    writeln!(
+        stream,
+        "{}",
+        json!({
+            "op": "start_session", "protocol": tsindex::daemon::PROTOCOL_VERSION,
+            "client_version": env!("CARGO_PKG_VERSION"), "root": root,
+            "client_pid": std::process::id(), "no_refresh": true,
+        })
+    )?;
+    let mut line = String::new();
+    BufReader::new(&mut stream).read_line(&mut line)?;
+    let ready: Value = serde_json::from_str(&line)?;
+    Ok((stream, ready))
+}
+
+#[test]
+fn killing_stopped_worker_with_full_stdin_does_not_wait_for_pipe_progress() -> Result<()> {
+    let daemon = common::TestDaemon::start()?;
+    let dir = tempdir_in("/tmp")?;
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+    build_fixture(dir.path(), "lib.py", "def target():\n    return 1\n")?;
+    let (mut stream, ready) = raw_session(&daemon.socket, dir.path())?;
+    let pid = ready["worker_pid"].as_u64().context("worker not ready")? as u32;
+    let id = ready["session_id"].as_str().unwrap();
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
+    // The request exceeds pipe capacity while staying below the frame limit.
+    stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+    writeln!(
+        stream,
+        "{}",
+        json!({"jsonrpc":"2.0","id":1,"method":"ping","params":{"padding":"x".repeat(1024*1024)}})
+    )?;
+    thread::sleep(Duration::from_millis(100));
+    let start = Instant::now();
+    daemon_json(&daemon.socket, &["daemon", "kill", id])?;
+    daemon.wait_active_sessions(0, Duration::from_secs(5))?;
+    wait_pid_gone(pid, Duration::from_secs(1))?;
+    assert!(start.elapsed() < Duration::from_secs(5));
+    Ok(())
+}
+
+#[test]
+fn worker_config_errors_are_returned_before_session_ready() -> Result<()> {
+    let daemon = common::TestDaemon::start()?;
+    let dir = tempdir_in("/tmp")?;
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+    fs::create_dir(dir.path().join(".tsindex"))?;
+    fs::write(dir.path().join(".tsindex/config.toml"), "invalid = [")?;
+    let output = Command::new(BIN)
+        .arg("--socket")
+        .arg(&daemon.socket)
+        .arg("--root")
+        .arg(dir.path())
+        .args(["serve", "--mcp", "--via-daemon"])
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("initialization") && stderr.contains("TOML"),
+        "{stderr}"
+    );
+    daemon.wait_active_sessions(0, Duration::from_secs(5))?;
+    Ok(())
+}
+
+#[test]
+fn concurrent_session_admission_reserves_the_last_slot() -> Result<()> {
+    use std::sync::{Arc, Barrier};
+    let daemon = common::TestDaemon::start_with_env(&[("TSINDEX_MAX_SESSIONS", "1")])?;
+    let dir = tempdir_in("/tmp")?;
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+    build_fixture(dir.path(), "lib.py", "def target():\n    return 1\n")?;
+    let barrier = Arc::new(Barrier::new(12));
+    let attempts: Vec<_> = (0..12)
+        .map(|_| {
+            let barrier = Arc::clone(&barrier);
+            let socket = daemon.socket.clone();
+            let root = dir.path().to_path_buf();
+            thread::spawn(move || {
+                barrier.wait();
+                raw_session(&socket, &root)
+            })
+        })
+        .collect();
+    let sessions: Vec<_> = attempts
+        .into_iter()
+        .map(|join| join.join().unwrap())
+        .collect::<Result<_>>()?;
+    assert_eq!(
+        sessions
+            .iter()
+            .filter(|(_, reply)| reply["kind"] == "session_ready")
+            .count(),
+        1
+    );
+    assert_eq!(daemon.ping()?.active_sessions, 1);
+    drop(sessions);
+    daemon.wait_active_sessions(0, Duration::from_secs(5))?;
+    Ok(())
+}
+
+#[test]
+fn custom_socket_refuses_regular_files_and_keeps_existing_permissions() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir_in("/tmp")?;
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+    let socket = dir.path().join("keep.sock");
+    let sibling = dir.path().join("keep.json");
+    fs::write(&socket, "keep endpoint")?;
+    fs::write(&sibling, "keep sibling")?;
+    let output = Command::new(BIN)
+        .arg("--socket")
+        .arg(&socket)
+        .args(["daemon", "run"])
+        .output()?;
+    assert!(!output.status.success());
+    assert_eq!(fs::read_to_string(&socket)?, "keep endpoint");
+    assert_eq!(fs::read_to_string(&sibling)?, "keep sibling");
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755))?;
+    let output = Command::new(BIN)
+        .arg("--socket")
+        .arg(&socket)
+        .args(["daemon", "run"])
+        .output()?;
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::metadata(dir.path())?.permissions().mode() & 0o777,
+        0o755
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn atomic_executable_replacement_keeps_worker_startup_available() -> Result<()> {
+    use tsindex::daemon::{DaemonClient, DaemonPaths};
+    let dir = tempdir_in("/tmp")?;
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+    let exe = dir.path().join("tsindex");
+    let socket = dir.path().join("d.sock");
+    fs::copy(BIN, &exe)?;
+    let mut daemon = Command::new(&exe)
+        .arg("--socket")
+        .arg(&socket)
+        .args(["daemon", "run"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    struct Guard<'a>(&'a mut Child);
+    impl Drop for Guard<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _guard = Guard(&mut daemon);
+    let client = DaemonClient::new(DaemonPaths::resolve(Some(&socket))?);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while client.ping().is_err() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(20));
+    }
+    fs::copy(BIN, dir.path().join("replacement"))?;
+    fs::rename(dir.path().join("replacement"), &exe)?;
+    let root = dir.path().join("repo");
+    build_fixture(&root, "lib.py", "def target():\n    return 1\n")?;
+    let (stream, ready) = raw_session(&socket, &root)?;
+    assert_eq!(ready["kind"], "session_ready", "{ready}");
+    drop(stream);
+    client.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn session_listing_pages_bounded_summaries_and_keeps_detail_separate() -> Result<()> {
+    let daemon = common::TestDaemon::start()?;
+    let dir = tempdir_in("/tmp")?;
+    build_fixture(dir.path(), "lib.py", "def target():\n    return 1\n")?;
+    let mut streams = Vec::new();
+    for _ in 0..12 {
+        let (mut stream, ready) = raw_session(&daemon.socket, dir.path())?;
+        assert_eq!(ready["kind"], "session_ready");
+        writeln!(
+            stream,
+            "{}",
+            json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
+                "protocolVersion":"2024-11-05", "capabilities":{},
+                "clientInfo":{"name":"x".repeat(16*1024), "version":"v".repeat(4096)}
+            }})
+        )?;
+        let mut line = String::new();
+        BufReader::new(&mut stream).read_line(&mut line)?;
+        assert!(
+            serde_json::from_str::<Value>(&line)?
+                .get("result")
+                .is_some()
+        );
+        streams.push(stream);
+    }
+    let sessions = daemon_json(&daemon.socket, &["daemon", "sessions"])?;
+    let active = sessions["active"].as_array().unwrap();
+    assert_eq!(active.len(), 12);
+    for session in active {
+        assert!(session["harness_name"].as_str().unwrap().len() <= 256);
+        assert!(session.get("recent_stderr").is_none());
+    }
+    drop(streams);
+    daemon.wait_active_sessions(0, Duration::from_secs(5))?;
+    Ok(())
+}
+
+#[test]
+fn oversized_mcp_frame_ends_only_its_session_and_leaves_daemon_responsive() -> Result<()> {
+    let daemon = common::TestDaemon::start()?;
+    let dir = tempdir_in("/tmp")?;
+    build_fixture(dir.path(), "lib.py", "def target():\n    return 1\n")?;
+    let (mut stream, ready) = raw_session(&daemon.socket, dir.path())?;
+    assert_eq!(ready["kind"], "session_ready");
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let oversized = vec![b'x'; tsindex::daemon::MAX_MCP_FRAME_BYTES + 1];
+    // Early rejection may close the transport before write_all completes.
+    let _ = stream.write_all(&oversized);
+    daemon.wait_active_sessions(0, Duration::from_secs(5))?;
+    assert_eq!(daemon.ping()?.active_sessions, 0);
+    Ok(())
+}
+
+#[test]
+fn refused_existing_state_is_preserved_by_startup_cleanup() -> Result<()> {
+    use tsindex::daemon::DaemonPaths;
+    let dir = tempdir_in("/tmp")?;
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+    let socket = dir.path().join("d.sock");
+    let paths = DaemonPaths::resolve(Some(&socket))?;
+    let metadata = paths.lock_path.parent().unwrap();
+    fs::create_dir(metadata)?;
+    fs::set_permissions(metadata, fs::Permissions::from_mode(0o700))?;
+    fs::write(metadata.join("owner"), "tsindex daemon runtime v2\n")?;
+    fs::write(&paths.state_path, "preserve this unrelated state")?;
+    let output = Command::new(BIN)
+        .arg("--socket")
+        .arg(&socket)
+        .args(["daemon", "run"])
+        .output()?;
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read_to_string(&paths.state_path)?,
+        "preserve this unrelated state"
+    );
+    assert!(!socket.exists());
+    Ok(())
+}
+
+fn outcome_watch(
+    socket: &Path,
+    session_id: &str,
+) -> Result<BufReader<std::os::unix::net::UnixStream>> {
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    writeln!(
+        stream,
+        "{}",
+        json!({"op":"watch_session", "session_id":session_id})
+    )?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    assert_eq!(serde_json::from_str::<Value>(&line)?["kind"], "watching");
+    Ok(reader)
+}
+
+#[test]
+fn outcome_watcher_receives_final_state_after_daemon_stops_accepting() -> Result<()> {
+    let daemon = common::TestDaemon::start()?;
+    let dir = tempdir_in("/tmp")?;
+    build_fixture(dir.path(), "lib.py", "def target():\n    return 1\n")?;
+    let (stream, ready) = raw_session(&daemon.socket, dir.path())?;
+    let worker_pid = ready["worker_pid"].as_u64().unwrap() as u32;
+    let mut watcher = outcome_watch(&daemon.socket, ready["session_id"].as_str().unwrap())?;
+    let start = Instant::now();
+    daemon.client()?.shutdown()?;
+    let mut line = String::new();
+    watcher.read_line(&mut line)?;
+    let outcome: Value = serde_json::from_str(&line)?;
+    assert_eq!(outcome["kind"], "session");
+    assert_eq!(outcome["session"]["state"], "exited");
+    assert_eq!(outcome["session"]["exit_reason"], "daemon_shutdown");
+    assert!(outcome["session"].get("recent_stderr").is_none());
+    wait_pid_gone(worker_pid, Duration::from_secs(1))?;
+    #[cfg(target_os = "linux")]
+    assert!(
+        start.elapsed() < Duration::from_millis(1500),
+        "empty process group paid a full TERM grace period"
+    );
+    #[cfg(not(target_os = "linux"))]
+    let _ = start;
+    drop(stream);
+    Ok(())
+}
+
+#[test]
+fn active_session_accepts_only_one_outcome_watcher() -> Result<()> {
+    let daemon = common::TestDaemon::start()?;
+    let dir = tempdir_in("/tmp")?;
+    build_fixture(dir.path(), "lib.py", "def target():\n    return 1\n")?;
+    let (stream, ready) = raw_session(&daemon.socket, dir.path())?;
+    let id = ready["session_id"].as_str().unwrap();
+    let mut watcher = outcome_watch(&daemon.socket, id)?;
+    let mut duplicate = std::os::unix::net::UnixStream::connect(&daemon.socket)?;
+    duplicate.set_read_timeout(Some(Duration::from_secs(5)))?;
+    writeln!(
+        duplicate,
+        "{}",
+        json!({"op":"watch_session", "session_id":id})
+    )?;
+    let mut line = String::new();
+    BufReader::new(duplicate).read_line(&mut line)?;
+    let denied: Value = serde_json::from_str(&line)?;
+    assert_eq!(denied["kind"], "error");
+    assert!(denied["error"].as_str().unwrap().contains("already has"));
+    daemon.client()?.kill_session(id.to_string())?;
+    line.clear();
+    watcher.read_line(&mut line)?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&line)?["session"]["exit_reason"],
+        "killed_by_user"
+    );
+    drop(stream);
+    Ok(())
+}
+
+#[test]
+fn older_protocol_is_rejected_before_worker_spawn() -> Result<()> {
+    let daemon = common::TestDaemon::start()?;
+    let dir = tempdir_in("/tmp")?;
+    let mut stream = std::os::unix::net::UnixStream::connect(&daemon.socket)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    writeln!(
+        stream,
+        "{}",
+        json!({
+            "op":"start_session", "protocol":tsindex::daemon::PROTOCOL_VERSION - 1,
+            "client_version":env!("CARGO_PKG_VERSION"), "root":dir.path(),
+            "client_pid":std::process::id(), "no_refresh":true,
+        })
+    )?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line)?;
+    let response: Value = serde_json::from_str(&line)?;
+    assert_eq!(response["kind"], "error");
+    assert!(
+        response["error"]
+            .as_str()
+            .unwrap()
+            .contains("protocol mismatch")
+    );
+    assert_eq!(daemon.ping()?.total_sessions_started, 0);
+    Ok(())
+}
+
+#[test]
+fn daemon_recovers_empty_metadata_directory_and_ignores_old_state_temp() -> Result<()> {
+    use tsindex::daemon::DaemonPaths;
+    let dir = tempdir_in("/tmp")?;
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+    let socket = dir.path().join("d.sock");
+    let paths = DaemonPaths::resolve(Some(&socket))?;
+    let metadata = paths.lock_path.parent().unwrap();
+    fs::create_dir(metadata)?;
+    fs::set_permissions(metadata, fs::Permissions::from_mode(0o700))?;
+    // This is exactly the crash window between mkdir and marker publication.
+    let started = daemon_json(&socket, &["daemon", "start"])?;
+    assert_eq!(started["active_sessions"], 0);
+    daemon_json(&socket, &["daemon", "stop"])?;
+    let old_temp = paths
+        .state_path
+        .with_extension(format!("tmp.{}", std::process::id()));
+    fs::write(&old_temp, "old incomplete publication")?;
+    let started = daemon_json(&socket, &["daemon", "start"])?;
+    assert_eq!(started["active_sessions"], 0);
+    daemon_json(&socket, &["daemon", "stop"])?;
+    assert_eq!(fs::read_to_string(old_temp)?, "old incomplete publication");
+    Ok(())
+}
+
+#[test]
+fn session_detail_prunes_escaped_stderr_to_the_encoded_frame_budget() -> Result<()> {
+    use std::os::unix::net::UnixStream;
+    use tsindex::daemon::{DaemonClient, DaemonPaths, DaemonRequest, StartSessionRequest};
+
+    let dir = tempdir_in("/tmp")?;
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+    let exe = dir.path().join("tsindex");
+    let socket = dir.path().join("d.sock");
+    let root = dir.path().join("repo");
+    fs::create_dir(&root)?;
+    fs::copy(BIN, &exe)?;
+    let child = Command::new(&exe)
+        .arg("--socket")
+        .arg(&socket)
+        .args(["daemon", "run"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    struct DaemonGuard(Child);
+    impl Drop for DaemonGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _guard = DaemonGuard(child);
+    let client = DaemonClient::new(DaemonPaths::resolve(Some(&socket))?);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while client.ping().is_err() {
+        assert!(Instant::now() < deadline, "copied daemon did not start");
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Replace only this fixture's worker path. Controlled shell literals emit
+    // arbitrary diagnostics while the unchanged daemon handles the actual
+    // capture, retention, SessionDetail pruning, and wire framing.
+    let readiness = json!({
+        "protocol": tsindex::daemon::PROTOCOL_VERSION,
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+    let mut script = format!("#!/bin/sh\nprintf '%s\\n' '{readiness}'\n");
+    let mut original_stderr = Vec::new();
+    for index in 0..12 {
+        let diagnostic = format!(
+            "older-{index:02}:{}{}",
+            "\u{1}".repeat(1300),
+            "\"\\".repeat(200)
+        );
+        script.push_str(&format!("printf '%s\\n' '{diagnostic}' >&2\n"));
+        original_stderr.push(diagnostic);
+    }
+    let newest = format!(
+        "newest diagnostic \"quoted\" \\escaped\\ {}",
+        "\u{2}".repeat(1000)
+    );
+    script.push_str(&format!("printf '%s\\n' '{newest}' >&2\n"));
+    original_stderr.push(newest.clone());
+    script.push_str(
+        "while IFS= read -r request; do\n\
+         printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'\n\
+         done\n",
+    );
+    let helper = dir.path().join("helper");
+    fs::write(&helper, script)?;
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700))?;
+    fs::rename(helper, &exe)?;
+
+    let mut request = StartSessionRequest {
+        protocol: tsindex::daemon::PROTOCOL_VERSION,
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
+        root,
+        db: None,
+        languages: Vec::new(),
+        no_refresh: true,
+        client_pid: std::process::id(),
+        owner_pid: None,
+        owner_explicit: false,
+    };
+    let metadata_entry = "quote\"backslash\\".repeat(10);
+    while serde_json::to_vec(&request)?.len() + serde_json::to_vec(&metadata_entry)?.len() + 1
+        < 16 * 1024 - 128
+    {
+        request.languages.push(metadata_entry.clone());
+    }
+    assert!(serde_json::to_vec(&request)?.len() > 15 * 1024);
+    assert!(serde_json::to_vec(&original_stderr)?.len() > tsindex::daemon::MAX_CONTROL_LINE_BYTES);
+    let mut stream = UnixStream::connect(&socket)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    writeln!(
+        stream,
+        "{}",
+        serde_json::to_string(&DaemonRequest::StartSession(request))?
+    )?;
+    let mut data = BufReader::new(stream);
+    let mut line = String::new();
+    data.read_line(&mut line)?;
+    let ready: Value = serde_json::from_str(&line)?;
+    assert_eq!(ready["kind"], "session_ready", "{ready}");
+    let session_id = ready["session_id"].as_str().unwrap();
+    writeln!(
+        data.get_mut(),
+        "{}",
+        json!({"jsonrpc":"2.0","id":1,"method":"ping"})
+    )?;
+    line.clear();
+    data.read_line(&mut line)?;
+    assert_eq!(serde_json::from_str::<Value>(&line)?["result"], json!({}));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut control = UnixStream::connect(&socket)?;
+        control.set_read_timeout(Some(Duration::from_secs(5)))?;
+        writeln!(
+            control,
+            "{}",
+            json!({"op":"session_detail", "session_id":session_id})
+        )?;
+        let mut frame = String::new();
+        BufReader::new(control).read_line(&mut frame)?;
+        assert!(frame.len() <= tsindex::daemon::MAX_CONTROL_LINE_BYTES);
+        let detail: Value = serde_json::from_str(&frame)?;
+        let diagnostics = detail["session"]["recent_stderr"].as_array().unwrap();
+        if diagnostics.last().and_then(Value::as_str) == Some(newest.as_str()) {
+            assert!(diagnostics.len() < original_stderr.len());
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|line| line.as_str().unwrap().contains('\u{1}'))
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|line| line.as_str().unwrap().contains("\"\\"))
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "newest diagnostic did not reach the bounded detail response"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    drop(data);
+    client.shutdown()?;
     Ok(())
 }

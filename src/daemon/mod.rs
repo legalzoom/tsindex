@@ -513,7 +513,8 @@ pub fn daemon_not_running_message(socket_path: &Path) -> String {
 
 /// Connect without letting a full activation backlog block the calling thread
 /// indefinitely. Linux reports a full AF_UNIX backlog as EAGAIN, requiring a
-/// fresh socket for each retry. Other pending connects complete via SO_ERROR.
+/// fresh socket for each retry. Darwin can report ECONNREFUSED for the same
+/// live-backlog condition. Other pending connects complete via SO_ERROR.
 /// https://man7.org/linux/man-pages/man2/connect.2.html
 #[cfg(unix)]
 pub(crate) fn connect_with_timeout(
@@ -579,7 +580,9 @@ pub(crate) fn connect_with_timeout(
             return Ok(stream);
         }
         let error = io::Error::last_os_error();
-        match error.raw_os_error() {
+        // Resolve deferred connect errors before applying the same platform
+        // classification used for immediate syscall failures.
+        let error = match error.raw_os_error() {
             Some(libc::EINPROGRESS | libc::EALREADY) => loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -620,12 +623,25 @@ pub(crate) fn connect_with_timeout(
                     return Err(io::Error::last_os_error());
                 }
                 if code != 0 {
-                    return Err(io::Error::from_raw_os_error(code));
+                    break io::Error::from_raw_os_error(code);
                 }
                 let stream = UnixStream::from(fd);
                 stream.set_nonblocking(false)?;
                 return Ok(stream);
             },
+            _ => error,
+        };
+        #[cfg(target_os = "macos")]
+        let error =
+            if error.raw_os_error() == Some(libc::ECONNREFUSED) && live_stream_endpoint(path)? {
+                // XNU uses refusal for both stale vnodes and full live backlogs.
+                // A datagram probe distinguishes them without adding a queued
+                // stream connection. Retry the live case under the same deadline.
+                io::Error::from_raw_os_error(libc::EAGAIN)
+            } else {
+                error
+            };
+        match error.raw_os_error() {
             Some(libc::EAGAIN | libc::EINTR) => {
                 drop(fd);
                 std::thread::sleep(
@@ -636,6 +652,34 @@ pub(crate) fn connect_with_timeout(
             }
             _ => return Err(error),
         }
+    }
+}
+
+#[cfg(all(unix, any(target_os = "macos", test)))]
+fn live_stream_endpoint(path: &Path) -> io::Result<bool> {
+    use std::os::unix::net::UnixDatagram;
+
+    // XNU checks for an absent vnode socket/PCB before checking socket type,
+    // and checks type before attempting the stream backlog. EPROTOTYPE from
+    // this nonblocking probe therefore proves that a stream socket is live,
+    // whereas ECONNREFUSED identifies the stale vnode case. Unknown failures
+    // stay errors so callers cannot misclassify them as permission to unlink.
+    // https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/uipc_usrreq.c#L1290-L1339
+    let probe = UnixDatagram::unbound()?;
+    probe.set_nonblocking(true)?;
+    match probe.connect(path) {
+        Err(error) if error.raw_os_error() == Some(libc::EPROTOTYPE) => Ok(true),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ECONNREFUSED | libc::ENOENT)
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+        // A datagram endpoint is live but does not implement this protocol.
+        Ok(()) => Err(io::Error::from_raw_os_error(libc::EPROTOTYPE)),
     }
 }
 
@@ -787,9 +831,11 @@ mod tests {
     #[test]
     fn unix_connect_deadline_bounds_a_full_listener_backlog() -> Result<()> {
         use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         use std::os::unix::net::UnixListener;
         use std::time::Instant;
         let dir = tempfile::tempdir()?;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
         let path = dir.path().join("listener.sock");
         let listener = UnixListener::bind(&path)?;
         assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
@@ -817,6 +863,72 @@ mod tests {
             }
         }
         assert!(reached_deadline, "test listener backlog did not fill");
+        let before = fs::symlink_metadata(&path)?;
+        let paths = DaemonPaths::resolve(Some(&path))?;
+        let refusal = crate::daemon::service::check_socket(&paths).unwrap_err();
+        assert_eq!(
+            refusal.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::TimedOut)
+        );
+        let after = fs::symlink_metadata(&path)?;
+        assert_eq!(
+            (before.dev(), before.ino()),
+            (after.dev(), after.ino()),
+            "preflight replaced a saturated live endpoint"
+        );
+        assert!(!queued.is_empty());
+        let (accepted, _) = listener.accept()?;
+        drop(accepted);
+        let recovered = connect_with_timeout(&path, Duration::from_millis(100))?;
+        assert_eq!(recovered.peer_addr()?.as_pathname(), Some(path.as_path()));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stream_liveness_probe_distinguishes_stale_missing_and_wrong_type_endpoints() -> Result<()> {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        use std::os::unix::net::{UnixDatagram, UnixListener};
+        use std::time::Instant;
+        let dir = tempfile::tempdir()?;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+        let path = dir.path().join("stream.sock");
+        let listener = UnixListener::bind(&path)?;
+        assert!(live_stream_endpoint(&path)?);
+        drop(listener);
+        assert!(fs::symlink_metadata(&path)?.file_type().is_socket());
+        assert!(!live_stream_endpoint(&path)?);
+        let start = Instant::now();
+        let error = connect_with_timeout(&path, Duration::from_secs(2)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "a stale vnode consumed the live-listener retry deadline"
+        );
+        crate::daemon::service::check_socket(&DaemonPaths::resolve(Some(&path))?)?;
+        assert!(fs::symlink_metadata(&path)?.file_type().is_socket());
+
+        let missing = dir.path().join("missing.sock");
+        assert!(!live_stream_endpoint(&missing)?);
+        let error = connect_with_timeout(&missing, Duration::from_secs(2)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let datagram_path = dir.path().join("datagram.sock");
+        let _datagram = UnixDatagram::bind(&datagram_path)?;
+        assert_eq!(
+            live_stream_endpoint(&datagram_path)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPROTOTYPE)
+        );
+        let file = dir.path().join("regular-file");
+        fs::write(&file, "preserve regular file")?;
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            live_stream_endpoint(&file).unwrap_err().raw_os_error(),
+            Some(libc::ENOTSOCK)
+        );
+        assert!(crate::daemon::service::check_socket(&DaemonPaths::resolve(Some(&file))?).is_err());
+        assert_eq!(fs::read_to_string(file)?, "preserve regular file");
         Ok(())
     }
 

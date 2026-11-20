@@ -18,7 +18,7 @@ use crate::daemon::{
     CONTROL_IO_TIMEOUT, DaemonClient, DaemonPaths, DaemonRequest, DaemonResponse,
     MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION, STARTUP_IO_TIMEOUT, SessionState,
     StartSessionRequest, connect_with_timeout, daemon_not_running_message, read_bounded_line,
-    validate_private_dir, verify_peer_credentials, write_json_line,
+    validate_private_dir, verify_server_credentials, write_json_line,
 };
 use crate::mcp::CancellableStdin;
 
@@ -58,7 +58,7 @@ pub fn run_mcp_proxy(args: McpProxyArgs) -> Result<()> {
         })?;
     // Authenticate the server before revealing workspace metadata. Private
     // pathname permissions alone cannot authenticate a shared /tmp endpoint.
-    verify_peer_credentials(&stream)?;
+    verify_server_credentials(&stream, &paths)?;
     stream.set_read_timeout(Some(STARTUP_IO_TIMEOUT + CONTROL_IO_TIMEOUT))?;
     stream.set_write_timeout(Some(CONTROL_IO_TIMEOUT))?;
 

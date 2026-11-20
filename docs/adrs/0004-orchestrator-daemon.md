@@ -15,9 +15,13 @@ the source access policy because they can contain cached snippets.
 
 Trusted clients select `serve --mcp --via-daemon` explicitly. This grants the
 session the user daemon's source-read and source-write authority. The daemon
-socket belongs outside the mount view of untrusted processes. Bidirectional
-Unix peer credentials authenticate the effective user identity. Kernel
-restrictions stay with the process launched inside them.
+socket belongs outside the mount view of untrusted processes. Unix peer
+credentials authenticate accepted clients as the daemon's user. Server
+connections also require an owned socket leaf and private user directory,
+rejecting symlinks at the leaf and its immediate parent. On macOS, server
+authentication accepts the trusted root creator cached for launchd's listener
+after handoff to the user daemon. Kernel restrictions stay with the process
+launched inside them.
 
 For managed sessions, use a foreground orchestrator with manager-owned socket
 activation. `systemd --user` installs a socket unit and associated service on

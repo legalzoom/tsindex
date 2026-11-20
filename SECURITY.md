@@ -28,11 +28,16 @@ sandbox's grants. An index database can contain cached source snippets, so
 apply the same read policy to a database as to its indexed sources.
 
 `serve --mcp --via-daemon` explicitly authorizes a trusted session to use the
-shared daemon's user authority. Both socket peers verify the effective user
-identity, and the socket lives in a private user directory. Keep that endpoint
-outside the filesystem view of untrusted sandboxed processes. A reachable
-same-user broker can read and modify files using its own permissions. A
-path supplied by a client carries no proof of that client's kernel sandbox.
+shared daemon's user authority. Accepted clients must authenticate as the
+daemon's effective user. Server connections require a Unix socket leaf owned
+by the current user in a private user directory. Neither the leaf nor its
+immediate parent directory may be a symlink. Linux server credentials must
+match that user. On macOS, clients also accept the trusted UID 0 listener
+creator because launchd creates the listener as root and XNU retains those
+credentials after handoff to the user daemon. Keep that endpoint outside the
+filesystem view of untrusted sandboxed processes. A reachable same-user broker
+can read and modify files using its own permissions. A path supplied by a
+client carries no proof of that client's kernel sandbox.
 
 The HTTP server binds to `127.0.0.1` by default. Host and Origin validation reduce
 browser-based attacks, but do not authenticate clients. The HTTP API includes

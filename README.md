@@ -430,8 +430,12 @@ boundary and fails if the sandbox runtime is unavailable.
 
 Keep a shared daemon socket outside the mount view of untrusted harnesses.
 Access to that socket grants the daemon's user authority, including source
-reads and `replace_symbol` writes. Unix peer credentials authenticate the user
-identity. The kernel sandbox applies to the process launched inside it.
+reads and `replace_symbol` writes. Incoming clients must authenticate as the
+daemon's user. Server connections verify kernel credentials and require an
+owned socket leaf in a private user directory. Neither the leaf nor its
+immediate parent directory may be a symlink. On macOS, clients also accept the
+trusted UID 0 creator cached for a launchd listener after it is handed to the
+user daemon. The kernel sandbox applies to the process launched inside it.
 
 ### Trusted sessions through the daemon
 

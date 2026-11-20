@@ -824,13 +824,21 @@ fn handle_connection(
     stream: UnixStream,
     pending: PendingConnection,
 ) -> Result<()> {
-    let creds = verify_peer_credentials(&stream)?;
-    stream.set_read_timeout(Some(CONTROL_IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(CONTROL_IO_TIMEOUT))?;
+    let creds =
+        verify_peer_credentials(&stream).context("failed to authenticate control client")?;
+    stream
+        .set_read_timeout(Some(CONTROL_IO_TIMEOUT))
+        .context("failed to set control connection read timeout")?;
+    stream
+        .set_write_timeout(Some(CONTROL_IO_TIMEOUT))
+        .context("failed to set control connection write timeout")?;
 
-    let mut writer = stream.try_clone()?;
+    let mut writer = stream
+        .try_clone()
+        .context("failed to clone control connection")?;
     let mut reader = BufReader::new(stream);
-    let line = read_control_deadline(&mut reader, CONTROL_IO_TIMEOUT)?;
+    let line = read_control_deadline(&mut reader, CONTROL_IO_TIMEOUT)
+        .context("failed to read control handshake")?;
     let request: DaemonRequest = match serde_json::from_str(&line) {
         Ok(req) => req,
         Err(error) => {

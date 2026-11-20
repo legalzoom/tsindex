@@ -234,7 +234,7 @@ pub(crate) fn verify_peer_credentials(
 ) -> Result<PeerCredentials> {
     let creds = read_peer_credentials(stream)?;
     let expected_uid = current_uid();
-    if creds.uid != expected_uid {
+    if !peer_uid_allowed(creds.uid, expected_uid, false) {
         bail!(
             "rejected Unix socket peer with uid {} (expected {})",
             creds.uid,
@@ -242,6 +242,52 @@ pub(crate) fn verify_peer_credentials(
         );
     }
     Ok(creds)
+}
+
+/// Authenticate an outbound connection before sending workspace metadata.
+#[cfg(unix)]
+pub(crate) fn verify_server_credentials(
+    stream: &std::os::unix::net::UnixStream,
+    paths: &DaemonPaths,
+) -> Result<PeerCredentials> {
+    let expected_uid = current_uid();
+    validate_server_socket_path(paths, expected_uid)?;
+    let creds = read_peer_credentials(stream).context("failed to inspect daemon server peer")?;
+    // XNU caches the listener creator's credentials at listen time. launchd
+    // creates the user-owned endpoint as root before passing it to the daemon.
+    // Root is already trusted by the OS; allow that creator only on Darwin,
+    // with an owned socket leaf in a verified private user directory above.
+    // Accepted clients still use verify_peer_credentials with no exception.
+    // https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/uipc_usrreq.c#L1358-L1396
+    if !peer_uid_allowed(creds.uid, expected_uid, cfg!(target_os = "macos")) {
+        bail!(
+            "rejected Unix socket server peer with uid {} (expected {})",
+            creds.uid,
+            expected_uid
+        );
+    }
+    Ok(creds)
+}
+
+#[cfg(unix)]
+fn peer_uid_allowed(peer_uid: u32, expected_uid: u32, allow_root_creator: bool) -> bool {
+    peer_uid == expected_uid || (allow_root_creator && peer_uid == 0)
+}
+
+#[cfg(unix)]
+fn validate_server_socket_path(paths: &DaemonPaths, expected_uid: u32) -> Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    validate_private_dir(paths.socket_dir()?)?;
+    let metadata = fs::symlink_metadata(&paths.socket_path)
+        .with_context(|| format!("failed to inspect daemon endpoint {:?}", paths.socket_path))?;
+    if !metadata.file_type().is_socket() || metadata.uid() != expected_uid {
+        bail!(
+            "daemon endpoint {:?} must be an owned Unix socket without a symlink leaf",
+            paths.socket_path
+        );
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -708,7 +754,7 @@ impl DaemonClient {
                 )
             })?;
         // Authenticate the service before disclosing workspace paths or commands.
-        verify_peer_credentials(&stream)?;
+        verify_server_credentials(&stream, &self.paths)?;
         Ok(stream)
     }
 
@@ -826,6 +872,90 @@ impl DaemonClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_uid_policy_keeps_root_creator_exception_out_of_client_authentication() {
+        let user = 501;
+        let other = 502;
+        for (peer, root_creator_allowed, expected) in [
+            (user, false, true),
+            (user, true, true),
+            (other, false, false),
+            (other, true, false),
+            (0, false, false),
+            (0, true, true),
+        ] {
+            assert_eq!(
+                peer_uid_allowed(peer, user, root_creator_allowed),
+                expected,
+                "peer={peer}, root_creator_allowed={root_creator_allowed}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_authentication_uses_owned_private_socket_and_client_auth_stays_same_uid() -> Result<()>
+    {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let dir = tempfile::tempdir_in("/tmp")?;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+        let paths = DaemonPaths::resolve(Some(&dir.path().join("d.sock")))?;
+        let listener = UnixListener::bind(&paths.socket_path)?;
+        let client = UnixStream::connect(&paths.socket_path)?;
+        assert_eq!(
+            verify_server_credentials(&client, &paths)?.uid,
+            current_uid()
+        );
+        let (accepted, _) = listener.accept()?;
+        assert_eq!(verify_peer_credentials(&accepted)?.uid, current_uid());
+        assert!(validate_server_socket_path(&paths, current_uid().wrapping_add(1)).is_err());
+
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755))?;
+        assert!(verify_server_credentials(&client, &paths).is_err());
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+        assert!(verify_server_credentials(&client, &paths).is_ok());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_authentication_path_rejects_symlink_parents_leaves_and_non_socket_nodes() -> Result<()>
+    {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir_in("/tmp")?;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+        let private = dir.path().join("private");
+        fs::create_dir(&private)?;
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700))?;
+        let socket = private.join("d.sock");
+        let paths = DaemonPaths::resolve(Some(&socket))?;
+        assert!(validate_server_socket_path(&paths, current_uid()).is_err());
+        let listener = UnixListener::bind(&socket)?;
+        assert!(validate_server_socket_path(&paths, current_uid()).is_ok());
+
+        let parent_alias = dir.path().join("private-link");
+        symlink(&private, &parent_alias)?;
+        let parent_paths = DaemonPaths::resolve(Some(&parent_alias.join("d.sock")))?;
+        assert!(validate_server_socket_path(&parent_paths, current_uid()).is_err());
+        drop(listener);
+        let original = private.join("original.sock");
+        fs::rename(&socket, &original)?;
+        symlink(&original, &socket)?;
+        assert!(validate_server_socket_path(&paths, current_uid()).is_err());
+        assert!(fs::symlink_metadata(&socket)?.file_type().is_symlink());
+        fs::remove_file(&socket)?;
+        fs::write(&socket, "preserve regular file")?;
+        assert!(validate_server_socket_path(&paths, current_uid()).is_err());
+        assert_eq!(fs::read_to_string(&socket)?, "preserve regular file");
+        assert!(original.exists());
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]

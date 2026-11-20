@@ -35,12 +35,12 @@ fn validate_listener(fd: OwnedFd, paths: &DaemonPaths) -> Result<UnixListener> {
     {
         return Err(io::Error::last_os_error()).context("invalid activation socket");
     }
-    let mut address: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     let mut address_size = std::mem::size_of_val(&address) as libc::socklen_t;
     if unsafe {
         libc::getsockname(
             raw,
-            (&mut address as *mut libc::sockaddr_storage).cast(),
+            (&mut address as *mut libc::sockaddr_un).cast(),
             &mut address_size,
         )
     } != 0
@@ -48,7 +48,7 @@ fn validate_listener(fd: OwnedFd, paths: &DaemonPaths) -> Result<UnixListener> {
         return Err(io::Error::last_os_error()).context("failed to inspect activation socket");
     }
     if socket_type != libc::SOCK_STREAM
-        || address.ss_family as i32 != libc::AF_UNIX
+        || address.sun_family as i32 != libc::AF_UNIX
         || !is_accepting(raw).context("failed to inspect activation listener state")?
     {
         bail!("activation requires a listening Unix stream socket");
@@ -58,22 +58,53 @@ fn validate_listener(fd: OwnedFd, paths: &DaemonPaths) -> Result<UnixListener> {
     if unsafe { libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
         return Err(io::Error::last_os_error()).context("failed to protect activation descriptor");
     }
-    let listener = UnixListener::from(fd);
-    let address = listener.local_addr()?;
-    let reported = address.as_pathname().with_context(|| {
+    let reported = pathname_from_address(&address, address_size).with_context(|| {
         format!(
-            "activation socket has no filesystem pathname; configured endpoint {}",
-            paths.socket_path.display()
+            "invalid activation socket address ({address_size} bytes) for configured endpoint {:?}",
+            paths.socket_path
         )
     })?;
-    validate_endpoint_path(reported, &paths.socket_path).with_context(|| {
+    validate_endpoint_path(&reported, &paths.socket_path).with_context(|| {
         format!(
-            "activation socket reported {} for configured endpoint {}",
-            reported.display(),
-            paths.socket_path.display()
+            "activation socket reported {reported:?} for configured endpoint {:?}",
+            paths.socket_path
         )
     })?;
-    Ok(listener)
+    Ok(UnixListener::from(fd))
+}
+
+fn pathname_from_address(
+    address: &libc::sockaddr_un,
+    length: libc::socklen_t,
+) -> Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let offset = std::mem::offset_of!(libc::sockaddr_un, sun_path);
+    let length = length as usize;
+    if address.sun_family as i32 != libc::AF_UNIX
+        || length <= offset
+        || length > offset + address.sun_path.len()
+    {
+        bail!("invalid Unix activation address length or family");
+    }
+    // A service manager may bind using sizeof(sockaddr_un), leaving zero
+    // padding after the pathname terminator. Interpret that C string within the
+    // returned length, rejecting abstract names and nonzero suffixes rather
+    // than treating padding as part of a filesystem path. BSD also permits a
+    // pathname whose reported length excludes a terminator.
+    let mut bytes: Vec<u8> = address.sun_path[..length - offset]
+        .iter()
+        .map(|&byte| byte as u8)
+        .collect();
+    let end = bytes
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(bytes.len());
+    if end == 0 || bytes[end..].iter().any(|&byte| byte != 0) {
+        bail!("Unix activation pathname is empty, abstract or has nonzero padding");
+    }
+    bytes.truncate(end);
+    Ok(std::ffi::OsString::from_vec(bytes).into())
 }
 
 fn validate_endpoint_path(reported: &std::path::Path, configured: &std::path::Path) -> Result<()> {
@@ -93,14 +124,10 @@ fn validate_endpoint_path(reported: &std::path::Path, configured: &std::path::Pa
     // at the socket leaf instead of following it into another endpoint.
     for (socket, parent) in [(reported, reported_parent), (configured, configured_parent)] {
         crate::daemon::validate_private_dir(parent)?;
-        let metadata = std::fs::symlink_metadata(socket).with_context(|| {
-            format!("failed to inspect activation endpoint {}", socket.display())
-        })?;
+        let metadata = std::fs::symlink_metadata(socket)
+            .with_context(|| format!("failed to inspect activation endpoint {socket:?}"))?;
         if !metadata.file_type().is_socket() || metadata.uid() != crate::daemon::current_uid() {
-            bail!(
-                "activation endpoint {} must be an owned Unix socket",
-                socket.display()
-            );
+            bail!("activation endpoint {socket:?} must be an owned Unix socket");
         }
     }
     let reported_parent = std::fs::canonicalize(reported_parent)
@@ -293,6 +320,111 @@ mod tests {
             return Err(io::Error::last_os_error()).context("test socket protection failed");
         }
         Ok(fd)
+    }
+
+    fn unix_address(bytes: &[u8]) -> libc::sockaddr_un {
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        assert!(bytes.len() <= address.sun_path.len());
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (target, byte) in address.sun_path.iter_mut().zip(bytes) {
+            *target = *byte as libc::c_char;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            address.sun_len = std::mem::size_of_val(&address) as u8;
+        }
+        address
+    }
+
+    #[test]
+    fn activation_pathname_accepts_compact_padded_and_length_delimited_paths() -> Result<()> {
+        let offset = std::mem::offset_of!(libc::sockaddr_un, sun_path);
+        for bytes in [b"/tmp/a.sock".as_slice(), b"/tmp/\xff.sock".as_slice()] {
+            let mut terminated = bytes.to_vec();
+            terminated.push(0);
+            let address = unix_address(&terminated);
+            for length in [
+                offset + bytes.len(),
+                offset + terminated.len(),
+                std::mem::size_of_val(&address),
+            ] {
+                let path = pathname_from_address(&address, length as libc::socklen_t)?;
+                assert_eq!(path.as_os_str().as_bytes(), bytes);
+            }
+        }
+        let bytes = b"/tmp/a.sock\0ignored";
+        let address = unix_address(bytes);
+        let reported = offset + b"/tmp/a.sock\0".len();
+        assert_eq!(
+            pathname_from_address(&address, reported as libc::socklen_t)?,
+            std::path::Path::new("/tmp/a.sock")
+        );
+        assert!(
+            pathname_from_address(&address, (offset + bytes.len()) as libc::socklen_t).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn activation_pathname_rejects_invalid_lengths_empty_abstract_and_nonzero_padding() {
+        let offset = std::mem::offset_of!(libc::sockaddr_un, sun_path);
+        let mut address = unix_address(b"/tmp/a.sock\0");
+        for length in [0, offset - 1, offset, std::mem::size_of_val(&address) + 1] {
+            assert!(pathname_from_address(&address, length as libc::socklen_t).is_err());
+        }
+        address.sun_family = libc::AF_INET as libc::sa_family_t;
+        assert!(
+            pathname_from_address(&address, std::mem::size_of_val(&address) as libc::socklen_t)
+                .is_err()
+        );
+        for bytes in [
+            b"\0".as_slice(),
+            b"\0abstract".as_slice(),
+            b"/tmp/a.sock\0suffix".as_slice(),
+        ] {
+            let address = unix_address(bytes);
+            assert!(
+                pathname_from_address(&address, (offset + bytes.len()) as libc::socklen_t).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn full_sized_activation_address_preserves_the_pending_client() -> Result<()> {
+        let dir = private_scratch()?;
+        let paths = DaemonPaths::resolve(Some(&dir.path().join("d.sock")))?;
+        let address = unix_address(paths.socket_path.as_os_str().as_bytes());
+        let fd = unbound_stream()?;
+        let result = unsafe {
+            libc::bind(
+                fd.as_raw_fd(),
+                (&address as *const libc::sockaddr_un).cast(),
+                std::mem::size_of_val(&address) as libc::socklen_t,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error()).context("full-size activation bind failed");
+        }
+        assert_eq!(unsafe { libc::listen(fd.as_raw_fd(), 4) }, 0);
+        let manager = UnixListener::from(fd);
+        let mut client = UnixStream::connect(&paths.socket_path)?;
+        client.write_all(b"queued request")?;
+        let adopted = validate_listener(manager.try_clone()?.into(), &paths)?;
+        assert_ne!(
+            unsafe { libc::fcntl(adopted.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        adopted.set_nonblocking(true)?;
+        let (mut accepted, _) = adopted.accept()?;
+        accepted.set_read_timeout(Some(Duration::from_secs(1)))?;
+        let mut request = [0u8; 14];
+        accepted.read_exact(&mut request)?;
+        assert_eq!(&request, b"queued request");
+        drop(adopted);
+        assert!(paths.socket_path.exists());
+        let _next = UnixStream::connect(&paths.socket_path)?;
+        assert!(manager.accept().is_ok());
+        Ok(())
     }
 
     #[test]

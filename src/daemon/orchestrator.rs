@@ -206,13 +206,14 @@ const RUNTIME_FDS: usize = 3;
 const PENDING_FDS: usize = 3;
 // During a concurrent worker spawn, all six worker pipe ends and both exec
 // status descriptors can coexist. Charge those eight and a child handle,
-// both data-socket fds, the wake pair, a distinct index owner, one watcher
-// socket, and two retired wake pairs still held by a watcher or owner sweep.
-const SESSION_FDS: usize = 8 + 1 + 2 + 2 + RUNTIME_FDS + 1 + 4;
+// both data-socket fds, the wake and worker-bootstrap pairs, a distinct index
+// owner, one watcher socket, and two wake pairs retained by an earlier sweep.
+const SESSION_FDS: usize = 8 + 1 + 2 + 2 + 2 + RUNTIME_FDS + 1 + 4;
 // The pool serializes runtime spawns. Beyond that owner's retained fds, its
 // receiver, child-side stdin, null stdout and exec status pair take five.
-// Reserve one concurrent process inspection and one accept-before-admission.
-const HOUSEKEEPING_FDS: usize = 5 + 1 + 1;
+// Reserve one replacement owner awaiting its predecessor's exit, one concurrent
+// process inspection and one accept-before-admission.
+const HOUSEKEEPING_FDS: usize = 5 + RUNTIME_FDS + 1 + 1;
 
 fn descriptor_admission(requested: usize) -> io::Result<(usize, usize)> {
     let reserve = HOUSEKEEPING_FDS + super::runtime::MAX_IDLE * RUNTIME_FDS;
@@ -306,7 +307,7 @@ impl DaemonCore {
             paths,
             worker_executable,
             worker_groups,
-            runtimes: super::runtime::RuntimePool::new()?,
+            runtimes: super::runtime::RuntimePool::new(max_sessions)?,
             instance_id,
             pending_connections: AtomicUsize::new(0),
             outcome_watchers: AtomicUsize::new(0),
@@ -1117,16 +1118,6 @@ fn handle_start_session(
         return Ok(());
     }
 
-    if !req.root.exists() {
-        write_json_line(
-            &mut writer,
-            &DaemonResponse::Error {
-                error: format!("workspace root does not exist: {}", req.root.display()),
-            },
-        )?;
-        return Ok(());
-    }
-
     let Some(client_pid) = peer_pid else {
         write_json_line(&mut writer, &DaemonResponse::Error {
             error: "daemon sessions require a kernel-verified peer PID; use direct `tsindex serve --mcp` on this platform".into(),
@@ -1337,38 +1328,56 @@ fn run_session(
     reader: BufReader<UnixStream>,
     writer: &mut UnixStream,
 ) -> Result<String> {
-    let runtime = core.runtimes.acquire(req, &core.worker_executable)?;
+    // The session child resolves workspace files. An unavailable mount or a
+    // slow configuration read must remain visible and cancellable at startup.
+    let deadline = Instant::now() + STARTUP_IO_TIMEOUT;
+    let (bootstrap, worker_end) = UnixStream::pair()?;
     let mut child = spawn_worker(
         &core.worker_executable,
         core.worker_groups,
-        &runtime.channel,
-        &req.root,
+        &worker_end,
+        req,
     )?;
-    let worker_pid = child.id();
-    {
-        let mut session = handle.info.lock().unwrap_or_else(|p| p.into_inner());
-        session.worker_pid = worker_pid;
-        session.runtime_pid = Some(runtime.pid);
-    }
+    drop(worker_end);
+    let mut startup = WorkerStartup {
+        deadline,
+        bootstrap: Some(bootstrap),
+        runtime: None,
+    };
+    handle
+        .info
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .worker_pid = child.id();
     core.total_sessions_started.fetch_add(1, Ordering::Relaxed);
-    let result = supervise_session(&mut child, core, handle, reader, writer, session_id);
+    let result = supervise_session(
+        &mut child,
+        core,
+        handle,
+        reader,
+        writer,
+        session_id,
+        &mut startup,
+    );
     // Closing every pipe first makes waits independent of inherited pipe ends.
     drop(child.stdin.take());
     drop(child.stdout.take());
     drop(child.stderr.take());
     let status_note = match reap_worker(&mut child, core.worker_groups) {
-        Ok(status) if !status.success() => Some(format!("worker_status_{status}")),
+        Ok(status) if !status.success() => {
+            // Only the worker knows whether the owner's independent intake
+            // failed to acknowledge a connection. A slow checkout or an
+            // accepted lookup can time out while healthy peers keep running.
+            if status.code() == Some(super::runtime::LOOKUP_TIMEOUT_EXIT)
+                && let Some(runtime) = &startup.runtime
+            {
+                core.runtimes.retire(runtime);
+            }
+            Some(format!("worker_status_{status}"))
+        }
         Ok(_) => None,
         Err(error) => Some(format!("worker_wait_failed: {error}")),
     };
-    if result
-        .as_ref()
-        .is_err_and(|err| err.is::<WorkerStartupTimeout>())
-        || child.try_wait().ok().flatten().and_then(|exit| exit.code())
-            == Some(super::runtime::LOOKUP_TIMEOUT_EXIT)
-    {
-        core.runtimes.retire(&runtime);
-    }
     // Global shutdown can precede the accept loop's kill_all snapshot. Record
     // that cause locally before a forced exit status can replace the outcome.
     if core.is_shutting_down() {
@@ -1385,17 +1394,23 @@ fn run_session(
 fn spawn_worker(
     executable: &std::path::Path,
     worker_groups: bool,
-    runtime: &UnixStream,
-    root: &std::path::Path,
+    bootstrap: &UnixStream,
+    request: &StartSessionRequest,
 ) -> Result<Child> {
     let mut cmd = Command::new(executable);
+    super::runtime::add_settings(
+        &mut cmd,
+        &request.root,
+        request.db.as_deref(),
+        &request.languages,
+        request.no_refresh,
+    );
     cmd.args(["daemon", "worker", "--runtime-fd"])
-        .arg(runtime.as_raw_fd().to_string())
-        .current_dir(root)
+        .arg(bootstrap.as_raw_fd().to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    super::fds::prepare_exec(&mut cmd, Some(runtime.as_fd()))?;
+    super::fds::prepare_exec(&mut cmd, Some(bootstrap.as_fd()))?;
     configure_child(&mut cmd, worker_groups, libc::SIGTERM);
     cmd.spawn().context("failed to spawn MCP worker")
 }
@@ -1671,15 +1686,44 @@ fn capture_stderr(child: &mut Child, handle: &SessionHandle, partial: &mut Vec<u
     }
 }
 
-#[derive(Debug)]
-struct WorkerStartupTimeout;
+struct WorkerStartup {
+    deadline: Instant,
+    // The fresh private socket has room for exactly this one descriptor
+    // handoff. Dropping the daemon's endpoint completes the first phase.
+    bootstrap: Option<UnixStream>,
+    runtime: Option<super::runtime::RuntimeLease>,
+}
 
-impl std::fmt::Display for WorkerStartupTimeout {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("worker initialization timed out")
+impl WorkerStartup {
+    fn provide_runtime(
+        &mut self,
+        frame: &[u8],
+        core: &DaemonCore,
+        handle: &SessionHandle,
+    ) -> Result<()> {
+        let request: super::runtime::WorkerRuntimeRequest =
+            serde_json::from_slice(frame).context("invalid worker runtime request")?;
+        if request.protocol != PROTOCOL_VERSION {
+            bail!("worker protocol differs from daemon; run `tsindex daemon restart`");
+        }
+        let runtime = core
+            .runtimes
+            .acquire(request.runtime_key, &core.worker_executable)?;
+        let channel = self
+            .bootstrap
+            .take()
+            .context("duplicate worker runtime request")?;
+        super::fds::send_fd(&channel, runtime.channel.as_fd())
+            .context("failed to connect worker to its index runtime")?;
+        handle
+            .info
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .runtime_pid = Some(runtime.pid);
+        self.runtime = Some(runtime);
+        Ok(())
     }
 }
-impl std::error::Error for WorkerStartupTimeout {}
 
 fn supervise_session(
     child: &mut Child,
@@ -1688,6 +1732,7 @@ fn supervise_session(
     mut reader: BufReader<UnixStream>,
     writer: &mut UnixStream,
     session_id: &str,
+    startup: &mut WorkerStartup,
 ) -> Result<String> {
     let stdin_fd = child
         .stdin
@@ -1707,7 +1752,6 @@ fn supervise_session(
     for fd in [stdin_fd, stdout_fd, stderr_fd] {
         nonblocking(fd)?;
     }
-    let startup_deadline = Instant::now() + STARTUP_IO_TIMEOUT;
     let mut startup_probe = Instant::now() + CHILD_EXIT_PROBE;
     let mut ready_bytes = Vec::new();
     let mut stderr_partial = Vec::new();
@@ -1719,6 +1763,9 @@ fn supervise_session(
         }
         if handle.forced_stop.load(Ordering::Acquire) {
             bail!("session cancelled during startup");
+        }
+        if Instant::now() >= startup.deadline {
+            bail!("worker initialization timed out");
         }
         if peer_stopped_reading(reader.get_ref())? {
             bail!("client disconnected during worker initialization");
@@ -1735,6 +1782,11 @@ fn supervise_session(
             ready_bytes.extend_from_slice(&chunk[..n]);
         }
         if let Some(end) = memchr::memchr(b'\n', &ready_bytes) {
+            if startup.bootstrap.is_some() {
+                startup.provide_runtime(&ready_bytes[..end], core, handle)?;
+                ready_bytes.drain(..=end);
+                continue;
+            }
             let ready: WorkerReady = serde_json::from_slice(&ready_bytes[..end])
                 .context("invalid worker readiness acknowledgement")?;
             if ready.protocol != PROTOCOL_VERSION {
@@ -1760,16 +1812,13 @@ fn supervise_session(
             let detail = handle.snapshot().recent_stderr.join("\n");
             bail!("worker exited before initialization: {detail}");
         }
-        if Instant::now() >= startup_deadline {
-            return Err(WorkerStartupTimeout.into());
-        }
         let mut fds = [
             interest(stdout_fd, libc::POLLIN),
             interest(if stderr_eof { -1 } else { stderr_fd }, libc::POLLIN),
             interest(handle.supervisor_wake.as_raw_fd(), libc::POLLIN),
             interest(reader.get_ref().as_raw_fd(), 0),
         ];
-        let timeout = startup_deadline.saturating_duration_since(Instant::now());
+        let timeout = startup.deadline.saturating_duration_since(Instant::now());
         poll(&mut fds, Some(timeout.min(CHILD_EXIT_PROBE)))?;
     }
     // Publish readiness state before the acknowledgement can reach a client
@@ -2605,8 +2654,21 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        let outcome =
-            supervise_session(&mut child, &core, &handle, reader, &mut server, "finishing");
+        // This fixture tests the relay after its runtime has been provided.
+        let mut startup = WorkerStartup {
+            deadline: Instant::now() + STARTUP_IO_TIMEOUT,
+            bootstrap: None,
+            runtime: None,
+        };
+        let outcome = supervise_session(
+            &mut child,
+            &core,
+            &handle,
+            reader,
+            &mut server,
+            "finishing",
+            &mut startup,
+        );
         let finished_before_outcome = marker.is_file();
         drop(child.stdin.take());
         let status = child.wait()?;
@@ -2619,10 +2681,14 @@ mod tests {
     fn shutdown_outcome_precedes_kill_all_even_when_worker_needs_sigkill() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let helper = dir.path().join("worker");
+        let key = super::super::runtime::RuntimeKey::resolve(dir.path(), None, &[], true)?;
+        let request = serde_json::json!({"protocol": PROTOCOL_VERSION, "runtime_key": key});
         let ready = serde_json::json!({ "protocol": PROTOCOL_VERSION, "version": env!("CARGO_PKG_VERSION") });
         fs::write(
             &helper,
-            format!("#!/bin/sh\ntrap '' TERM\nprintf '%s\\n' '{ready}'\nexec sleep 60\n"),
+            format!(
+                "#!/bin/sh\ntrap '' TERM\nprintf '%s\\n' '{request}' '{ready}'\nexec sleep 60\n"
+            ),
         )?;
         fs::set_permissions(&helper, fs::Permissions::from_mode(0o700))?;
         let paths = DaemonPaths::resolve(Some(&dir.path().join("d.sock")))?;

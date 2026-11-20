@@ -356,6 +356,60 @@ fn compatible_clients_share_indexing_and_keep_independent_mcp_sessions() -> Resu
 }
 
 #[test]
+fn a_busy_indexed_client_leaves_new_sessions_and_live_primary_queries_responsive() -> Result<()> {
+    use tsindex::maintenance::{
+        FileLease, refresh_lease_path, refresh_marker_path, writer_lease_path,
+    };
+    let dir = tempdir_in("/tmp")?;
+    let root = dir.path();
+    build_fixture(root, "lib.py", "def live_symbol():\n    pass\n")?;
+    let daemon = common::TestDaemon::start()?;
+    let mut busy = McpSession::connect_with(&daemon.socket, root, "busy", &[])?;
+    let pid = managed_session(&daemon, "busy")?.runtime_pid;
+    let db = tsindex::config::db_path(root);
+    let writer = FileLease::acquire(writer_lease_path(&db), Duration::from_secs(3))?;
+    if let Err(e) = fs::remove_file(refresh_marker_path(&db))
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(e.into());
+    }
+    let stdin = busy.child.stdin.as_mut().unwrap();
+    for id in 101..105 {
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc":"2.0", "id":id, "method":"tools/call", "params":{"name":"get_symbol", "arguments":{"name":"live_symbol"}}})
+        )?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while FileLease::try_acquire(refresh_lease_path(&db))?.is_some() {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "indexed request never entered refresh"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    // The indexed work still owns the refresh lock and waits for our writer
+    // lease. A new session can attach and run a live primary query on that owner.
+    let mut live = McpSession::connect_with(&daemon.socket, root, "live", &[])?;
+    assert_eq!(managed_session(&daemon, "live")?.runtime_pid, pid);
+    let result = live.call_tool(
+        "query",
+        json!({"language":"python", "query":"(function_definition name: (identifier) @name)"}),
+    )?;
+    assert!(result.to_string().contains("live_symbol"), "{result}");
+    drop(writer);
+    for _ in 101..105 {
+        let line = busy.responses.recv_timeout(Duration::from_secs(5))??;
+        let response: Value = serde_json::from_str(&line)?;
+        assert!(response.get("result").is_some(), "{response}");
+    }
+    busy.close_gracefully()?;
+    live.close_gracefully()?;
+    Ok(())
+}
+
+#[test]
 fn shared_index_reuses_the_in_memory_linked_checkout_across_clients() -> Result<()> {
     let daemon = common::TestDaemon::start_with_env(&[("TSINDEX_RUNTIME_IDLE_SECS", "60")])?;
     let dir = tempdir_in("/tmp")?;
@@ -407,6 +461,31 @@ fn shared_index_reuses_the_in_memory_linked_checkout_across_clients() -> Result<
     );
     second.close_gracefully()?;
     Ok(())
+}
+
+#[test]
+fn freshly_seeded_checkout_retains_its_projected_runtime_key() -> Result<()> {
+    let daemon = common::TestDaemon::start()?;
+    let fixture = tempdir_in("/tmp")?;
+    let main = fixture.path().join("main");
+    let linked = fixture.path().join("feature");
+    build_fixture(&main, "one.py", "def primary():\n    pass\n")?;
+    link_checkout(&main, &linked, "feature")?;
+    fs::write(linked.join("one.py"), "def feature_only():\n    pass\n")?;
+    assert!(!tsindex::config::db_path(&linked).exists());
+    let mut first = McpSession::connect(&daemon.socket, &linked, "before-seed")?;
+    let initial = managed_session(&daemon, "before-seed")?.runtime_pid;
+    assert!(tsindex::config::db_path(&linked).is_file());
+    let mut second = McpSession::connect(&daemon.socket, &linked, "after-seed")?;
+    assert_eq!(managed_session(&daemon, "after-seed")?.runtime_pid, initial);
+    for session in [&mut first, &mut second] {
+        assert_eq!(
+            session.call_tool("get_symbol", json!({"names":["feature_only"]}))?["total"],
+            1
+        );
+    }
+    first.close_gracefully()?;
+    second.close_gracefully()
 }
 
 #[test]
@@ -462,6 +541,11 @@ fn incompatible_roots_databases_refresh_languages_and_configs_get_distinct_index
     );
     changed.close_gracefully()?;
     base.close_gracefully()?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while daemon.ping()?.index_runtimes > 4 {
+        anyhow::ensure!(Instant::now() < deadline, "too many idle index owners");
+        std::thread::sleep(Duration::from_millis(25));
+    }
     Ok(())
 }
 
@@ -1121,6 +1205,41 @@ fn worker_config_errors_are_returned_before_session_ready() -> Result<()> {
 }
 
 #[test]
+fn repairing_an_index_database_allows_immediate_reconnect() -> Result<()> {
+    let daemon = common::TestDaemon::start()?;
+    let dir = tempdir_in("/tmp")?;
+    let db = dir.path().join("index.db");
+    let db_arg = db.to_str().context("fixture path")?;
+    // SQLite rejects an existing directory. Fixing it leaves the same checkout,
+    // configuration, and explicit database key for the immediately following open.
+    fs::create_dir(&db)?;
+    let failed = Command::new(BIN)
+        .arg("--socket")
+        .arg(&daemon.socket)
+        .arg("--root")
+        .arg(dir.path())
+        .arg("--db")
+        .arg(&db)
+        .args(["--no-refresh", "serve", "--mcp", "--via-daemon"])
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(!failed.status.success());
+    assert!(failed.stdout.is_empty());
+    let diagnostic = String::from_utf8_lossy(&failed.stderr);
+    assert!(diagnostic.contains("database"), "{diagnostic}");
+    fs::remove_dir(&db)?;
+    let mut recovered = McpSession::connect_with(
+        &daemon.socket,
+        dir.path(),
+        "recovered-db",
+        &["--no-refresh", "--db", db_arg],
+    )?;
+    assert_eq!(recovered.request("ping", json!({}))?["result"], json!({}));
+    assert!(db.is_file());
+    recovered.close_gracefully()
+}
+
+#[test]
 fn inherited_descriptor_limit_preserves_controls_at_full_capacity() -> Result<()> {
     let daemon = common::TestDaemon::start_with_nofile(96)?;
     let client = daemon.client()?;
@@ -1552,51 +1671,189 @@ fn daemon_recovers_empty_metadata_directory_and_ignores_old_state_temp() -> Resu
     Ok(())
 }
 
-#[test]
-fn session_detail_prunes_escaped_stderr_to_the_encoded_frame_budget() -> Result<()> {
-    use std::os::unix::net::UnixStream;
-    use tsindex::daemon::{DaemonClient, DaemonPaths, DaemonRequest, StartSessionRequest};
+struct WrappedDaemon(Child);
 
-    let dir = tempdir_in("/tmp")?;
-    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
-    let exe = dir.path().join("tsindex");
-    let socket = dir.path().join("d.sock");
-    let root = dir.path().join("repo");
-    fs::create_dir(&root)?;
-    fs::copy(BIN, &exe)?;
-    let child = Command::new(&exe)
-        .env("TSINDEX_TEST_RUNTIME_EXE", BIN)
-        .arg("--socket")
-        .arg(&socket)
-        .args(["daemon", "run"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    struct DaemonGuard(Child);
-    impl Drop for DaemonGuard {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
+impl Drop for WrappedDaemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
-    let _guard = DaemonGuard(child);
+}
+
+/// Run the real orchestrator with a fixture wrapper for its child entry points.
+fn start_with_worker_wrapper(
+    dir: &Path,
+    script: &str,
+) -> Result<(
+    WrappedDaemon,
+    std::path::PathBuf,
+    tsindex::daemon::DaemonClient,
+)> {
+    use tsindex::daemon::{DaemonClient, DaemonPaths};
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    let exe = dir.join("tsindex");
+    let socket = dir.join("d.sock");
+    fs::copy(BIN, &exe)?;
+    let child = WrappedDaemon(
+        Command::new(&exe)
+            .env("TSINDEX_TEST_RUNTIME_EXE", BIN)
+            .arg("--socket")
+            .arg(&socket)
+            .args(["daemon", "run"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
     let client = DaemonClient::new(DaemonPaths::resolve(Some(&socket))?);
     let deadline = Instant::now() + Duration::from_secs(5);
     while client.ping().is_err() {
         assert!(Instant::now() < deadline, "copied daemon did not start");
         thread::sleep(Duration::from_millis(10));
     }
+    let helper = dir.join("worker-wrapper");
+    fs::write(&helper, script)?;
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700))?;
+    fs::rename(helper, exe)?;
+    Ok((child, socket, client))
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_installation_change_between_child_launches_requires_a_fresh_connection() -> Result<()> {
+    let dir = tempdir_in("/tmp")?;
+    let root = dir.path().join("repo");
+    build_fixture(&root, "lib.py", "def available(): return True\n")?;
+    let replacement = dir.path().join("replacement");
+    fs::copy(BIN, &replacement)?;
+    // The worker has mapped the original inode when the next exec sees the new
+    // installation. A failed handoff must never publish the wrong generation.
+    let script = r#"#!/bin/sh
+for arg do
+  if [ "$arg" = index-runtime ] && [ -f "${0%/*}/replacement" ]; then
+    exec "${0%/*}/replacement" "$@"
+  fi
+done
+exec "$TSINDEX_TEST_RUNTIME_EXE" "$@"
+"#;
+    let (_guard, socket, _client) = start_with_worker_wrapper(dir.path(), script)?;
+    let (_, failed) = raw_session(&socket, &root)?;
+    assert_eq!(failed["kind"], "error", "{failed}");
+    assert!(
+        failed["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("installed binary changed"),
+        "{failed}"
+    );
+    fs::remove_file(replacement)?;
+    McpSession::connect(&socket, &root, "fresh-generation")?.close_gracefully()
+}
+
+#[test]
+fn blocked_workspace_initialization_can_be_cancelled_while_another_checkout_serves() -> Result<()> {
+    use std::os::unix::net::UnixStream;
+    use tsindex::daemon::SessionState;
+
+    let dir = tempdir_in("/tmp")?;
+    let blocked = dir.path().join("await-config");
+    let healthy = dir.path().join("healthy");
+    fs::create_dir(&blocked)?;
+    build_fixture(&healthy, "a.py", "def healthy_symbol():\n    return 1\n")?;
+    // Model a worker waiting on an initialization dependency before it can
+    // provide a runtime key. The fixture's private input stays open until
+    // cancellation, and the other checkout uses the real session binary.
+    let script = r#"#!/bin/sh
+for arg do
+  case "$arg" in
+    */await-config) blocked=yes ;;
+    worker) worker=yes ;;
+  esac
+done
+if [ "$blocked" = yes ] && [ "$worker" = yes ]; then
+  echo 'waiting for workspace configuration' >&2
+  IFS= read -r configuration || exit 0
+fi
+exec "$TSINDEX_TEST_RUNTIME_EXE" "$@"
+"#;
+    let (_guard, socket, client) = start_with_worker_wrapper(dir.path(), script)?;
+    let mut starting = UnixStream::connect(&socket)?;
+    starting.set_read_timeout(Some(Duration::from_secs(5)))?;
+    writeln!(
+        starting,
+        "{}",
+        json!({
+            "op":"start_session", "protocol":tsindex::daemon::PROTOCOL_VERSION,
+            "client_version":env!("CARGO_PKG_VERSION"), "root":blocked,
+            "client_pid":std::process::id(), "no_refresh":true,
+        })
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let held = loop {
+        if let Some(session) = client
+            .list_sessions(false)?
+            .0
+            .into_iter()
+            .find(|session| session.root == blocked)
+        {
+            let detail = client.session_detail(&session.session_id)?;
+            if detail
+                .recent_stderr
+                .iter()
+                .any(|line| line == "waiting for workspace configuration")
+            {
+                break detail;
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!("fixture did not enter its initialization wait");
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(held.state, SessionState::Starting);
+    assert!(held.worker_pid > 1 && pid_exists(held.worker_pid));
+    assert!(held.runtime_pid.is_none());
+    assert_eq!(client.ping()?.index_runtimes, 0);
+
+    let mut sibling = McpSession::connect(&socket, &healthy, "healthy")?;
+    assert_eq!(
+        sibling.call_tool("get_symbol", json!({"names":["healthy_symbol"]}))?["total"],
+        1
+    );
+    client.kill_session(held.session_id.clone())?;
+    let mut response = String::new();
+    BufReader::new(starting).read_line(&mut response)?;
+    let response: Value = serde_json::from_str(&response)?;
+    assert_eq!(response["kind"], "error");
+    assert_eq!(
+        client
+            .session_detail(&held.session_id)?
+            .exit_reason
+            .as_deref(),
+        Some("killed_by_user")
+    );
+    wait_pid_gone(held.worker_pid, Duration::from_secs(1))?;
+    assert_eq!(client.ping()?.index_runtimes, 1);
+    assert!(sibling.request("ping", json!({}))?.get("result").is_some());
+    sibling.close_gracefully()?;
+    client.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn session_detail_prunes_escaped_stderr_to_the_encoded_frame_budget() -> Result<()> {
+    use std::os::unix::net::UnixStream;
+    use tsindex::daemon::{DaemonRequest, StartSessionRequest};
+
+    let dir = tempdir_in("/tmp")?;
+    let root = dir.path().join("repo");
+    fs::create_dir(&root)?;
 
     // Replace only this fixture's worker path. Controlled shell literals emit
     // arbitrary diagnostics while the unchanged daemon handles the actual
     // capture, retention, SessionDetail pruning, and wire framing.
-    let readiness = json!({
-        "protocol": tsindex::daemon::PROTOCOL_VERSION,
-        "version": env!("CARGO_PKG_VERSION"),
-    });
-    let mut script = format!(
-        "#!/bin/sh\nfor arg do\n  if [ \"$arg\" = index-runtime ]; then exec \"$TSINDEX_TEST_RUNTIME_EXE\" \"$@\"; fi\ndone\nprintf '%s\\n' '{readiness}'\n"
+    let mut script = String::from(
+        "#!/bin/sh\nfor arg do\n  if [ \"$arg\" = index-runtime ]; then exec \"$TSINDEX_TEST_RUNTIME_EXE\" \"$@\"; fi\ndone\n",
     );
     let mut original_stderr = Vec::new();
     for index in 0..12 {
@@ -1614,15 +1871,8 @@ fn session_detail_prunes_escaped_stderr_to_the_encoded_frame_budget() -> Result<
     );
     script.push_str(&format!("printf '%s\\n' '{newest}' >&2\n"));
     original_stderr.push(newest.clone());
-    script.push_str(
-        "while IFS= read -r request; do\n\
-         printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'\n\
-         done\n",
-    );
-    let helper = dir.path().join("helper");
-    fs::write(&helper, script)?;
-    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700))?;
-    fs::rename(helper, &exe)?;
+    script.push_str("exec \"$TSINDEX_TEST_RUNTIME_EXE\" \"$@\"\n");
+    let (_guard, socket, client) = start_with_worker_wrapper(dir.path(), &script)?;
 
     let mut request = StartSessionRequest {
         protocol: tsindex::daemon::PROTOCOL_VERSION,

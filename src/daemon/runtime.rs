@@ -1,16 +1,16 @@
 //! One warm index owner per compatible checkout. Only session workers receive
-//! its unnamed Unix socket. Each lookup has a private reply channel, so two
-//! harnesses can use the same JSON-RPC IDs or cancel independently.
+//! its unnamed Unix socket. Each worker reuses private resolver streams, so
+//! harnesses can overlap slow lookups and use identical JSON-RPC IDs.
 
 use std::collections::HashMap;
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    MAX_MCP_FRAME_BYTES, PROTOCOL_VERSION, STARTUP_IO_TIMEOUT, StartSessionRequest, fds,
-    read_bounded_line, write_bounded_json,
+    MAX_MCP_FRAME_BYTES, PROTOCOL_VERSION, STARTUP_IO_TIMEOUT, fds, read_bounded_line,
+    write_bounded_json,
 };
 use crate::config::{TsIndexConfig, db_path};
 use crate::mcp::{InvalidParams, PreparedTool, ToolResolver};
@@ -28,13 +28,41 @@ use crate::worktrees::Runtimes;
 
 const DEFAULT_IDLE: Duration = Duration::from_secs(60);
 pub(super) const MAX_IDLE: usize = 4;
-const RESOLVERS: usize = 4;
 // Distinguish an unresponsive shared resolver from a failed tool or an
 // independently cancelled MCP worker when the supervisor reaps the child.
 pub(super) const LOOKUP_TIMEOUT_EXIT: i32 = 75;
 
-fn config_digest(config: &TsIndexConfig) -> Result<String> {
-    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(config)?)))
+fn generation_digest(config: &TsIndexConfig) -> Result<String> {
+    // Both children calculate this themselves. A package replacement between
+    // their two execs must fail initialization and allow a fresh connection.
+    let inputs = (env!("CARGO_PKG_VERSION"), running_image()?, config);
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&inputs)?)
+    ))
+}
+
+fn running_image() -> io::Result<[u8; 16]> {
+    #[cfg(target_os = "macos")]
+    {
+        // The kernel records the mapped Mach-O UUID even when the installation
+        // path has been replaced. Custom unsigned builds may omit the UUID.
+        let mut info: libc::rusage_info_v0 = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V0, (&raw mut info).cast())
+        };
+        if rc == 0 && info.ri_uuid != [0; 16] {
+            return Ok(info.ri_uuid);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let image = std::fs::metadata("/proc/self/exe")?;
+    #[cfg(not(target_os = "linux"))]
+    let image = std::env::current_exe()?.metadata()?;
+    let mut identity = [0; 16];
+    identity[..8].copy_from_slice(&image.dev().to_be_bytes());
+    identity[8..].copy_from_slice(&image.ino().to_be_bytes());
+    Ok(identity)
 }
 
 // Existing parents can be aliases even when a requested DB does not exist yet.
@@ -55,27 +83,28 @@ fn canonical_target(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
-#[derive(Clone, Hash, PartialEq, Eq)]
-struct RuntimeKey {
+#[derive(Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct RuntimeKey {
     root: PathBuf,
     // An explicit DB disables repo pruning even if it names the default file.
     db: Option<PathBuf>,
     languages: Vec<String>,
     no_refresh: bool,
-    config: String,
-    executable: (u64, u64),
+    generation: String,
 }
 
 impl RuntimeKey {
-    fn for_session(req: &StartSessionRequest, executable: &Path) -> Result<Self> {
-        let root = req
-            .root
+    pub(super) fn resolve(
+        root: &Path,
+        db: Option<&Path>,
+        languages: &[String],
+        no_refresh: bool,
+    ) -> Result<Self> {
+        let root = root
             .canonicalize()
             .context("cannot resolve checkout root")?;
         ensure!(root.is_dir(), "workspace root must be a directory");
-        let db = req
-            .db
-            .as_deref()
+        let db = db
             .map(|path| canonical_target(&root.join(path)))
             .transpose()?;
         let checkout = if db.is_none() && !db_path(&root).exists() {
@@ -91,18 +120,43 @@ impl RuntimeKey {
         } else {
             TsIndexConfig::load_or_default(&root)?
         };
-        let mut languages = req.languages.clone();
+        let mut languages = languages.to_owned();
         languages.sort();
         languages.dedup();
-        let image = executable.metadata()?;
         Ok(Self {
             root,
             db,
             languages,
-            no_refresh: req.no_refresh,
-            config: config_digest(&settings)?,
-            executable: (image.dev(), image.ino()),
+            no_refresh,
+            generation: generation_digest(&settings)?,
         })
+    }
+}
+
+/// The session worker resolves settings inside its own cancellable process.
+/// Its stdout is still a private control pipe until the second acknowledgement.
+#[derive(Serialize, Deserialize)]
+pub(super) struct WorkerRuntimeRequest {
+    pub protocol: u32,
+    pub runtime_key: RuntimeKey,
+}
+
+pub(super) fn add_settings(
+    cmd: &mut Command,
+    root: &Path,
+    db: Option<&Path>,
+    languages: &[String],
+    no_refresh: bool,
+) {
+    cmd.arg("--root").arg(root);
+    if let Some(db) = db {
+        cmd.arg("--db").arg(db);
+    }
+    for language in languages {
+        cmd.arg("--languages").arg(language);
+    }
+    if no_refresh {
+        cmd.arg("--no-refresh");
     }
 }
 
@@ -118,24 +172,25 @@ struct Entry {
 }
 
 impl Entry {
-    fn start(key: &RuntimeKey, executable: &Path) -> Result<Self> {
+    fn start(key: &RuntimeKey, executable: &Path, max_lanes: usize) -> Result<Self> {
         let (channel, receiver) = UnixStream::pair()?;
         channel.set_write_timeout(Some(STARTUP_IO_TIMEOUT))?;
         let mut cmd = Command::new(executable);
-        cmd.arg("--root").arg(&key.root).current_dir(&key.root);
-        if let Some(db) = &key.db {
-            cmd.arg("--db").arg(db);
-        }
-        for language in &key.languages {
-            cmd.arg("--languages").arg(language);
-        }
-        if key.no_refresh {
-            cmd.arg("--no-refresh");
-        }
+        // A stalled checkout must not block the single pool thread in pre-exec
+        // chdir. The new process enters the root after installing its lifeline.
+        add_settings(
+            &mut cmd,
+            &key.root,
+            key.db.as_deref(),
+            &key.languages,
+            key.no_refresh,
+        );
         cmd.args(["daemon", "index-runtime", "--runtime-fd"])
             .arg(receiver.as_raw_fd().to_string())
-            .arg("--config-digest")
-            .arg(&key.config)
+            .arg("--generation")
+            .arg(&key.generation)
+            .arg("--max-lanes")
+            .arg(max_lanes.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
@@ -175,19 +230,27 @@ impl Entry {
             pid: self.child.id(),
         }
     }
+
+    fn stop(mut self, exiting: &mut Vec<Child>) {
+        // EOF releases the runtime on daemon loss. An explicit stop also kills
+        // an unresponsive or stopped owner. Its child handle reserves the PID
+        // until a later nonblocking wait observes exit.
+        drop(self.child.stdin.take());
+        if child_pending(&mut self.child) {
+            let _ = self.child.kill();
+            exiting.push(self.child);
+        }
+    }
 }
 
-impl Drop for Entry {
-    fn drop(&mut self) {
-        // Only the daemon holds the write end. EOF also releases the runtime
-        // after an ungraceful daemon exit, even if a session still has a channel.
-        drop(self.child.stdin.take());
-        // The index owner spawns threads only. Reap its reserved child PID even
-        // if initialization is stuck or the process has been stopped.
-        if matches!(self.child.try_wait(), Ok(None)) {
-            let _ = self.child.kill();
+fn child_pending(child: &mut Child) -> bool {
+    loop {
+        match child.try_wait() {
+            Ok(status) => return status.is_none(),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            // Never send a numeric signal after losing ownership of the PID.
+            Err(_) => return false,
         }
-        let _ = self.child.wait();
     }
 }
 
@@ -204,7 +267,7 @@ pub(super) struct RuntimePool {
 }
 
 impl RuntimePool {
-    pub fn new() -> Result<Self> {
+    pub fn new(max_sessions: usize) -> Result<Self> {
         let (inbox, requests) = mpsc::channel();
         let idle = std::env::var("TSINDEX_RUNTIME_IDLE_SECS")
             .ok()
@@ -215,7 +278,7 @@ impl RuntimePool {
         let count = Arc::clone(&resident);
         let thread = thread::Builder::new()
             .name("tsindex-runtime-pool".into())
-            .spawn(move || run_pool(requests, idle, &count))?;
+            .spawn(move || run_pool(requests, idle, &count, max_sessions))?;
         Ok(Self {
             inbox,
             resident,
@@ -223,8 +286,7 @@ impl RuntimePool {
         })
     }
 
-    pub fn acquire(&self, req: &StartSessionRequest, executable: &Path) -> Result<RuntimeLease> {
-        let key = RuntimeKey::for_session(req, executable)?;
+    pub fn acquire(&self, key: RuntimeKey, executable: &Path) -> Result<RuntimeLease> {
         let (tx, rx) = mpsc::sync_channel(1);
         self.inbox
             .send(PoolMessage::Acquire(key, executable.to_owned(), tx))
@@ -256,92 +318,165 @@ impl Drop for RuntimePool {
     }
 }
 
-fn run_pool(requests: mpsc::Receiver<PoolMessage>, idle: Duration, count: &AtomicUsize) {
-    let mut entries = HashMap::<RuntimeKey, Entry>::new();
-    let mut retiring = Vec::<Entry>::new();
+struct IndexOwners {
+    current: HashMap<RuntimeKey, Entry>,
+    retiring: Vec<Entry>,
+    exiting: Vec<Child>,
+    max_owners: usize,
+    max_lanes: usize,
+}
+
+impl IndexOwners {
+    fn resident(&self) -> usize {
+        self.current.len() + self.retiring.len() + self.exiting.len()
+    }
+
+    fn acquire(&mut self, key: RuntimeKey, image: &Path) -> Result<RuntimeLease> {
+        if self.current.get(&key).is_some_and(Entry::is_stopped)
+            && let Some(stopped) = self.current.remove(&key)
+        {
+            // A confirmed stop can strand a writer lease. Request termination
+            // before opening the replacement without blocking unrelated owners.
+            stopped.stop(&mut self.exiting);
+        }
+        // Initialization failure closes the owner intake before replying to
+        // admitted clients. Route an immediate retry to a fresh process while
+        // the old one finishes delivering each private diagnostic.
+        if self
+            .current
+            .get(&key)
+            .is_some_and(|e| intake_closed(&e.channel))
+            && let Some(closed) = self.current.remove(&key)
+        {
+            self.retiring.push(closed);
+        }
+        let at_capacity = self.resident() >= self.max_owners;
+        match self.current.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut slot) => Ok(slot.get_mut().lease()),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                ensure!(
+                    !at_capacity,
+                    "index owner capacity reached while earlier processes are exiting; retry shortly"
+                );
+                let entry = Entry::start(slot.key(), image, self.max_lanes)?;
+                Ok(slot.insert(entry).lease())
+            }
+        }
+    }
+
+    fn retire(&mut self, channel: &Arc<UnixStream>) {
+        // A late timeout from an old generation cannot retire its replacement.
+        // Keep serving any peers that already have a lease on this generation.
+        let stale = self
+            .current
+            .extract_if(|_, e| Arc::ptr_eq(&e.channel, channel));
+        self.retiring.extend(stale.map(|(_, entry)| entry));
+    }
+
+    fn collect(&mut self, idle: Duration) {
+        self.exiting.retain_mut(child_pending);
+        for entry in self.retiring.extract_if(.., |e| {
+            Arc::strong_count(&e.channel) == 1 || !child_pending(&mut e.child)
+        }) {
+            entry.stop(&mut self.exiting);
+        }
+        let now = Instant::now();
+        let expired = self.current.extract_if(|_, entry| {
+            if !child_pending(&mut entry.child) {
+                return true;
+            }
+            if Arc::strong_count(&entry.channel) > 1 {
+                entry.idle_since = None;
+                return false;
+            }
+            now.duration_since(*entry.idle_since.get_or_insert(now)) >= idle
+        });
+        for (_, entry) in expired {
+            entry.stop(&mut self.exiting);
+        }
+        let mut unused: Vec<_> = self
+            .current
+            .iter()
+            .filter_map(|(key, entry)| entry.idle_since.map(|t| (t, key.clone())))
+            .collect();
+        if unused.len() > MAX_IDLE {
+            unused.sort_unstable_by_key(|(t, _)| *t);
+            let excess = unused.len() - MAX_IDLE;
+            for (_, key) in unused.into_iter().take(excess) {
+                if let Some(entry) = self.current.remove(&key) {
+                    entry.stop(&mut self.exiting);
+                }
+            }
+        }
+    }
+
+    fn shutdown(mut self) {
+        for entry in self.current.into_values().chain(self.retiring) {
+            entry.stop(&mut self.exiting);
+        }
+        // SIGKILL cannot end uninterruptible kernel I/O until the syscall
+        // returns. Keep the manager responsive and bound its final wait.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            self.exiting.retain_mut(child_pending);
+            if self.exiting.is_empty() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                eprintln!(
+                    "{} index owners still await kernel exit",
+                    self.exiting.len()
+                );
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+fn run_pool(
+    requests: mpsc::Receiver<PoolMessage>,
+    idle: Duration,
+    count: &AtomicUsize,
+    max_sessions: usize,
+) {
+    let mut owners = IndexOwners {
+        current: HashMap::new(),
+        retiring: Vec::new(),
+        exiting: Vec::new(),
+        // One replacement may be starting while its predecessor is exiting.
+        // Uninterruptible children still count against this finite budget.
+        max_owners: max_sessions.saturating_add(MAX_IDLE + 1),
+        max_lanes: max_sessions.saturating_mul(crate::mcp::MAX_CONCURRENT_REQUESTS),
+    };
     loop {
-        // With no children there are no timeouts or exits to supervise.
-        let message = if entries.is_empty() && retiring.is_empty() {
+        let message = if owners.resident() == 0 {
             requests
                 .recv()
                 .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
         } else {
             requests.recv_timeout(Duration::from_millis(250))
         };
-        let now = Instant::now();
-        retiring.retain_mut(|owner| {
-            Arc::strong_count(&owner.channel) > 1 && matches!(owner.child.try_wait(), Ok(None))
-        });
-        entries.retain(|_, entry| {
-            if !matches!(entry.child.try_wait(), Ok(None)) {
-                return false;
-            }
-            if Arc::strong_count(&entry.channel) == 1 {
-                now.duration_since(*entry.idle_since.get_or_insert(now)) < idle
-            } else {
-                entry.idle_since = None;
-                true
-            }
-        });
-        let mut idle_times: Vec<_> = entries.values().filter_map(|e| e.idle_since).collect();
-        if idle_times.len() > MAX_IDLE {
-            idle_times.sort_unstable();
-            let mut excess = idle_times.len() - MAX_IDLE;
-            let cutoff = idle_times[excess - 1];
-            entries.retain(|_, e| {
-                if excess > 0 && e.idle_since.is_some_and(|t| t <= cutoff) {
-                    excess -= 1;
-                    false
-                } else {
-                    true
-                }
-            });
-        }
+        owners.collect(idle);
         match message {
             Ok(PoolMessage::Acquire(key, image, reply)) => {
-                if entries.get(&key).is_some_and(Entry::is_stopped) {
-                    // A confirmed stopped owner may hold the writer lease.
-                    // Reaping it releases that lease before its replacement opens.
-                    entries.remove(&key);
-                }
-                let result = match entries.entry(key) {
-                    std::collections::hash_map::Entry::Occupied(mut slot) => {
-                        Ok(slot.get_mut().lease())
-                    }
-                    std::collections::hash_map::Entry::Vacant(slot) => {
-                        Entry::start(slot.key(), &image).map(|entry| slot.insert(entry).lease())
-                    }
-                };
-                count.store(entries.len() + retiring.len(), Ordering::Relaxed);
+                let result = owners.acquire(key, &image);
+                count.store(owners.resident(), Ordering::Relaxed);
                 let _ = reply.send(result);
             }
-            Ok(PoolMessage::Retire(channel)) => {
-                // A timed-out lookup is not proof of process death. Existing
-                // sessions can finish on their owner. Route new clients to a
-                // fresh owner and reap this generation after its last lease.
-                if let Some(key) = entries
-                    .iter()
-                    .find(|(_, entry)| Arc::ptr_eq(&entry.channel, &channel))
-                    .map(|(key, _)| key.clone())
-                    && let Some(entry) = entries.remove(&key)
-                {
-                    retiring.push(entry);
-                }
-            }
+            Ok(PoolMessage::Retire(channel)) => owners.retire(&channel),
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                count.store(entries.len() + retiring.len(), Ordering::Relaxed)
+                count.store(owners.resident(), Ordering::Relaxed)
             }
             Ok(PoolMessage::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    owners.shutdown();
     count.store(0, Ordering::Relaxed);
 }
 
 #[derive(Serialize, Deserialize)]
 enum Lookup {
-    Ready {
-        protocol: u32,
-    },
     Prepare {
         repo: Option<String>,
         live_query: bool,
@@ -372,27 +507,45 @@ fn inherited_socket(fd: i32) -> Result<UnixStream> {
     Ok(stream)
 }
 
+// The worker generates this identity once. Neither MCP payloads nor caller
+// request IDs participate in the runtime's per-session admission decision.
+#[derive(Serialize, Deserialize)]
+struct OpenLane {
+    session: [u8; 16],
+    protocol: u32,
+}
+
 pub(crate) struct SessionResolver {
     channel: UnixStream,
+    session: [u8; 16],
+    idle: Mutex<Vec<BufReader<UnixStream>>>,
+    lookup_timeout: Duration,
 }
 
 impl SessionResolver {
-    pub fn connect(fd: i32) -> Result<Self> {
-        let resolver = Self {
-            channel: inherited_socket(fd)?,
-        };
-        ensure!(
-            matches!(
-                resolver.request(Lookup::Ready {
-                    protocol: PROTOCOL_VERSION
-                })?,
-                Reply::Ready
-            ),
-            "invalid index runtime readiness acknowledgement"
-        );
-        // Only requests travel on the shared channel, each with its own reply
-        // stream. EOF here means the index owner died. End affected MCP sessions
-        // so a reconnect can acquire a new owner.
+    pub fn connect(
+        fd: i32,
+        root: &Path,
+        db: Option<&Path>,
+        languages: &[String],
+        no_refresh: bool,
+    ) -> Result<Self> {
+        let bootstrap = inherited_socket(fd)?;
+        let key = RuntimeKey::resolve(root, db, languages, no_refresh)?;
+        std::env::set_current_dir(&key.root)?;
+        super::write_json_line(
+            &mut io::stdout(),
+            &WorkerRuntimeRequest {
+                protocol: PROTOCOL_VERSION,
+                runtime_key: key,
+            },
+        )?;
+        let capability = fds::recv_fd(&bootstrap)?
+            .context("supervisor closed before assigning an index owner")?;
+        drop(bootstrap);
+        let resolver = Self::attach(UnixStream::from(capability), STARTUP_IO_TIMEOUT)?;
+        // This shared endpoint carries only descriptor transfers towards the
+        // owner. Its EOF applies to the generation, independently of a lane.
         let mut monitor = resolver.channel.try_clone()?;
         thread::Builder::new()
             .name("tsindex-runtime-lifetime".into())
@@ -405,34 +558,82 @@ impl SessionResolver {
         Ok(resolver)
     }
 
-    fn request(&self, request: Lookup) -> Result<Reply> {
-        let response = self.exchange(request);
-        if response.as_ref().is_err_and(|error| {
-            error.chain().any(|cause| {
-                cause.downcast_ref::<io::Error>().is_some_and(|e| {
-                    matches!(
-                        e.kind(),
-                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                    )
-                })
-            })
-        }) {
-            eprintln!("shared index runtime timed out; reconnect to start a new runtime");
-            std::process::exit(LOOKUP_TIMEOUT_EXIT);
-        }
-        response
+    fn attach(channel: UnixStream, lookup_timeout: Duration) -> Result<Self> {
+        let mut session = [0u8; 16];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut session)?;
+        let resolver = Self {
+            channel,
+            session,
+            idle: Mutex::new(Vec::new()),
+            lookup_timeout,
+        };
+        let first = resolver.open_lane()?;
+        resolver
+            .idle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(first);
+        Ok(resolver)
     }
 
-    fn exchange(&self, request: Lookup) -> Result<Reply> {
+    fn open_lane(&self) -> Result<BufReader<UnixStream>> {
         let (mut local, remote) = UnixStream::pair()?;
         local.set_read_timeout(Some(STARTUP_IO_TIMEOUT))?;
         local.set_write_timeout(Some(STARTUP_IO_TIMEOUT))?;
-        fds::send_fd(&self.channel, remote.as_fd()).context("shared index runtime unavailable")?;
+        // Queue the whole bounded header before handing over the endpoint. The
+        // listener can read it without ever waiting for a worker or its lookup.
+        super::write_json_line(
+            &mut local,
+            &OpenLane {
+                session: self.session,
+                protocol: PROTOCOL_VERSION,
+            },
+        )?;
+        let receipt = fds::send_fd(&self.channel, remote.as_fd())
+            .and_then(|()| await_receipt(&mut local, &self.channel, STARTUP_IO_TIMEOUT));
+        if let Err(error) = receipt {
+            if matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ) {
+                // Only failure to reach the independent admission loop identifies
+                // an unresponsive owner. Ordinary accepted work can take longer.
+                eprintln!("shared index runtime did not accept its resolver connection");
+                std::process::exit(LOOKUP_TIMEOUT_EXIT);
+            }
+            return Err(error).context("shared index runtime unavailable");
+        }
+        // Darwin may still be transferring the file description until receipt.
+        // The client keeps its sender-side reference through that acknowledgement.
         drop(remote);
-        write_bounded_json(&mut local, &request, MAX_MCP_FRAME_BYTES)?;
-        let line = read_bounded_line(&mut BufReader::new(local), MAX_MCP_FRAME_BYTES)
-            .context("shared index runtime did not answer")?;
-        match serde_json::from_str(&line)? {
+        let mut lane = BufReader::new(local);
+        match read_reply(&mut lane)? {
+            Reply::Ready => {
+                lane.get_ref().set_read_timeout(Some(self.lookup_timeout))?;
+                lane.get_ref()
+                    .set_write_timeout(Some(self.lookup_timeout))?;
+                Ok(lane)
+            }
+            Reply::Error { detail, .. } => Err(anyhow!(detail)),
+            _ => bail!("invalid index runtime readiness acknowledgement"),
+        }
+    }
+
+    fn request(&self, request: Lookup) -> Result<Reply> {
+        let lane = self.idle.lock().unwrap_or_else(|p| p.into_inner()).pop();
+        let mut lane = match lane {
+            Some(lane) => lane,
+            None => self.open_lane()?,
+        };
+        write_bounded_json(lane.get_mut(), &request, MAX_MCP_FRAME_BYTES)?;
+        // A timeout after admission releases just this stream. The server
+        // charges its running task to this session until prepare actually ends.
+        let reply = read_reply(&mut lane).context("index lookup did not complete")?;
+        self.idle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(lane);
+        match reply {
             Reply::Error {
                 detail,
                 invalid_params: true,
@@ -455,16 +656,99 @@ impl ToolResolver for SessionResolver {
     }
 }
 
-pub(crate) fn verify_config(config: &TsIndexConfig, expected: &str) -> Result<()> {
+pub(crate) fn verify_generation(config: &TsIndexConfig, expected: &str) -> Result<()> {
     ensure!(
-        config_digest(config)? == expected,
-        "checkout configuration changed during startup; reconnect"
+        generation_digest(config)? == expected,
+        "checkout configuration or installed binary changed during startup; reconnect"
     );
     Ok(())
 }
 
-pub(crate) fn serve_index(fd: i32, initialize: impl FnOnce() -> Result<Runtimes>) -> Result<()> {
-    let mut channel = Mutex::new(inherited_socket(fd)?);
+fn read_reply(lane: &mut BufReader<UnixStream>) -> Result<Reply> {
+    let line = read_bounded_line(lane, MAX_MCP_FRAME_BYTES)?;
+    Ok(serde_json::from_str(&line)?)
+}
+
+const RECEIVED: u8 = 1;
+
+fn intake_closed(channel: &UnixStream) -> bool {
+    // The owner never writes on its intake. A non-consuming EOF check works
+    // even while its final private replies keep the process alive.
+    let mut byte = 0u8;
+    let n = unsafe {
+        libc::recv(
+            channel.as_raw_fd(),
+            (&raw mut byte).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    n == 0
+        || (n < 0
+            && matches!(
+                io::Error::last_os_error().kind(),
+                io::ErrorKind::ConnectionReset | io::ErrorKind::NotConnected
+            ))
+}
+
+fn await_receipt(local: &mut UnixStream, owner: &UnixStream, timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut fds = [
+        libc::pollfd {
+            fd: local.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: owner.as_raw_fd(),
+            events: 0,
+            revents: 0,
+        },
+    ];
+    loop {
+        // The sender still holds `remote`, so local by itself cannot report
+        // EOF if the owner dies between sendmsg and acknowledgement.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let n = unsafe {
+            libc::poll(
+                fds.as_mut_ptr(),
+                2,
+                remaining.as_millis().min(i32::MAX as u128) as i32,
+            )
+        };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        if fds[0].revents != 0 {
+            let mut ack = [0];
+            local.read_exact(&mut ack)?;
+            if ack != [RECEIVED] {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid resolver receipt",
+                ));
+            }
+            return Ok(());
+        }
+        if fds[1].revents != 0 {
+            return Err(io::ErrorKind::ConnectionReset.into());
+        }
+    }
+}
+
+pub(crate) fn serve_index(
+    fd: i32,
+    max_lanes: usize,
+    initialize: impl FnOnce() -> Result<Runtimes> + Send,
+) -> Result<()> {
+    let channel = inherited_socket(fd)?;
     // The parent alone owns stdin's write end. Establish this guard before
     // a cold checkout can block on SQLite or linked-worktree preparation.
     thread::Builder::new()
@@ -473,81 +757,318 @@ pub(crate) fn serve_index(fd: i32, initialize: impl FnOnce() -> Result<Runtimes>
             let _ = io::stdin().read_exact(&mut [0u8; 1]);
             std::process::exit(0);
         })?;
-    let runtimes = match initialize() {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            // Return the original initialization error over the private channel
-            // before exiting; a later attach can retry a temporary failure.
-            if let Some(fd) = fds::recv_fd(channel.get_mut().unwrap_or_else(|p| p.into_inner()))? {
-                let mut reply = UnixStream::from(fd);
-                reply.set_read_timeout(Some(STARTUP_IO_TIMEOUT))?;
-                reply.set_write_timeout(Some(STARTUP_IO_TIMEOUT))?;
-                let _ = read_bounded_line(&mut BufReader::new(&reply), MAX_MCP_FRAME_BYTES);
-                write_bounded_json(
-                    &mut reply,
-                    &Reply::Error {
-                        detail: format!("{error:#}"),
-                        invalid_params: false,
-                    },
-                    MAX_MCP_FRAME_BYTES,
-                )?;
-            }
-            return Err(error);
-        }
+    serve_lanes(channel, max_lanes, initialize)
+}
+
+fn serve_lanes<T: ToolResolver + Send>(
+    channel: UnixStream,
+    max_lanes: usize,
+    initialize: impl FnOnce() -> Result<T> + Send,
+) -> Result<()> {
+    // An actual client owns a private stream before initialization can fail.
+    // The intake loop keeps acknowledging other attachments during a cold start.
+    let Some(first) = next_lane(&channel)? else {
+        return Ok(());
     };
+    let initialized = OnceLock::new();
     thread::scope(|scope| -> Result<()> {
-        let mut handlers = Vec::with_capacity(RESOLVERS);
-        for _ in 0..RESOLVERS {
-            handlers.push(
-                thread::Builder::new()
+        let state = &initialized;
+        let notify = &channel;
+        scope.spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(initialize))
+                .unwrap_or_else(|_| Err(anyhow!("index initializer panicked")));
+            if result.is_err() {
+                // New acquisitions must observe closure before any waiting
+                // client receives its detailed error and attempts a repair.
+                let _ = notify.shutdown(std::net::Shutdown::Both);
+            }
+            let _ = state.set(result);
+        });
+        let mut lanes = Vec::<([u8; 16], thread::ScopedJoinHandle<'_, ()>)>::new();
+        let mut next = Some(first);
+        while let Some((hello, mut lane)) = next {
+            lanes.retain(|(_, handle)| !handle.is_finished());
+            let session_count = lanes
+                .iter()
+                .filter(|(session, _)| *session == hello.session)
+                .count();
+            if hello.protocol != PROTOCOL_VERSION {
+                let _ = send_error(
+                    lane.get_mut(),
+                    "index runtime protocol mismatch; restart the daemon",
+                );
+            } else if lanes.len() >= max_lanes
+                || session_count >= crate::mcp::MAX_CONCURRENT_REQUESTS
+            {
+                let _ = send_error(
+                    lane.get_mut(),
+                    "resolver capacity reached; retry after an outstanding lookup finishes",
+                );
+            } else {
+                let task = thread::Builder::new()
                     .name("tsindex-resolve".into())
-                    .spawn_scoped(scope, || -> Result<()> {
-                        loop {
-                            let fd = {
-                                let channel = channel.lock().unwrap_or_else(|p| p.into_inner());
-                                fds::recv_fd(&channel)?
-                            };
-                            let Some(fd) = fd else { return Ok(()) };
-                            // A session may disappear during refresh. Losing that reply
-                            // must not cancel useful index work or close other sessions.
-                            let _ = answer(UnixStream::from(fd), &runtimes);
+                    .spawn_scoped(scope, move || match state.wait() {
+                        Ok(runtimes) => {
+                            let _ = serve_lane(lane, runtimes);
                         }
-                    })?,
-            );
+                        Err(error) => {
+                            let _ = send_error(lane.get_mut(), &format!("{error:#}"));
+                        }
+                    });
+                if let Ok(handle) = task {
+                    lanes.push((hello.session, handle));
+                }
+            }
+            next = next_lane(&channel)?;
         }
-        for handler in handlers {
-            handler
-                .join()
-                .map_err(|_| anyhow!("runtime resolver stopped"))??;
+        if let Err(error) = state.wait() {
+            return Err(anyhow!("{error:#}"));
         }
         Ok(())
     })
 }
 
-fn answer(mut stream: UnixStream, runtimes: &Runtimes) -> Result<()> {
-    stream.set_read_timeout(Some(STARTUP_IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(STARTUP_IO_TIMEOUT))?;
-    let request = read_bounded_line(&mut BufReader::new(&stream), MAX_MCP_FRAME_BYTES)?;
-    let result = match serde_json::from_str(&request)? {
-        Lookup::Ready { protocol } if protocol == PROTOCOL_VERSION => Ok(Reply::Ready),
-        Lookup::Ready { .. } => Err(anyhow!(
-            "index runtime protocol mismatch; restart tsindex daemon"
-        )),
-        Lookup::Prepare { repo, live_query } => runtimes
+fn next_lane(channel: &UnixStream) -> Result<Option<(OpenLane, BufReader<UnixStream>)>> {
+    while let Some(fd) = fds::recv_fd(channel)? {
+        let mut lane = BufReader::new(UnixStream::from(fd));
+        // A disconnected worker or malformed private header affects only it.
+        if let Ok(hello) = receive_lane(&mut lane) {
+            return Ok(Some((hello, lane)));
+        }
+    }
+    Ok(None)
+}
+
+fn receive_lane(lane: &mut BufReader<UnixStream>) -> Result<OpenLane> {
+    lane.get_ref().peer_addr()?;
+    lane.get_mut().set_nonblocking(true)?;
+    lane.get_mut().write_all(&[RECEIVED])?;
+    let line = read_bounded_line(lane, super::MAX_CONTROL_LINE_BYTES)?;
+    let hello = serde_json::from_str(&line)?;
+    lane.get_mut().set_nonblocking(false)?;
+    lane.get_mut().set_write_timeout(Some(STARTUP_IO_TIMEOUT))?;
+    Ok(hello)
+}
+
+fn send_error(stream: &mut UnixStream, detail: &str) -> Result<()> {
+    write_bounded_json(
+        stream,
+        &Reply::Error {
+            detail: detail.into(),
+            invalid_params: false,
+        },
+        MAX_MCP_FRAME_BYTES,
+    )
+}
+
+fn serve_lane(mut lane: BufReader<UnixStream>, runtimes: &impl ToolResolver) -> Result<()> {
+    write_bounded_json(lane.get_mut(), &Reply::Ready, MAX_MCP_FRAME_BYTES)?;
+    while let Ok(line) = read_bounded_line(&mut lane, MAX_MCP_FRAME_BYTES) {
+        let Lookup::Prepare { repo, live_query } = serde_json::from_str(&line)?;
+        let reply = runtimes
             .prepare(repo.as_deref(), live_query)
-            .map(|prepared| Reply::Prepared(Box::new(prepared))),
-    };
-    let reply = result.unwrap_or_else(|err| Reply::Error {
-        invalid_params: err.is::<InvalidParams>(),
-        detail: format!("{err:#}"),
-    });
-    write_bounded_json(&mut stream, &reply, MAX_MCP_FRAME_BYTES)
+            .map(|prepared| Reply::Prepared(Box::new(prepared)))
+            .unwrap_or_else(|err| Reply::Error {
+                invalid_params: err.is::<InvalidParams>(),
+                detail: format!("{err:#}"),
+            });
+        write_bounded_json(lane.get_mut(), &reply, MAX_MCP_FRAME_BYTES)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn failed_initialization_closes_intake_before_answering_all_admitted_clients() -> Result<()> {
+        let (sender, owner) = UnixStream::pair()?;
+        let (release, gate) = mpsc::channel::<()>();
+        let listener = thread::spawn(move || {
+            serve_lanes(owner, 8, move || -> Result<Runtimes> {
+                gate.recv()?;
+                bail!("database initialization failed")
+            })
+        });
+        let mut clients = vec![];
+        for id in [1, 2] {
+            let (mut local, remote) = UnixStream::pair()?;
+            super::super::write_json_line(
+                &mut local,
+                &OpenLane {
+                    session: [id; 16],
+                    protocol: PROTOCOL_VERSION,
+                },
+            )?;
+            fds::send_fd(&sender, remote.as_fd())?;
+            await_receipt(&mut local, &sender, Duration::from_secs(3))?;
+            drop(remote);
+            local.set_read_timeout(Some(Duration::from_secs(3)))?;
+            clients.push(BufReader::new(local));
+        }
+        release.send(())?;
+        for mut client in clients {
+            match read_reply(&mut client)? {
+                Reply::Error { detail, .. } => assert_eq!(detail, "database initialization failed"),
+                _ => panic!("expected the initialization diagnostic"),
+            }
+            assert!(
+                intake_closed(&sender),
+                "pool could still reassign this failed owner"
+            );
+        }
+        assert!(listener.join().unwrap().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn established_clients_reuse_their_private_streams_under_concurrent_load() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().to_owned();
+        let (sender, owner) = UnixStream::pair()?;
+        let listener = thread::spawn(move || {
+            serve_lanes(owner, 32, || {
+                Ok(Runtimes::new(crate::index::Runtime::new(
+                    root.clone(),
+                    db_path(&root),
+                    TsIndexConfig::default(),
+                    vec![],
+                )))
+            })
+        });
+        let clients: Vec<_> = (0..8)
+            .map(|_| SessionResolver::attach(sender.try_clone()?, Duration::from_secs(3)))
+            .collect::<Result<_>>()?;
+        // Disable all further descriptor transfers. Each client must complete
+        // its own lookups concurrently using the private stream already assigned.
+        sender.shutdown(std::net::Shutdown::Write)?;
+        thread::scope(|scope| -> Result<()> {
+            let calls: Vec<_> = clients
+                .into_iter()
+                .map(|client| {
+                    scope.spawn(move || -> Result<()> {
+                        for _ in 0..20 {
+                            client.prepare(None, true)?;
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            for call in calls {
+                call.join().unwrap()?;
+            }
+            Ok(())
+        })?;
+        listener.join().unwrap()?;
+        Ok(())
+    }
+
+    #[test]
+    fn blocked_lookups_remain_charged_to_their_session_and_leave_another_session_live() -> Result<()>
+    {
+        use std::sync::Condvar;
+        type Gate = Arc<(Mutex<bool>, Condvar)>;
+        struct Release(Gate);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                *self.0.0.lock().unwrap() = true;
+                self.0.1.notify_all();
+            }
+        }
+        struct Controlled {
+            started: mpsc::Sender<()>,
+            gate: Gate,
+            real: Runtimes,
+        }
+        impl ToolResolver for Controlled {
+            fn prepare(&self, repo: Option<&str>, live: bool) -> Result<PreparedTool> {
+                if !live {
+                    self.started.send(())?;
+                    drop(
+                        self.gate
+                            .1
+                            .wait_while(self.gate.0.lock().unwrap(), |blocked| !*blocked)
+                            .unwrap(),
+                    );
+                }
+                self.real.prepare(repo, true)
+            }
+        }
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().to_path_buf();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Release(gate.clone());
+        let (started, events) = mpsc::channel();
+        let (sender, owner) = UnixStream::pair()?;
+        let listener = thread::spawn(move || {
+            serve_lanes(owner, 8, || {
+                Ok(Controlled {
+                    started,
+                    gate,
+                    real: Runtimes::new(crate::index::Runtime::new(
+                        root.clone(),
+                        db_path(&root),
+                        TsIndexConfig::default(),
+                        vec![],
+                    )),
+                })
+            })
+        });
+        let busy = Arc::new(SessionResolver::attach(
+            sender.try_clone()?,
+            Duration::from_millis(750),
+        )?);
+        let jobs: Vec<_> = (0..crate::mcp::MAX_CONCURRENT_REQUESTS)
+            .map(|_| {
+                let session = busy.clone();
+                thread::spawn(move || session.prepare(None, false))
+            })
+            .collect();
+        for _ in 0..jobs.len() {
+            events.recv_timeout(Duration::from_secs(3))?;
+        }
+        let peer = SessionResolver::attach(sender, Duration::from_secs(2))?;
+        for _ in 0..8 {
+            peer.prepare(None, true)?;
+        }
+        for task in jobs {
+            let error = task
+                .join()
+                .unwrap()
+                .err()
+                .context("expected an isolated lookup timeout")?;
+            assert!(
+                error
+                    .chain()
+                    .any(
+                        |cause| cause.downcast_ref::<io::Error>().is_some_and(|e| matches!(
+                            e.kind(),
+                            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                        ))
+                    )
+            );
+        }
+        // Abandoning four streams cannot create a fifth running task for the
+        // same session. The independent peer keeps its healthy connection.
+        let error = busy
+            .prepare(None, true)
+            .err()
+            .context("expected capacity rejection")?;
+        assert!(error.to_string().contains("capacity"), "{error:#}");
+        peer.prepare(None, true)?;
+        drop(release);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while let Err(e) = busy.prepare(None, true) {
+            ensure!(Instant::now() < deadline, "session did not recover: {e:#}");
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(busy);
+        drop(peer);
+        listener.join().unwrap()?;
+        Ok(())
+    }
 
     #[test]
     fn timed_out_generation_is_replaced_without_stopping_healthy_peers() -> Result<()> {
@@ -557,27 +1078,17 @@ mod tests {
         // exec keeps the fixture a single, directly owned child.
         std::fs::write(&image, "#!/bin/sh\nexec sleep 30\n")?;
         std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o700))?;
-        let pool = RuntimePool::new()?;
-        let request = StartSessionRequest {
-            protocol: PROTOCOL_VERSION,
-            client_version: env!("CARGO_PKG_VERSION").into(),
-            root: dir.path().into(),
-            db: None,
-            languages: vec![],
-            no_refresh: true,
-            client_pid: std::process::id(),
-            owner_pid: None,
-            owner_explicit: false,
-        };
-        let first = pool.acquire(&request, &image)?;
-        let peer = pool.acquire(&request, &image)?;
+        let pool = RuntimePool::new(4)?;
+        let key = RuntimeKey::resolve(dir.path(), None, &[], true)?;
+        let first = pool.acquire(key.clone(), &image)?;
+        let peer = pool.acquire(key.clone(), &image)?;
         assert_eq!(first.pid, peer.pid);
         pool.retire(&first);
-        let replacement = pool.acquire(&request, &image)?;
+        let replacement = pool.acquire(key.clone(), &image)?;
         assert_ne!(replacement.pid, first.pid);
         // Late notifications from a failed session only refer to its generation.
         pool.retire(&first);
-        assert_eq!(pool.acquire(&request, &image)?.pid, replacement.pid);
+        assert_eq!(pool.acquire(key.clone(), &image)?.pid, replacement.pid);
         drop(first);
         assert_eq!(unsafe { libc::kill(peer.pid as libc::pid_t, 0) }, 0);
         let old_pid = peer.pid;

@@ -170,7 +170,7 @@ fn serve_mcp_io(
     )
 }
 
-const MAX_CONCURRENT_REQUESTS: usize = 4;
+pub(crate) const MAX_CONCURRENT_REQUESTS: usize = 4;
 const MAX_QUEUED_REQUESTS: usize = 16;
 
 /// Keep wire framing separate from tool dispatch so transports can schedule a

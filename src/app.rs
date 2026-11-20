@@ -478,7 +478,9 @@ pub enum DaemonAction {
         #[arg(long)]
         runtime_fd: i32,
         #[arg(long)]
-        config_digest: String,
+        generation: String,
+        #[arg(long)]
+        max_lanes: usize,
     },
 }
 
@@ -769,17 +771,29 @@ fn manage_daemon(cli: &Cli, command: &DaemonCommand) -> Result<()> {
     match &command.action {
         DaemonAction::IndexRuntime {
             runtime_fd,
-            config_digest,
-        } => crate::daemon::runtime::serve_index(*runtime_fd, || {
+            generation,
+            max_lanes,
+        } => crate::daemon::runtime::serve_index(*runtime_fd, *max_lanes, || {
+            let root = cli
+                .root
+                .as_deref()
+                .context("missing shared index checkout")?;
+            std::env::set_current_dir(root)?;
             with_runtime(cli, |runtime| {
                 let runtime = runtime.with_jobs(0);
-                crate::daemon::runtime::verify_config(&runtime.config, config_digest)?;
+                crate::daemon::runtime::verify_generation(&runtime.config, generation)?;
                 spawn_background_watch(cli, &runtime)?;
                 Ok(crate::worktrees::Runtimes::new(runtime))
             })
         }),
         DaemonAction::Worker { runtime_fd } => {
-            let resolver = crate::daemon::runtime::SessionResolver::connect(*runtime_fd)?;
+            let resolver = crate::daemon::runtime::SessionResolver::connect(
+                *runtime_fd,
+                cli.root.as_deref().context("missing MCP checkout")?,
+                cli.db.as_deref(),
+                &cli.languages,
+                cli.no_refresh,
+            )?;
             crate::daemon::write_json_line(
                 &mut std::io::stdout(),
                 &crate::daemon::WorkerReady {
@@ -1546,8 +1560,10 @@ mod tests {
                 "index-runtime",
                 "--runtime-fd",
                 "3",
-                "--config-digest",
+                "--generation",
                 "digest",
+                "--max-lanes",
+                "4",
             ]
             .as_slice(),
             ["tsindex", "watch"].as_slice(),
@@ -1637,8 +1653,10 @@ mod tests {
                 "index-runtime",
                 "--runtime-fd",
                 "3",
-                "--config-digest",
+                "--generation",
                 "digest",
+                "--max-lanes",
+                "4",
             ]
             .as_slice(),
         ] {

@@ -91,7 +91,7 @@ surrounding whitespace, and trailing spaces are normalized.
 | regex-syntax | 0.8.10 | MIT OR Apache-2.0 | [1](#license-text-1), [10](#license-text-10), [48](#license-text-48) |
 | rsqlite-vfs | 0.2.0 | MIT | [95] |
 | rusqlite | 0.41.1 | MIT | [94] |
-| rustix | 1.1.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | [1](#license-text-1), [9](#license-text-9), [43](#license-text-43), [49](#license-text-49) |
+| rustix | 1.1.6 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | [1](#license-text-1), [9](#license-text-9), [43](#license-text-43), [49](#license-text-49) |
 | same-file | 1.0.6 | Unlicense/MIT | [3](#license-text-3), [5](#license-text-5), [50](#license-text-50) |
 | semver | 1.0.28 | MIT OR Apache-2.0 | [8](#license-text-8), [9](#license-text-9) |
 | serde | 1.0.228 | MIT OR Apache-2.0 | [8](#license-text-8), [9](#license-text-9) |
@@ -203,7 +203,7 @@ surrounding whitespace, and trailing spaces are normalized.
 - [regex 1.12.3](https://docs.rs/crate/regex/1.12.3/source/LICENSE-APACHE)
 - [regex-automata 0.4.14](https://docs.rs/crate/regex-automata/0.4.14/source/LICENSE-APACHE)
 - [regex-syntax 0.8.10](https://docs.rs/crate/regex-syntax/0.8.10/source/LICENSE-APACHE)
-- [rustix 1.1.4](https://docs.rs/crate/rustix/1.1.4/source/LICENSE-APACHE)
+- [rustix 1.1.6](https://docs.rs/crate/rustix/1.1.6/source/LICENSE-APACHE)
 - [smallvec 1.15.1](https://docs.rs/crate/smallvec/1.15.1/source/LICENSE-APACHE)
 - [tempfile 3.27.0](https://docs.rs/crate/tempfile/3.27.0/source/LICENSE-APACHE)
 - [unicode-xid 0.2.6](https://docs.rs/crate/unicode-xid/0.2.6/source/LICENSE-APACHE)
@@ -989,7 +989,7 @@ END OF TERMS AND CONDITIONS
 - [prettyplease 0.2.37](https://docs.rs/crate/prettyplease/0.2.37/source/LICENSE-MIT)
 - [proc-macro2 1.0.106](https://docs.rs/crate/proc-macro2/1.0.106/source/LICENSE-MIT)
 - [quote 1.0.45](https://docs.rs/crate/quote/1.0.45/source/LICENSE-MIT)
-- [rustix 1.1.4](https://docs.rs/crate/rustix/1.1.4/source/LICENSE-MIT)
+- [rustix 1.1.6](https://docs.rs/crate/rustix/1.1.6/source/LICENSE-MIT)
 - [semver 1.0.28](https://docs.rs/crate/semver/1.0.28/source/LICENSE-MIT)
 - [serde 1.0.228](https://docs.rs/crate/serde/1.0.228/source/LICENSE-MIT)
 - [serde_core 1.0.228](https://docs.rs/crate/serde_core/1.0.228/source/LICENSE-MIT)
@@ -2701,7 +2701,7 @@ at your option.
 ## License text 43
 
 - [linux-raw-sys 0.12.1](https://docs.rs/crate/linux-raw-sys/0.12.1/source/LICENSE-Apache-2.0_WITH_LLVM-exception)
-- [rustix 1.1.4](https://docs.rs/crate/rustix/1.1.4/source/LICENSE-Apache-2.0_WITH_LLVM-exception)
+- [rustix 1.1.6](https://docs.rs/crate/rustix/1.1.6/source/LICENSE-Apache-2.0_WITH_LLVM-exception)
 - [wasi 0.11.1+wasi-snapshot-preview1](https://docs.rs/crate/wasi/0.11.1+wasi-snapshot-preview1/source/LICENSE-Apache-2.0_WITH_LLVM-exception)
 - [wasip2 1.0.3+wasi-0.2.9](https://docs.rs/crate/wasip2/1.0.3+wasi-0.2.9/source/LICENSE-Apache-2.0_WITH_LLVM-exception)
 - [wasip3 0.4.0+wasi-0.3.0-rc-2026-01-06](https://github.com/bytecodealliance/wasi-rs/blob/06ce201370fcde0d1b0d47cac8ecb1b0b312c9f9/LICENSE-Apache-2.0_WITH_LLVM-exception)
@@ -3191,7 +3191,7 @@ written authorization of the copyright holder.
 
 ## License text 49
 
-- [rustix 1.1.4](https://docs.rs/crate/rustix/1.1.4/source/COPYRIGHT)
+- [rustix 1.1.6](https://docs.rs/crate/rustix/1.1.6/source/COPYRIGHT)
 
 ````text
 Short version for non-lawyers:

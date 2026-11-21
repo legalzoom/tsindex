@@ -3,6 +3,9 @@
 //! goes through the library API, so these are the only checks that arg
 //! parsing, stdout hygiene, and transport wiring actually work.
 
+#[cfg(unix)]
+mod common;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -150,6 +153,7 @@ fn cli_init_build_symbol_round_trip() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 #[test]
 fn mcp_stdio_emits_only_json_rpc_lines() -> Result<()> {
     let dir = tempdir()?;
@@ -235,20 +239,24 @@ fn mcp_exits_when_stdout_closes_even_if_the_parent_keeps_stdin_open() -> Result<
             let _ = self.0.wait();
         }
     }
+    let daemon = common::TestDaemon::start()?;
     let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/transport-fixtures");
     fs::create_dir_all(&artifacts)?;
     let dir = tempfile::tempdir_in(artifacts)?;
     fixture(dir.path())?;
     let mut server = Server(
         Command::new(BIN)
+            .arg("--socket")
+            .arg(&daemon.socket)
             .arg("--root")
             .arg(dir.path())
-            .args(["--no-refresh", "serve", "--mcp"])
+            .args(["--no-refresh", "serve", "--mcp", "--via-daemon"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()?,
     );
+    daemon.wait_active_sessions(1, Duration::from_secs(5))?;
     drop(server.0.stdout.take());
     let input = server.0.stdin.as_mut().unwrap();
     writeln!(input, r#"{{"jsonrpc":"2.0","id":1,"method":"ping"}}"#)?;
@@ -271,6 +279,494 @@ fn mcp_exits_when_stdout_closes_even_if_the_parent_keeps_stdin_open() -> Result<
         !status.unwrap().success(),
         "a broken output pipe is an I/O error"
     );
+    daemon.wait_active_sessions(0, Duration::from_secs(5))?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_proxy_reports_clean_daemon_stop_and_restart() -> Result<()> {
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    struct Proxy(std::process::Child);
+    impl Drop for Proxy {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    struct Endpoint(std::path::PathBuf);
+    impl Drop for Endpoint {
+        fn drop(&mut self) {
+            let _ = Command::new(BIN)
+                .arg("--socket")
+                .arg(&self.0)
+                .args(["daemon", "stop"])
+                .output();
+        }
+    }
+
+    for action in ["stop", "restart"] {
+        let daemon = common::TestDaemon::start()?;
+        let _endpoint = Endpoint(daemon.socket.clone());
+        let dir = tempdir()?;
+        fixture(dir.path())?;
+        let mut proxy = Proxy(
+            Command::new(BIN)
+                .arg("--socket")
+                .arg(&daemon.socket)
+                .arg("--root")
+                .arg(dir.path())
+                .args(["--no-refresh", "serve", "--mcp", "--via-daemon"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()?,
+        );
+        writeln!(
+            proxy.0.stdin.as_mut().unwrap(),
+            "{}",
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping"})
+        )?;
+        let stdout = proxy.0.stdout.take().unwrap();
+        let (sent, received) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut line = String::new();
+            let _ = sent.send(BufReader::new(stdout).read_line(&mut line).map(|_| line));
+        });
+        let response = received.recv_timeout(Duration::from_secs(5))??;
+        let response: Value = serde_json::from_str(&response)?;
+        assert!(response.get("result").is_some(), "{response}");
+        let command = Command::new(BIN)
+            .arg("--socket")
+            .arg(&daemon.socket)
+            .args(["daemon", action])
+            .output()?;
+        assert!(
+            command.status.success(),
+            "{}",
+            String::from_utf8_lossy(&command.stderr)
+        );
+        // The subscribed outcome arrives during shutdown, with no new control
+        // connection and no request timeout after the command completes.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            if let Some(status) = proxy.0.try_wait()? {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "proxy waited after daemon {action}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert!(status.success(), "clean daemon {action} failed the proxy");
+        reader.join().unwrap();
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn detached_daemon_releases_inherited_launcher_descriptors() -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir_in("/tmp")?;
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+    let socket = dir.path().join("d.sock");
+    let launcher = || {
+        let mut command = Command::new(BIN);
+        command
+            .arg("--socket")
+            .arg(&socket)
+            .env("HOME", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path());
+        command
+    };
+    let (mut observer, endpoint) = UnixStream::pair()?;
+    let fd = endpoint.as_raw_fd();
+    let mut start = launcher();
+    start.args(["daemon", "start"]);
+    // Only this test launcher inherits the descriptor. A long-lived detached
+    // daemon retaining it would keep the observer from seeing EOF.
+    unsafe {
+        start.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let started = start.output()?;
+    drop(endpoint);
+    // Capture the result before asserting so even a regression stops the daemon.
+    observer.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let disconnected = observer.read(&mut [0]);
+    let stopped = launcher().args(["daemon", "stop"]).output()?;
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert_eq!(disconnected?, 0);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_proxy_drains_buffered_responses_after_normal_input_eof() -> Result<()> {
+    use std::collections::HashSet;
+    use std::os::fd::AsRawFd;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    struct Proxy(std::process::Child);
+    impl Drop for Proxy {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let daemon = common::TestDaemon::start()?;
+    let dir = tempdir()?;
+    fixture(dir.path())?;
+    let mut proxy = Proxy(
+        Command::new(BIN)
+            .arg("--socket")
+            .arg(&daemon.socket)
+            .arg("--root")
+            .arg(dir.path())
+            .args(["--no-refresh", "serve", "--mcp", "--via-daemon"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    let fd = proxy.0.stdout.as_ref().unwrap().as_raw_fd();
+    assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, 4096) }, 4096);
+    daemon.wait_active_sessions(1, Duration::from_secs(5))?;
+    {
+        let mut stdin = proxy.0.stdin.take().unwrap();
+        for id in 0..500 {
+            writeln!(
+                stdin,
+                "{}",
+                serde_json::json!({"jsonrpc":"2.0","id":id,"method":"ping"})
+            )?;
+        }
+    }
+    // Keep stdout unread until the worker has exited and the daemon has reaped
+    // it. Its final socket hangup must preserve the already-buffered responses.
+    daemon.wait_active_sessions(0, Duration::from_secs(8))?;
+    let stdout = proxy.0.stdout.take().unwrap();
+    let (sent, received) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let lines: std::io::Result<Vec<String>> = BufReader::new(stdout).lines().collect();
+        let _ = sent.send(lines);
+    });
+    let lines = received.recv_timeout(Duration::from_secs(6))??;
+    let ids: HashSet<u64> = lines
+        .iter()
+        .map(|line| {
+            let response: Value = serde_json::from_str(line).unwrap();
+            assert!(response.get("result").is_some(), "{response}");
+            response["id"].as_u64().unwrap()
+        })
+        .collect();
+    assert_eq!(lines.len(), 500);
+    assert_eq!(ids, (0..500).collect());
+    let deadline = Instant::now() + Duration::from_secs(6);
+    let status = loop {
+        if let Some(status) = proxy.0.try_wait()? {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "proxy did not finish its normal drain"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success());
+    reader.join().unwrap();
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_proxy_reports_worker_crash_after_readiness() -> Result<()> {
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    struct Proxy(std::process::Child);
+    impl Drop for Proxy {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    for close_input in [false, true] {
+        let daemon = common::TestDaemon::start()?;
+        let dir = tempdir()?;
+        fixture(dir.path())?;
+        let mut proxy = Proxy(
+            Command::new(BIN)
+                .arg("--socket")
+                .arg(&daemon.socket)
+                .arg("--root")
+                .arg(dir.path())
+                .args(["--no-refresh", "serve", "--mcp", "--via-daemon"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()?,
+        );
+        writeln!(
+            proxy.0.stdin.as_mut().unwrap(),
+            "{}",
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping"})
+        )?;
+        let stdout = proxy.0.stdout.take().unwrap();
+        let (sent, received) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut line = String::new();
+            let _ = sent.send(BufReader::new(stdout).read_line(&mut line).map(|_| line));
+        });
+        let response = received.recv_timeout(Duration::from_secs(5))??;
+        let response: Value = serde_json::from_str(&response)?;
+        assert!(response.get("result").is_some(), "{response}");
+        let (sessions, _) = daemon.client()?.list_sessions(false)?;
+        assert_eq!(sessions.len(), 1);
+        if close_input {
+            // Stop the worker before EOF so the test can observe the drain phase
+            // deterministically, then crash it while the proxy is draining.
+            assert_eq!(
+                unsafe { libc::kill(sessions[0].worker_pid as i32, libc::SIGSTOP) },
+                0
+            );
+            drop(proxy.0.stdin.take());
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let (active, _) = daemon.client()?.list_sessions(false)?;
+                if active
+                    .iter()
+                    .any(|session| session.state == tsindex::daemon::SessionState::Draining)
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "worker did not enter drain phase"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        assert_eq!(
+            unsafe { libc::kill(sessions[0].worker_pid as i32, libc::SIGKILL) },
+            0
+        );
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let status = loop {
+            if let Some(status) = proxy.0.try_wait()? {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "proxy did not observe worker crash"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert!(!status.success(), "worker crash must fail the MCP proxy");
+        reader.join().unwrap();
+        daemon.wait_active_sessions(0, Duration::from_secs(3))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_proxy_exits_when_daemon_stops_with_stdout_full() -> Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    struct Proxy {
+        child: std::process::Child,
+        writer: Option<thread::JoinHandle<std::process::ChildStdin>>,
+    }
+    impl Drop for Proxy {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            // Killing the proxy releases a writer blocked on its stdin. Join
+            // even after an assertion fails so no fixture thread survives.
+            if let Some(writer) = self.writer.take() {
+                let _ = writer.join();
+            }
+        }
+    }
+
+    let daemon = common::TestDaemon::start()?;
+    let dir = tempdir()?;
+    fixture(dir.path())?;
+    for (limit, close_input) in [(None, false), (Some(4096), true)] {
+        let mut raw = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(raw.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: pipe2 succeeded and transfers two distinct descriptors.
+        let stdout = unsafe { OwnedFd::from_raw_fd(raw[0]) };
+        let observer = unsafe { OwnedFd::from_raw_fd(raw[1]) };
+        let inherited_flags = unsafe { libc::fcntl(observer.as_raw_fd(), libc::F_GETFL) };
+        assert!(inherited_flags >= 0);
+        if let Some(limit) = limit {
+            // The kernel rounds the requested capacity up to its page size.
+            let actual = unsafe { libc::fcntl(observer.as_raw_fd(), libc::F_SETPIPE_SZ, limit) };
+            assert!(actual >= limit, "failed to set stdout pipe capacity");
+        }
+        let mut proxy = Proxy {
+            child: Command::new(BIN)
+                .arg("--socket")
+                .arg(&daemon.socket)
+                .arg("--root")
+                .arg(dir.path())
+                .args(["--no-refresh", "serve", "--mcp", "--via-daemon"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::from(observer.try_clone()?))
+                .stderr(Stdio::null())
+                .spawn()?,
+            writer: None,
+        };
+        let mut stdin = proxy.child.stdin.take().unwrap();
+        proxy.writer = Some(thread::spawn(move || {
+            // Tool schemas fill a normal pipe without requiring a large fixture.
+            let count = if close_input { 4 } else { 1024 };
+            for id in 0..count {
+                if writeln!(
+                    stdin,
+                    "{}",
+                    serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/list"})
+                )
+                .is_err()
+                {
+                    break;
+                }
+            }
+            // The harness keeps stdin open while neglecting output. Retain its
+            // handle in the thread result until the proxy has exited.
+            stdin
+        }));
+        daemon.wait_active_sessions(1, Duration::from_secs(5))?;
+        let capacity = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETPIPE_SZ) };
+        assert!(capacity > 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                proxy.child.try_wait()?.is_none(),
+                "proxy exited before stdout backpressure"
+            );
+            let mut available: libc::c_int = 0;
+            assert_eq!(
+                unsafe { libc::ioctl(stdout.as_raw_fd(), libc::FIONREAD, &mut available) },
+                0
+            );
+            // Page fragmentation can stop writes before the byte capacity is
+            // reached. Observe readiness on a write descriptor, matching the
+            // proxy's POLLOUT wait, without adding any data to its output.
+            let mut writing = libc::pollfd {
+                fd: observer.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut writing, 1, 0) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error.into());
+            }
+            assert_eq!(
+                writing.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL),
+                0
+            );
+            if available > 0 && ready == 0 {
+                eprintln!("stdout backpressured with {available}/{capacity} bytes queued");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "proxy did not encounter stdout backpressure ({available}/{capacity} bytes): {}",
+                daemon.read_log()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            unsafe { libc::fcntl(observer.as_raw_fd(), libc::F_GETFL) },
+            inherited_flags,
+            "the proxy changed the harness stdout flags"
+        );
+        let (sessions, _) = daemon.client()?.list_sessions(false)?;
+        assert_eq!(sessions.len(), 1);
+        let worker_pid = sessions[0].worker_pid;
+        assert!(worker_pid > 1);
+        if close_input {
+            // Hold this worker across EOF so the daemon reports an explicit stop
+            // during the drain. Normal EOF may otherwise complete first.
+            assert_eq!(unsafe { libc::kill(worker_pid as i32, libc::SIGSTOP) }, 0);
+            drop(proxy.writer.take().unwrap().join().unwrap());
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let (sessions, _) = daemon.client()?.list_sessions(false)?;
+                if sessions
+                    .iter()
+                    .any(|s| s.state == tsindex::daemon::SessionState::Draining)
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the half-close never reached the daemon"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        daemon.client()?.kill_all()?;
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while proxy.child.try_wait()?.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "full stdout prevented proxy teardown"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        if let Some(writer) = proxy.writer.take() {
+            writer.join().unwrap();
+        }
+        assert_eq!(
+            unsafe { libc::fcntl(observer.as_raw_fd(), libc::F_GETFL) },
+            inherited_flags
+        );
+        daemon.wait_active_sessions(0, Duration::from_secs(3))?;
+        assert_eq!(unsafe { libc::kill(worker_pid as i32, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "worker was not reaped"
+        );
+    }
     Ok(())
 }
 

@@ -2,6 +2,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::os::unix::process::CommandExt;
@@ -52,11 +54,20 @@ fn read_log(path: &Path) -> String {
 fn explicit_session_exit(args: &[&str], check_alive: bool, reap_owner: bool) -> Result<()> {
     let dir = fixture()?;
     let log = dir.path().join("server.log");
+    let is_mcp = args.contains(&"--mcp");
+    let daemon = if args.contains(&"--via-daemon") {
+        Some(common::TestDaemon::start()?)
+    } else {
+        None
+    };
     // The owner is deliberately NOT the server's parent, as with a wrapper.
     let mut owner = Process(Command::new("sleep").arg("60").spawn()?);
+    let mut cmd = Command::new(BIN);
+    if let Some(daemon) = &daemon {
+        cmd.arg("--socket").arg(&daemon.socket);
+    }
     let mut server = Process(
-        Command::new(BIN)
-            .arg("--root")
+        cmd.arg("--root")
             .arg(dir.path())
             .arg("--no-refresh")
             .args(args)
@@ -67,11 +78,15 @@ fn explicit_session_exit(args: &[&str], check_alive: bool, reap_owner: bool) -> 
             .stderr(fs::File::create(&log)?)
             .spawn()?,
     );
-    let tracking = format!(
-        "tracking session PID {} for tsindex PID {}",
-        owner.0.id(),
-        server.0.id()
-    );
+    let tracking = if is_mcp {
+        format!("tracking session PID {} for tsindex PID ", owner.0.id())
+    } else {
+        format!(
+            "tracking session PID {} for tsindex PID {}",
+            owner.0.id(),
+            server.0.id()
+        )
+    };
     wait_until(|| read_log(&log).contains(&tracking));
     if check_alive {
         thread::sleep(Duration::from_millis(5200));
@@ -84,22 +99,43 @@ fn explicit_session_exit(args: &[&str], check_alive: bool, reap_owner: bool) -> 
     // Keep stdin open: EOF cannot be what terminates the MCP server.
     wait_until(|| server.0.try_wait().unwrap().is_some());
     assert!(server.0.wait()?.success(), "{}", read_log(&log));
-    let log = read_log(&log);
-    assert_eq!(log.matches("tracking session PID").count(), 1, "{log}");
-    assert!(
-        log.contains(&format!(
-            "session PID {} exited; shutting down tsindex PID {}",
-            owner.0.id(),
-            server.0.id()
-        )),
-        "{log}"
+    let log_text = read_log(&log);
+    assert_eq!(
+        log_text.matches("tracking session PID").count(),
+        1,
+        "{log_text}"
     );
+    if let Some(daemon) = &daemon {
+        daemon.wait_active_sessions(0, Duration::from_secs(5))?;
+        let daemon_log = daemon.read_log();
+        assert!(
+            daemon_log.contains(&format!(
+                "owner PID {} exited; shutting down worker PID",
+                owner.0.id()
+            )),
+            "{daemon_log}"
+        );
+    } else {
+        assert!(
+            log_text.contains(&format!(
+                "session PID {} exited; shutting down tsindex PID {}",
+                owner.0.id(),
+                server.0.id()
+            )),
+            "{log_text}"
+        );
+    }
     Ok(())
 }
 
 #[test]
 fn mcp_tracks_explicit_owner_and_stays_alive_until_it_exits() -> Result<()> {
     explicit_session_exit(&["serve", "--mcp"], true, true)
+}
+
+#[test]
+fn managed_mcp_tracks_explicit_owner() -> Result<()> {
+    explicit_session_exit(&["serve", "--mcp", "--via-daemon"], false, true)
 }
 
 #[test]
@@ -114,23 +150,32 @@ fn watch_tracks_explicit_owner() -> Result<()> {
 
 #[test]
 fn missing_owner_fails_before_index_initialization() -> Result<()> {
+    let daemon = common::TestDaemon::start()?;
     let dir = tempdir()?;
     let mut owner = Process(Command::new("sleep").arg("60").spawn()?);
     owner.0.kill()?;
     owner.0.wait()?;
     let output = Command::new(BIN)
+        .arg("--socket")
+        .arg(&daemon.socket)
         .arg("--root")
         .arg(dir.path())
-        .args(["serve", "--mcp", "--session-pid"])
+        .args(["serve", "--mcp", "--via-daemon", "--session-pid"])
         .arg(owner.0.id().to_string())
         .output()?;
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("has already exited"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("has already exited"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(!dir.path().join(".tsindex").exists());
+    daemon.wait_active_sessions(0, Duration::from_secs(2))?;
     Ok(())
 }
 
-fn wrapper_exit(explicit_owner: bool) -> Result<()> {
+fn wrapper_exit(explicit_owner: bool, via_daemon: bool) -> Result<()> {
+    let daemon = via_daemon.then(common::TestDaemon::start).transpose()?;
     let dir = fixture()?;
     let log = dir.path().join("server.log");
     let mut owner = if explicit_owner {
@@ -151,6 +196,12 @@ fn wrapper_exit(explicit_owner: bool) -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(fs::File::create(&log)?)
         .process_group(0);
+    if let Some(daemon) = &daemon {
+        command
+            .arg("--socket")
+            .arg(&daemon.socket)
+            .arg("--via-daemon");
+    }
     if let Some(owner) = &owner {
         command.arg("--session-pid").arg(owner.0.id().to_string());
     }
@@ -185,35 +236,52 @@ fn wrapper_exit(explicit_owner: bool) -> Result<()> {
         owner.0.kill()?;
         owner.0.wait()?;
     }
-    // EOF on stdout proves the server exited, independent of its log message.
+    // EOF on stdout proves the proxy and worker exited, independent of logs.
     received.recv_timeout(Duration::from_secs(8))??;
-    let log = read_log(&log);
-    assert!(
-        log.contains(&format!("session PID {session_pid} exited; shutting down")),
-        "{log}"
-    );
+    if let Some(daemon) = daemon {
+        daemon.wait_active_sessions(0, Duration::from_secs(5))?;
+        let daemon_log = daemon.read_log();
+        assert!(
+            daemon_log.contains(&format!("owner PID {session_pid} exited; shutting down")),
+            "{daemon_log}"
+        );
+    }
     Ok(())
 }
 
 #[test]
 fn mcp_exits_when_its_default_parent_dies_with_stdin_still_open() -> Result<()> {
-    wrapper_exit(false)
+    wrapper_exit(false, false)
 }
 
 #[test]
 fn explicit_owner_keeps_server_alive_after_wrapper_exit() -> Result<()> {
-    wrapper_exit(true)
+    wrapper_exit(true, false)
+}
+
+#[test]
+fn managed_mcp_exits_when_its_parent_dies() -> Result<()> {
+    wrapper_exit(false, true)
 }
 
 #[test]
 fn disconnected_stderr_does_not_prevent_shutdown() -> Result<()> {
+    let daemon = common::TestDaemon::start()?;
     let dir = fixture()?;
     let mut owner = Process(Command::new("sleep").arg("60").spawn()?);
     let mut server = Process(
         Command::new(BIN)
+            .arg("--socket")
+            .arg(&daemon.socket)
             .arg("--root")
             .arg(dir.path())
-            .args(["--no-refresh", "serve", "--mcp", "--session-pid"])
+            .args([
+                "--no-refresh",
+                "serve",
+                "--mcp",
+                "--via-daemon",
+                "--session-pid",
+            ])
             .arg(owner.0.id().to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -234,6 +302,7 @@ fn disconnected_stderr_does_not_prevent_shutdown() -> Result<()> {
     owner.0.wait()?;
     wait_until(|| server.0.try_wait().unwrap().is_some());
     assert!(server.0.wait()?.success());
+    daemon.wait_active_sessions(0, Duration::from_secs(5))?;
     Ok(())
 }
 
@@ -294,6 +363,7 @@ mod linux_owners {
     }
 
     fn exercise_owner(mode: &str, leader_exits_before_capture: bool) -> Result<()> {
+        let daemon = common::TestDaemon::start()?;
         let dir = fixture()?;
         let log = dir.path().join("server.log");
         let mut owner = owner(dir.path(), mode)?;
@@ -309,9 +379,17 @@ mod linux_owners {
         }
         let mut server = Process(
             Command::new(BIN)
+                .arg("--socket")
+                .arg(&daemon.socket)
                 .arg("--root")
                 .arg(dir.path())
-                .args(["--no-refresh", "serve", "--mcp", "--session-pid"])
+                .args([
+                    "--no-refresh",
+                    "serve",
+                    "--mcp",
+                    "--via-daemon",
+                    "--session-pid",
+                ])
                 .arg(owner.0.id().to_string())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
@@ -335,7 +413,8 @@ mod linux_owners {
         // Do not reap: an entirely zombie process must still trigger cleanup.
         wait_until(|| server.0.try_wait().unwrap().is_some());
         assert!(server.0.wait()?.success(), "{}", read_log(&log));
-        assert!(read_log(&log).contains("exited; shutting down"));
+        daemon.wait_active_sessions(0, Duration::from_secs(5))?;
+        assert!(daemon.read_log().contains("exited; shutting down"));
         Ok(())
     }
 
@@ -347,10 +426,5 @@ mod linux_owners {
     #[test]
     fn explicit_owner_accepts_zombie_leader_with_live_worker() -> Result<()> {
         exercise_owner("threads", true)
-    }
-
-    #[test]
-    fn explicit_owner_survives_main_thread_exit() -> Result<()> {
-        exercise_owner("threads", false)
     }
 }

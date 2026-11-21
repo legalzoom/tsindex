@@ -339,7 +339,9 @@ tsindex --root /path/to/main worktrees --json
 - `query`: Runs a raw tree-sitter query for one or more languages.
 - `worktrees`: Lists checkout names, paths, index status, and last update times.
 - `repos`: Lists, adds, and removes repos in the catalog.
-- `serve`: Starts the MCP or HTTP server.
+- `serve` runs an MCP stdio server or the HTTP server.
+  `--mcp --via-daemon` opts into the shared user daemon.
+- `daemon`: Installs, starts, stops, inspects, and manages the login-started orchestrator daemon and its active sessions.
 
 You can inspect per-command help with:
 
@@ -365,6 +367,9 @@ tsindex query '(function_definition name: (identifier) @fn)' --language python -
 
 - `--root`: Workspace root to index or query.
 - `--db`: Override the SQLite database path.
+- `--socket` overrides the orchestrator daemon Unix socket path. Defaults are
+  `$TSINDEX_SOCKET`, `$TSINDEX_HOME/run/daemon.sock`, or the platform runtime
+  socket.
 - `--languages <lang>`: Restrict work to one or more explicit languages
   (repeatable). `query` accepts either `--language <lang>` or repeated
   `--languages <lang>` options to query several grammars.
@@ -374,43 +379,200 @@ tsindex query '(function_definition name: (identifier) @fn)' --language python -
 
 Several query commands also support `--repo` to restrict results to one configured repo.
 
-## MCP server
+## MCP servers and the shared daemon
 
-Start the MCP server on stdio:
+The default MCP command runs inside the environment that launches it. Use it
+when a harness launches tools inside a filesystem sandbox or container.
 
 ```bash
 tsindex --root /path/to/repo serve --mcp
 ```
 
-The MCP server runs a session lifecycle handler on a dedicated thread. It
-records the owning session PID and tsindex PID in stderr and checks the owner
-every **5 seconds**, exiting when that process ends. The handler starts before
-index initialization and ends with tsindex; it needs no separate daemon or PID
-file. By default, the owner is tsindex's immediate parent (normally Codex,
-Claude, or another MCP client). Launches directly under PID 1 keep running
-without inferred ownership.
-
-When a wrapper launches the server, pass the actual session process PID:
+The process inherits the launcher's filesystem permissions, mount view, and
+kernel restrictions. It coordinates indexes and watchers through the existing
+file leases and exits when its owning harness ends. A wrapper can identify the
+actual owner explicitly.
 
 ```bash
 tsindex --root /path/to/repo serve --mcp --session-pid 12345
 ```
 
-Use the live Codex/Claude/etc. process PID in place of `12345`. Explicit
-ownership survives wrapper exit and also works with `serve --http` and `watch`.
-HTTP remains independent unless `--session-pid` is supplied; `watch
---exit-with-parent` monitors its immediate parent. The watcher's `--session-pid`
-replaces parent monitoring and cannot be combined with `--exit-with-parent`.
+Some harnesses launch MCP servers outside their shell sandbox. Configure the
+MCP executable itself through the harness's sandbox launcher in that case.
+Grant the server the source trees, index databases, and cache locations that
+it needs. An allowed database may already contain source snippets, including
+snippets from other repositories in a catalog.
 
-On macOS and Linux, the handler also checks process start time to detect PID
-reuse and treats fully exited zombie processes as ended. On Linux, an exited
-main thread does not end ownership while worker threads remain alive, and
-process names need not be valid UTF-8. If the inferred parent cannot be
-inspected, the handler falls back to parent-PID-only tracking, without PID-reuse
-or zombie checks. An explicit owner must exist and allow process inspection or
-startup fails; this includes PID 1 when inspection is denied. A later permission
-or inspection error does not count as an exit. Normal MCP stdin EOF still stops
-the server promptly.
+On Linux, this bubblewrap example exposes runtime libraries, the executable,
+and one writable workspace. Use absolute paths for both variables. The empty
+mount namespace keeps the login daemon's socket and the rest of the home
+directory outside the server's view. Its separate network namespace also
+blocks access to host loopback services. The example requires bubblewrap with
+unprivileged user, PID, and network namespaces available.
+
+```bash
+workspace="/absolute/path/to/repo"
+tsindex_binary="$(command -v tsindex)"
+bwrap --unshare-user --unshare-pid --unshare-net \
+  --die-with-parent --new-session \
+  --ro-bind /usr /usr --ro-bind /bin /bin \
+  --ro-bind /lib /lib --ro-bind-try /lib64 /lib64 \
+  --proc /proc --dev /dev --tmpfs /tmp \
+  --bind "$workspace" /workspace \
+  --ro-bind "$tsindex_binary" /tsindex \
+  --chdir /workspace --setenv HOME /workspace/.tsindex/home \
+  --setenv TSINDEX_HOME /workspace/.tsindex/home \
+  /tsindex --root /workspace serve --mcp
+```
+
+`TSINDEX_REQUIRE_SANDBOX=1 cargo test --locked --test sandbox` exercises this
+boundary and fails if the sandbox runtime is unavailable.
+
+Keep a shared daemon socket outside the mount view of untrusted harnesses.
+Access to that socket grants the daemon's user authority, including source
+reads and `replace_symbol` writes. Incoming clients must authenticate as the
+daemon's user. Server connections verify kernel credentials and require an
+owned socket leaf in a private user directory. Neither the leaf nor its
+immediate parent directory may be a symlink. On macOS, clients also accept the
+trusted UID 0 creator cached for a launchd listener after it is handed to the
+user daemon. The kernel sandbox applies to the process launched inside it.
+
+### Trusted sessions through the daemon
+
+For trusted MCP clients, opt into a shared user orchestrator on macOS or Linux.
+
+```bash
+tsindex daemon install
+tsindex --root /path/to/repo serve --mcp --via-daemon
+```
+
+The login service manager owns the private Unix socket and starts the
+orchestrator on demand. It uses launchd on macOS and a systemd user socket on
+Linux. The orchestrator starts with no index or watcher. The first connection
+opens an indexing process that owns the checkout's watcher, refresh
+coordination, and warm linked-checkout cache. Other connections with the same
+checkout, database selection, language filters, refresh mode, and effective
+configuration reuse that process. Different checkouts get separate index owners.
+
+Each connection has its own MCP worker, request IDs, pending edits, output, and
+exit status. Killing or closing one session leaves its peers usable. During
+startup, this cancellable worker resolves the checkout settings and computes
+the index-owner key. The daemon supplies the matching owner's private channel,
+and the worker waits for initialization before announcing readiness. A slow
+configuration read therefore remains visible as a starting session that can
+be inspected or stopped.
+
+Each session reuses up to four private lookup connections to its index owner.
+The owner acknowledges a new connection through an independent intake loop,
+then serves its lookups in order. A timeout after acceptance drops that lookup
+connection while the session and index owner continue. Its unfinished work
+still occupies that session's lookup capacity until it returns. Other sessions
+can continue using their own connections. An owner that fails to acknowledge a
+new connection is retired for future attachments while existing peers retain
+their generation. If an owner has never served a session after four minutes,
+the next attachment starts a new generation. Existing attempts can finish.
+
+After the last session closes, the daemon keeps the index warm for 60 seconds
+and retains at most four idle index owners. Set `TSINDEX_RUNTIME_IDLE_SECS` in
+the daemon's environment to change that interval. A value of zero releases
+unused owners on the next sweep. Losing an index owner ends its attached
+sessions, and reconnecting starts a fresh owner. A new attachment that finds a
+stopped owner requests its termination and starts a replacement. The old
+sessions end when their owner exits. Linked checkouts reload their own
+configuration during reconciliation. `daemon sessions` shows both worker and
+index-runtime PIDs, so clients can verify which index owner they share.
+
+`tsindex daemon status` reports the effective session maximum. Capacity derives
+from the launcher's inherited soft descriptor limit and `TSINDEX_MAX_SESSIONS`
+(default 128). The budget covers bootstrap descriptor pairs, worker launches,
+four idle index owners, one replacement owner, and lifecycle commands. Owners
+awaiting exit continue occupying their slots until reaped. A full daemon can
+still report status and stop sessions.
+
+Measured Linux foreground starts with ordinary stdio and a private socket
+admitted 8 sessions at a soft descriptor limit of 256 and 39 at a limit of
+1024. Existing open descriptors affect these figures. Choose a launch limit
+within the operating system's hard limit to provide the required capacity,
+then restart the daemon and inspect its reported maximum.
+
+Installation and service startup validate the reserved socket's ownership and
+file type. Linux also checks before each socket-unit bind.
+
+```bash
+tsindex daemon start          # activate the installed service or start manually
+tsindex daemon status         # show service, socket, and active session count
+tsindex daemon sessions       # list active sessions
+tsindex daemon sessions --all # include recent sessions
+tsindex daemon sessions --id <id> # fetch one session and recent worker stderr
+tsindex daemon kill <id>      # terminate one session (--all for every session)
+tsindex daemon restart        # replace the supervisor and end its sessions
+tsindex daemon stop           # stop accepting sessions and tear down workers
+tsindex daemon uninstall      # stop and remove the login service
+```
+
+`$TSINDEX_HOME/run/daemon.sock` overrides the platform runtime location.
+`--socket` and `$TSINDEX_SOCKET` select a custom endpoint. Use a dedicated,
+private directory for it. The installed service remembers the resolved endpoint.
+Bare lifecycle and proxy commands discover it in its installation scope.
+Explicit socket selections still address the specified endpoint. There is one
+installed service per account. Its definition must be in the active user
+manager's configuration search path. On Linux, a user manager that stops at
+logout also stops the daemon. Administrators who require service across logouts
+can configure lingering for that user. [systemd loginctl manual][linger]
+
+[linger]: https://www.freedesktop.org/software/systemd/man/latest/loginctl.html
+
+Run service lifecycle commands in the manager's PID namespace with access to
+its user service domain. For a manual daemon, use the launcher's PID namespace.
+A trusted MCP client in another Linux PID namespace can use
+`serve --mcp --via-daemon` when its harness grants access to the socket.
+
+Harnesses that share a confinement policy can run a separate foreground
+`tsindex daemon run` inside that policy, with a dedicated private socket and
+index/cache locations. A private Linux daemon needs a procfs mounted for its
+own PID namespace to identify its executable and supervised processes.
+Point those harnesses at that socket with
+`--socket /private/path/daemon.sock` and `serve --mcp --via-daemon`. Keep
+the user's broader login-daemon socket outside the sandbox. Use direct MCP when
+the harness only launches one server or restricts local socket access.
+
+Managed startup acknowledges a session after its worker initializes. A
+dedicated outcome connection carries its final status through daemon stop and
+restart, while the MCP socket carries protocol messages. Worker
+startup errors reach the client's stderr and produce a failing exit status.
+For socket-backed MCP stdout, use a connected stream socket. On macOS, a
+message-oriented socket such as a datagram socket must already be nonblocking.
+The proxy preserves the launcher's descriptor flags.
+
+Normal stdin EOF drains accepted requests. Explicit termination uses a bounded
+shutdown deadline independently of worker pipe progress, then terminates and
+reaps the worker. Linux and manual foreground daemons also clear its owned
+process group. Socket-activated macOS workers remain in launchd's job group
+for cleanup on daemon failure, with direct child termination per session.
+Current MCP workers run their operations in-process. A helper that creates a
+new process group can escape per-session group cleanup, so future helpers on
+all platforms require explicit containment. Linux service-wide stops retain
+the cgroup backstop. Manual daemons rely on their own process supervision.
+Session summaries are paginated. Worker diagnostics retain up to 16 KiB per
+session. Managed MCP frames have a
+16 MiB byte limit, and worker initialization has a 120-second deadline. A
+managed proxy closes a stream after 30 seconds without write progress, and
+detects daemon hangup while stdout is blocked.
+
+Direct MCP, managed MCP, `serve --http --session-pid`, and
+`watch --session-pid` check owner process identity. Linux inspects process
+start time to distinguish PID reuse and an exited zombie process from a leader
+with surviving threads. A managed proxy in another Linux PID namespace can
+use its inferred owner. An explicit `--session-pid` needs a PID from the same
+namespace as the daemon. Use direct MCP for an explicit sandbox-local PID.
+`watch --exit-with-parent` tracks its immediate parent.
+
+A session here means one MCP connection. A host can keep that connection and
+owner process alive across several conversations. Ending a conversation alone
+then leaves the connection active. The host can close its transport or an
+operator can terminate the session by ID. Compatible protocol versions keep
+working across package upgrades. Restart the daemon when its control protocol
+changes. A deliberate restart ends all its current connections.
 
 The server exposes five read tools:
 
@@ -692,5 +854,6 @@ tsindex is available under either the [MIT license](LICENSE-MIT) or the
 - [src/app.rs](./src/app.rs): CLI definition and command dispatch
 - [src/index.rs](./src/index.rs): indexing, SQLite schema, and query API
 - [src/lang.rs](./src/lang.rs): language registry and tree-sitter queries
+- [src/daemon/](./src/daemon/mod.rs): orchestrator daemon, stdio MCP proxy, and macOS/Linux login services
 - [src/mcp.rs](./src/mcp.rs): MCP and HTTP serving layer
 - [tests/integration.rs](./tests/integration.rs): fixture-based integration tests

@@ -919,7 +919,9 @@ fn proxy_half_close_waits_for_a_slow_accepted_call() -> Result<()> {
     let dir = tempdir_in("/tmp")?;
     build_fixture(dir.path(), "lib.py", "def target():\n    return 1\n")?;
     let mut proxy = McpSession::connect(&daemon.socket, dir.path(), "slow-request")?;
-    let pid = daemon.client()?.list_sessions(false)?.0[0].worker_pid;
+    let client = daemon.client()?;
+    let session = client.list_sessions(false)?.0.remove(0);
+    let pid = session.worker_pid;
     assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
     let mut stdin = proxy.child.stdin.take().context("missing proxy stdin")?;
     writeln!(
@@ -933,7 +935,7 @@ fn proxy_half_close_waits_for_a_slow_accepted_call() -> Result<()> {
     // Wait until the daemon has actually seen EOF before starting the clock.
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        let sessions = daemon.client()?.list_sessions(false)?.0;
+        let sessions = client.list_sessions(false)?.0;
         if sessions
             .iter()
             .any(|s| s.worker_pid == pid && s.state == tsindex::daemon::SessionState::Draining)
@@ -947,15 +949,34 @@ fn proxy_half_close_waits_for_a_slow_accepted_call() -> Result<()> {
     }
     thread::sleep(Duration::from_secs(6));
     assert!(
-        daemon
-            .client()?
+        client
             .list_sessions(false)?
             .0
             .iter()
             .any(|s| s.worker_pid == pid)
     );
     assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) }, 0);
-    let response = proxy.responses.recv_timeout(Duration::from_secs(3))??;
+    let response = proxy
+        .responses
+        .recv_timeout(Duration::from_secs(3))
+        .with_context(|| {
+            use std::io::Read;
+
+            // Both the worker and its proxy can close the response stream. Preserve
+            // the daemon's account of the exit before the fixture cleans them up.
+            let status = proxy.child.try_wait();
+            let mut stderr = String::new();
+            if matches!(status, Ok(Some(_)))
+                && let Some(pipe) = proxy.child.stderr.take()
+            {
+                let _ = pipe.take(16 * 1024).read_to_string(&mut stderr);
+            }
+            format!(
+                "missing reply after worker resumed: proxy={status:?}, stderr={stderr:?}, session={:?}\n{}",
+                client.session_detail(&session.session_id),
+                daemon.read_log()
+            )
+        })??;
     let response: Value = serde_json::from_str(&response)?;
     assert_eq!(response["id"], 27);
     assert!(response.get("result").is_some());

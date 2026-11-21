@@ -1388,7 +1388,17 @@ fn run_session(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    result.map(|reason| explicit.or(status_note).unwrap_or(reason))
+    result.map(|reason| {
+        if let Some(status) = status_note {
+            // A signal sent by our own reaper is the result of a disconnect or
+            // a drain deadline. Keep the event that initiated that teardown.
+            eprintln!("tsindex: session {session_id} relay ended with {reason}, worker {status}");
+            if matches!(reason.as_str(), "client_eof" | "worker_exited") {
+                return explicit.unwrap_or(status);
+            }
+        }
+        explicit.unwrap_or(reason)
+    })
 }
 
 fn spawn_worker(
@@ -1486,12 +1496,26 @@ fn poll(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn peer_stopped_reading(stream: &UnixStream) -> io::Result<bool> {
-    // Darwin also reports HUP for a peer's write half-close on a read filter.
-    // Probe only the write filter to distinguish loss of the response reader.
     let mut write = [interest(stream.as_raw_fd(), libc::POLLOUT)];
     poll(&mut write, Some(Duration::ZERO))?;
     Ok(write[0].revents & (libc::POLLHUP | libc::POLLERR) != 0)
+}
+
+#[cfg(target_os = "macos")]
+fn peer_stopped_reading(stream: &UnixStream) -> io::Result<bool> {
+    // XNU keeps an AF_UNIX stream connected across peer SHUT_WR. A full
+    // disconnect clears the association and marks both directions closed.
+    // getpeername distinguishes those states without sending probe bytes.
+    match stream.peer_addr() {
+        Ok(_) => Ok(false),
+        Err(error) => match error.raw_os_error() {
+            Some(libc::ENOTCONN | libc::EINVAL | libc::ECONNRESET) => Ok(true),
+            Some(libc::EINTR) => Ok(false),
+            _ => Err(error),
+        },
+    }
 }
 
 fn wait_for_outcome(handle: &SessionHandle, client: &UnixStream) -> Result<SessionInfo> {
@@ -2058,7 +2082,13 @@ fn child_has_exited(pid: u32) -> io::Result<bool> {
             )
         };
         if result == 0 {
-            return Ok(unsafe { info.si_pid() } != 0);
+            // Only a terminal report for this leader may start the pipe-drain
+            // deadline. A job-control notification still belongs to a live worker.
+            return Ok(unsafe { info.si_pid() } == pid as libc::pid_t
+                && matches!(
+                    info.si_code,
+                    libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+                ));
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
@@ -2193,6 +2223,67 @@ fn signal_worker(pid: u32, signal: libc::c_int, group: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_exit_probe_ignores_job_control_and_preserves_wait_status() -> Result<()> {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "kill -STOP $$ || exit 1; read value; exit 37"])
+            .stdin(Stdio::piped())
+            .spawn()?;
+        let pid = child.id();
+        let wait_for = |option, code| -> io::Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                let rc = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid as libc::id_t,
+                        &mut info,
+                        option | libc::WNOWAIT | libc::WNOHANG,
+                    )
+                };
+                if rc == 0 && info.si_code == code {
+                    return Ok(());
+                }
+                if rc < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                }
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("waiting for child status {code}"),
+                    ));
+                }
+                thread::sleep(POLL_WAIT_STEP);
+            }
+        };
+        let observed = (|| -> Result<()> {
+            // Leave each notification pending while the supervisor probes.
+            wait_for(libc::WSTOPPED, libc::CLD_STOPPED)?;
+            anyhow::ensure!(!child_has_exited(pid)?, "stopped worker reported as exited");
+            signal_worker(pid, libc::SIGCONT, false);
+            wait_for(libc::WCONTINUED, libc::CLD_CONTINUED)?;
+            anyhow::ensure!(
+                !child_has_exited(pid)?,
+                "continued worker reported as exited"
+            );
+            drop(child.stdin.take());
+            wait_for(libc::WEXITED, libc::CLD_EXITED)?;
+            anyhow::ensure!(child_has_exited(pid)?, "terminal child status was missed");
+            Ok(())
+        })();
+        if observed.is_err() {
+            let _ = child.kill();
+        }
+        let status = child.wait()?;
+        observed?;
+        assert_eq!(status.code(), Some(37));
+        Ok(())
+    }
 
     #[test]
     fn complete_frames_use_their_own_limit_across_a_coalesced_read() -> Result<()> {
@@ -2627,6 +2718,29 @@ mod tests {
         assert!(error.contains("kernel-verified peer PID") && error.contains("serve --mcp"));
         assert_eq!(core.total_sessions_started.load(Ordering::Acquire), 0);
         assert!(core.active_sessions.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn peer_write_eof_preserves_reply_delivery_until_the_last_reader_closes() -> Result<()> {
+        let dir = tempfile::tempdir_in("/tmp")?;
+        let socket = dir.path().join("peer.sock");
+        let listener = UnixListener::bind(&socket)?;
+        let client = UnixStream::connect(&socket)?;
+        let mut remaining_reader = client.try_clone()?;
+        let (mut server, _) = listener.accept()?;
+
+        client.shutdown(Shutdown::Write)?;
+        assert_eq!(server.read(&mut [0])?, 0);
+        drop(client);
+        assert!(!peer_stopped_reading(&server)?);
+        server.write_all(b"reply")?;
+        let mut reply = [0; 5];
+        remaining_reader.read_exact(&mut reply)?;
+        assert_eq!(&reply, b"reply");
+
+        drop(remaining_reader);
+        assert!(peer_stopped_reading(&server)?);
         Ok(())
     }
 

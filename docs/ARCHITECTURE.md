@@ -340,8 +340,11 @@ The proxy receives a session acknowledgement after that record, so invalid
 configuration and worker startup failures reach stderr and exit status. It
 registers a dedicated outcome connection before relaying MCP. The supervisor
 sends the reaped worker's final status on that existing connection even during
-whole-daemon shutdown, preserving exit status through stop and restart. Raw
-newline-delimited MCP messages pass through 16 MiB relay buffers. Worker
+whole-daemon shutdown. If a full disconnect or drain deadline triggers
+termination, the session retains that cause and the daemon logs the worker
+status. An ordinary stdin EOF keeps the reply channel open until the worker
+exits and its output drains. Newline-delimited MCP messages pass through
+16 MiB relay buffers. Worker
 startup has a 120-second deadline. A stop notification wakes supervision
 independently of blocked pipes. Shutdown has a finite graceful phase followed
 by TERM/KILL and child reaping, targeting the owned worker group or the direct

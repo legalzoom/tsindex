@@ -1184,6 +1184,28 @@ fn raw_session_version(
 }
 
 #[test]
+fn full_disconnect_retains_its_cause_when_the_worker_needs_a_signal() -> Result<()> {
+    let daemon = common::TestDaemon::start()?;
+    let dir = tempdir_in("/tmp")?;
+    build_fixture(dir.path(), "lib.py", "def target(): return 1\n")?;
+    let (stream, ready) = raw_session(&daemon.socket, dir.path())?;
+    let id = ready["session_id"].as_str().context("missing session ID")?;
+    let pid = ready["worker_pid"]
+        .as_u64()
+        .and_then(|value| libc::pid_t::try_from(value).ok())
+        .filter(|pid| *pid > 1)
+        .context("missing worker PID")?;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    drop(stream);
+
+    daemon.wait_active_sessions(0, Duration::from_secs(6))?;
+    let detail = daemon.client()?.session_detail(id)?;
+    assert_eq!(detail.exit_reason.as_deref(), Some("client_disconnected"));
+    wait_pid_gone(pid as u32, Duration::from_secs(1))?;
+    Ok(())
+}
+
+#[test]
 fn killing_stopped_worker_with_full_stdin_does_not_wait_for_pipe_progress() -> Result<()> {
     let daemon = common::TestDaemon::start()?;
     let dir = tempdir_in("/tmp")?;

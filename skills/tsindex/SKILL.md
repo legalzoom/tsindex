@@ -49,12 +49,16 @@ Trusted unrestricted sessions can opt into the shared user daemon with
 `serve --mcp --via-daemon` after `tsindex daemon install`. This grants the
 session the daemon's filesystem authority, including `replace_symbol` writes.
 Compatible trusted sessions share their warm index and watcher. Each connection
-owns its pending requests and edits. Keep the daemon socket outside an
-untrusted sandbox's mounted filesystem.
+owns its pending requests and edits and reuses up to four private lookup
+connections. A timed-out accepted lookup releases that connection while other
+sessions continue. Managed startup remains inspectable until the child loads
+its settings and attaches to an initialized index owner. Use `daemon sessions`
+to inspect worker and index-owner PIDs, and `daemon status` to check effective
+capacity under the launcher's descriptor limit. Keep the daemon socket outside
+an untrusted sandbox's mounted filesystem.
 
-To keep a
-foreground watcher attached to the current shell for CLI-only sessions that
-never start `serve --mcp`, run:
+To keep a foreground watcher attached to the current shell for CLI-only
+sessions that never start `serve --mcp`, run:
 
 ```bash
 TSINDEX_START_MODE=watch bash "$skill_root/scripts/start-tsindex.sh"

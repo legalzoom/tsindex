@@ -455,21 +455,44 @@ checkout, database selection, language filters, refresh mode, and effective
 configuration reuse that process. Different checkouts get separate index owners.
 
 Each connection has its own MCP worker, request IDs, pending edits, output, and
-exit status. Killing or closing one session leaves its peers usable. After the
-last session closes, the daemon keeps the index warm for 60 seconds and retains
-at most four idle index owners. Set `TSINDEX_RUNTIME_IDLE_SECS` in the daemon's
-environment to change that interval. A value of zero releases unused owners on
-the next sweep. If an index owner crashes, its sessions end and reconnecting
-starts a fresh owner. A timed-out lookup retires that generation for future
-connections. Existing peers can finish their work. If a new connection finds
-the index process stopped by a signal, the daemon replaces it and releases its
-file leases. `daemon sessions` shows the session worker and index
-runtime PIDs, so two clients can verify what they share.
+exit status. Killing or closing one session leaves its peers usable. During
+startup, this cancellable worker resolves the checkout settings and computes
+the index-owner key. The daemon supplies the matching owner's private channel,
+and the worker waits for initialization before announcing readiness. A slow
+configuration read therefore remains visible as a starting session that can
+be inspected or stopped.
 
-`tsindex daemon status` reports the effective session maximum. The daemon caps
-`TSINDEX_MAX_SESSIONS` (default 128) against its inherited open-file limit and
-reserves descriptors for idle index owners, concurrent worker launches, and
-lifecycle commands. A full daemon can still report status and stop sessions.
+Each session reuses up to four private lookup connections to its index owner.
+The owner acknowledges a new connection through an independent intake loop,
+then serves its lookups in order. A timeout after acceptance drops that lookup
+connection while the session and index owner continue. Its unfinished work
+still occupies that session's lookup capacity until it returns. Other sessions
+can continue using their own connections. An owner that fails to acknowledge a
+new connection is retired for future attachments while existing peers retain
+their generation.
+
+After the last session closes, the daemon keeps the index warm for 60 seconds
+and retains at most four idle index owners. Set `TSINDEX_RUNTIME_IDLE_SECS` in
+the daemon's environment to change that interval. A value of zero releases
+unused owners on the next sweep. Losing an index owner ends its attached
+sessions, and reconnecting starts a fresh owner. A new attachment that finds a
+stopped owner requests its termination and starts a replacement. The old
+sessions end when their owner exits. Linked checkouts reload their own
+configuration during reconciliation. `daemon sessions` shows both worker and
+index-runtime PIDs, so clients can verify which index owner they share.
+
+`tsindex daemon status` reports the effective session maximum. Capacity derives
+from the launcher's inherited soft descriptor limit and `TSINDEX_MAX_SESSIONS`
+(default 128). The budget covers bootstrap descriptor pairs, worker launches,
+four idle index owners, one replacement owner, and lifecycle commands. Owners
+awaiting exit continue occupying their slots until reaped. A full daemon can
+still report status and stop sessions.
+
+Measured Linux foreground starts with ordinary stdio and a private socket
+admitted 8 sessions at a soft descriptor limit of 256 and 39 at a limit of
+1024. Existing open descriptors affect these figures. Choose a launch limit
+within the operating system's hard limit to provide the required capacity,
+then restart the daemon and inspect its reported maximum.
 
 Installation and service startup validate the reserved socket's ownership and
 file type. Linux also checks before each socket-unit bind.

@@ -37,21 +37,42 @@ The shared unit is a compatible checkout's indexing runtime. It owns watcher
 registration, primary freshness, and the cache of linked-checkout refreshes.
 A dedicated process per runtime gives those resources a finite lifetime.
 Process acquisition is serialized and concurrent clients can attach while the
-owner initializes. Settings changes create a new generation. File leases still
-coordinate durable state with direct MCP, CLI writers, and older installations.
+owner initializes. Settings changes select a new generation for future
+connections. File leases still coordinate durable state with direct MCP, CLI
+writers, and older installations.
+
+Startup first launches a cancellable session worker. That child computes its
+configuration key and requests a matching owner. The daemon passes a private
+channel to the worker through a bootstrap socket. The worker's first lookup
+connection waits for initialization before the worker announces readiness.
+A blocked configuration read stays inside the inspectable session child. Both
+children check their loaded settings and executable identity. Linux uses the
+mapped executable inode, and macOS uses its mapped UUID when available.
 
 Each connection has a separate MCP worker so closing a session can interrupt
-its running edits and discard its queued requests. Workers inherit a private
-runtime channel. A request carries its own reply descriptor, and MCP request
-IDs never enter the shared channel. A stopped or crashed index owner affects
-only its attached sessions. The pool retains at most four idle owners for a
-default 60 seconds to cover short reconnects. The daemon releases all index
-owners on shutdown.
+its running edits and discard its queued requests. A session reuses at most
+four private lookup connections. The owner acknowledges each new connection
+through its independent intake loop and bounds total connections to four times
+the effective session maximum. MCP request IDs stay within each worker.
+Accepted lookups that time out release their connection while unfinished work
+continues counting against that session until it returns. Other sessions and
+the index owner continue. A failed intake acknowledgement retires the owner
+for future attachments while existing peers retain their generation.
+
+Actual owner loss ends its attached sessions. A stopped owner is terminated
+and replaced on the next attachment, and its old sessions end when it exits.
+The pool retains at most four idle owners for a default 60 seconds. Exiting
+owners keep their capacity until reaped, within a pool that reserves one extra
+replacement slot. Shutdown terminates index owners and bounds its final wait.
+Linked-checkout reconciliation reloads that checkout's configuration.
 
 The supervisor reserves a session slot during startup and holds it through
-teardown. Workers acknowledge successful initialization before the client
-receives a session acknowledgement. Startup failures reach the client with a
-failing exit status and bounded diagnostics.
+teardown. Its effective session cap derives from the operator's inherited soft
+descriptor limit and the requested maximum. Admission reserves bootstrap
+pairs, idle owners, one replacement owner, and lifecycle-command capacity.
+Measured Linux foreground starts admitted 8 sessions with a soft limit of 256
+and 39 with 1024. Existing descriptors affect capacity. Status reports the
+computed maximum so operators can size launch limits within the OS hard limit.
 
 A direct stop event starts teardown independently of relay-pipe progress. Normal
 stdin EOF drains accepted requests while the proxy can receive results. A forced

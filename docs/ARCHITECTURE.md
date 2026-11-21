@@ -240,26 +240,54 @@ permissions before either side connects or creates runtime files.
 
 The orchestrator starts without opening databases or registering watchers.
 A trusted session receives an MCP worker and a lease on a shared index owner.
-The pool serializes process creation. Its key includes the canonical checkout,
-explicit database override (which disables repo pruning), normalized language
-filters, refresh policy, effective configuration digest, and executable image.
-The digest covers the projected settings of an uninitialized linked worktree
-and is checked against the settings actually loaded by the index owner.
+Startup has two stages. First, the cancellable session worker canonicalizes the
+checkout and database, loads or projects its settings, and sends its runtime
+key through its private startup pipe. The daemon supplies a matching owner's
+channel through a bootstrap socket using `SCM_RIGHTS`. The worker then opens
+its first lookup connection and waits for index initialization before sending
+its readiness acknowledgement. Checkout filesystem I/O stays in a child that
+can be inspected and stopped throughout startup.
+
+The runtime key includes the canonical checkout, explicit database override
+(which disables repo pruning), normalized language filters, refresh policy,
+effective configuration digest, and executable image. Both the session worker
+and index owner compute the digest from their own loaded settings. Linux uses
+the mapped executable's device and inode from `/proc/self/exe`. macOS uses the
+mapped executable UUID when available, falling back to executable-file metadata
+for a build without a usable UUID. A generation mismatch fails initialization
+and asks the client to reconnect.
 
 Each index owner retains one `Runtimes` registry, including its primary
-maintenance coordinator and lazy linked-checkout cache. A private inherited
-Unix socket grants access to it. A worker requests checkout resolution over
-that socket and passes a fresh reply descriptor with `SCM_RIGHTS`. Four
-resolver threads bound concurrent index lookups. The worker executes queries
-and edits locally against the resolved snapshot. Session request IDs, queues,
-outputs, and cancellation all stay local. Killing a worker stops its edits.
-Background index maintenance can finish for other clients.
+maintenance coordinator and lazy linked-checkout cache. The daemon passes the
+worker a private Unix socket for this registry. Each session establishes up to
+four reusable lookup connections by passing a private socket endpoint with
+`SCM_RIGHTS`. An independent intake loop acknowledges descriptor receipt before
+the lookup can block, then sends readiness after initialization. Each connection
+serves lookup requests sequentially, while separate connections can overlap. The
+owner bounds them to four per session and four times the effective session
+maximum in aggregate. MCP request IDs stay in the session worker.
+
+A timed-out accepted lookup drops its connection. The worker, index, and other
+sessions remain usable, and its unfinished task stays charged to the session
+until it returns. Failure to acknowledge an incoming connection marks the
+owner unresponsive and retires that generation from future attachments.
+Existing peers retain access while they have leases. Queries and edits execute
+locally in the session worker against the prepared snapshot. Killing a worker
+stops its edits. Background index maintenance can finish for other clients.
+Linked-checkout reconciliation reloads the checkout's own configuration while
+retaining its warm state between refreshes.
 
 The last connection releases its lease. At most four idle owners survive for a
-default 60 seconds. An index-owner crash ends its attached sessions, and the
-next connection starts a new process. The daemon retains and reaps each child. A
-private lifetime pipe wakes an index owner when the daemon dies. Linux also ties
-its parent-death signal to the long-lived pool thread. This keeps live sessions
+default 60 seconds. Owner loss ends its attached sessions, and the next
+connection starts a new process. A new attachment that finds a stopped owner
+requests its termination before creating a replacement. Old sessions end when
+that owner exits. Current, retired, and exiting owners share a finite pool of
+`max_sessions + 5` entries, including the idle allowance and one replacement.
+A child awaiting kernel exit still counts until reaped. Pool shutdown requests
+termination for all owners and bounds its final wait to two seconds.
+
+A private lifetime pipe wakes an index owner when the daemon dies. Linux also
+ties its parent-death signal to the long-lived pool thread. Live sessions stay
 independent of the thread that accepted the first client.
 
 The daemon reserves a session slot before launching children and rejects new
@@ -275,13 +303,24 @@ containment because a helper can leave its assigned process group. Linux's
 cgroup backstop applies to whole-service stops. Manual daemons depend on their
 own process supervision.
 
-The orchestrator admits at most 32 finite control requests or connections
-awaiting classification, retaining each permit through its response. Workers in
-`Starting` and `Active` share the `max_sessions` limit. A separate pool allows
-at most `max_sessions` outcome watchers and retains each lease through its
-terminal or error response, even after the worker leaves the registry. An
-aggregate handler limit of `32 + 2 * max_sessions` also covers completion and
-error logging. The accept loop checks shutdown between accepts.
+Admission derives from the inherited `RLIMIT_NOFILE` soft limit and the
+requested `TSINDEX_MAX_SESSIONS`. The daemon counts available descriptor
+numbers after opening its own runtime handles. The per-session budget covers
+worker pipe ends, exec-status handles, data sockets, startup/bootstrap pairs,
+wake descriptors, one index owner, and an outcome watcher. Separate reserves
+cover up to four idle owners, one replacement awaiting exit, and serialized
+index-owner startup. The launcher's hard limit bounds its permitted
+soft limit. Measured foreground Linux starts admitted 8 sessions at a soft limit
+of 256 and 39 at 1024 with ordinary stdio and a private socket. Existing open
+descriptors can change the result. Status exposes the computed maximum.
+
+The resulting control budget admits at most 32 finite requests or connections
+awaiting classification, retaining each permit through its response. Workers
+in `Starting` and `Active` share the effective session limit. A separate pool
+allows at most that many outcome watchers and retains each lease through its
+terminal or error response, even after the worker leaves the registry. The
+aggregate handler limit is the effective control budget plus twice the session
+maximum. The accept loop checks shutdown between accepts.
 
 Workers send a bounded internal readiness record after runtime initialization.
 The proxy receives a session acknowledgement after that record, so invalid

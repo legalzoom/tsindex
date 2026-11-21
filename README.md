@@ -469,7 +469,8 @@ connection while the session and index owner continue. Its unfinished work
 still occupies that session's lookup capacity until it returns. Other sessions
 can continue using their own connections. An owner that fails to acknowledge a
 new connection is retired for future attachments while existing peers retain
-their generation.
+their generation. If an owner has never served a session after four minutes,
+the next attachment starts a new generation. Existing attempts can finish.
 
 After the last session closes, the daemon keeps the index warm for 60 seconds
 and retains at most four idle index owners. Set `TSINDEX_RUNTIME_IDLE_SECS` in
@@ -528,7 +529,9 @@ A trusted MCP client in another Linux PID namespace can use
 
 Harnesses that share a confinement policy can run a separate foreground
 `tsindex daemon run` inside that policy, with a dedicated private socket and
-index/cache locations. Point those harnesses at that socket with
+index/cache locations. A private Linux daemon needs a procfs mounted for its
+own PID namespace to identify its executable and supervised processes.
+Point those harnesses at that socket with
 `--socket /private/path/daemon.sock` and `serve --mcp --via-daemon`. Keep
 the user's broader login-daemon socket outside the sandbox. Use direct MCP when
 the harness only launches one server or restricts local socket access.

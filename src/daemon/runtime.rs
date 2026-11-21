@@ -4,12 +4,12 @@
 
 use std::collections::HashMap;
 use std::io::{self, BufReader, Read, Write};
-use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -42,7 +42,7 @@ fn generation_digest(config: &TsIndexConfig) -> Result<String> {
     ))
 }
 
-fn running_image() -> io::Result<[u8; 16]> {
+fn running_image() -> Result<[u8; 16]> {
     #[cfg(target_os = "macos")]
     {
         // The kernel records the mapped Mach-O UUID even when the installation
@@ -56,7 +56,8 @@ fn running_image() -> io::Result<[u8; 16]> {
         }
     }
     #[cfg(target_os = "linux")]
-    let image = std::fs::metadata("/proc/self/exe")?;
+    let image = std::fs::metadata("/proc/self/exe")
+        .context("managed Linux sessions require /proc/self/exe in the daemon's PID namespace")?;
     #[cfg(not(target_os = "linux"))]
     let image = std::env::current_exe()?.metadata()?;
     let mut identity = [0; 16];
@@ -161,13 +162,41 @@ pub(super) fn add_settings(
 }
 
 pub(super) struct RuntimeLease {
-    pub channel: Arc<UnixStream>,
+    generation: Arc<Generation>,
     pub pid: u32,
+}
+
+impl RuntimeLease {
+    pub fn channel(&self) -> BorrowedFd<'_> {
+        self.generation.channel.as_fd()
+    }
+
+    pub fn mark_ready(&self) {
+        self.generation.ready.store(true, Ordering::Release);
+    }
+}
+
+struct Generation {
+    channel: UnixStream,
+    started: Instant,
+    ready: AtomicBool,
+}
+
+impl Generation {
+    fn accepts_new_session(&self, now: Instant) -> bool {
+        // Let a second client join a slow cold start after the first client's
+        // deadline. Repeated overlapping retries must not pin an owner that
+        // has never served anyone. A warm owner can take arbitrarily long on
+        // its accepted lookups without reaching this startup deadline.
+        let cold_expired = !self.ready.load(Ordering::Acquire)
+            && now.saturating_duration_since(self.started) >= 2 * STARTUP_IO_TIMEOUT;
+        !cold_expired && !intake_closed(&self.channel)
+    }
 }
 
 struct Entry {
     child: Child,
-    channel: Arc<UnixStream>,
+    generation: Arc<Generation>,
     idle_since: Option<Instant>,
 }
 
@@ -203,7 +232,11 @@ impl Entry {
             .context("failed to start shared index runtime")?;
         Ok(Self {
             child,
-            channel: Arc::new(channel),
+            generation: Arc::new(Generation {
+                channel,
+                started: Instant::now(),
+                ready: AtomicBool::new(false),
+            }),
             idle_since: None,
         })
     }
@@ -226,7 +259,7 @@ impl Entry {
     fn lease(&mut self) -> RuntimeLease {
         self.idle_since = None;
         RuntimeLease {
-            channel: self.channel.clone(),
+            generation: self.generation.clone(),
             pid: self.child.id(),
         }
     }
@@ -256,7 +289,7 @@ fn child_pending(child: &mut Child) -> bool {
 
 enum PoolMessage {
     Acquire(RuntimeKey, PathBuf, mpsc::SyncSender<Result<RuntimeLease>>),
-    Retire(Arc<UnixStream>),
+    Retire(Arc<Generation>),
     Stop,
 }
 
@@ -297,7 +330,9 @@ impl RuntimePool {
     pub fn retire(&self, lease: &RuntimeLease) {
         // Compare capability identities. A late failure of an old owner cannot
         // retire a replacement that happens to have the same configuration.
-        let _ = self.inbox.send(PoolMessage::Retire(lease.channel.clone()));
+        let _ = self
+            .inbox
+            .send(PoolMessage::Retire(lease.generation.clone()));
     }
 
     pub fn resident(&self) -> usize {
@@ -327,11 +362,22 @@ struct IndexOwners {
 }
 
 impl IndexOwners {
+    fn new(max_sessions: usize) -> Self {
+        Self {
+            current: HashMap::new(),
+            retiring: Vec::new(),
+            exiting: Vec::new(),
+            // A replacement may start while its predecessor awaits kernel exit.
+            max_owners: max_sessions.saturating_add(MAX_IDLE + 1),
+            max_lanes: max_sessions.saturating_mul(crate::mcp::MAX_CONCURRENT_REQUESTS),
+        }
+    }
+
     fn resident(&self) -> usize {
         self.current.len() + self.retiring.len() + self.exiting.len()
     }
 
-    fn acquire(&mut self, key: RuntimeKey, image: &Path) -> Result<RuntimeLease> {
+    fn acquire(&mut self, key: RuntimeKey, image: &Path, now: Instant) -> Result<RuntimeLease> {
         if self.current.get(&key).is_some_and(Entry::is_stopped)
             && let Some(stopped) = self.current.remove(&key)
         {
@@ -339,16 +385,15 @@ impl IndexOwners {
             // before opening the replacement without blocking unrelated owners.
             stopped.stop(&mut self.exiting);
         }
-        // Initialization failure closes the owner intake before replying to
-        // admitted clients. Route an immediate retry to a fresh process while
-        // the old one finishes delivering each private diagnostic.
+        // New clients get a fresh generation if initialization failed or
+        // never completed. Keep prior leases alive to finish their own replies.
         if self
             .current
             .get(&key)
-            .is_some_and(|e| intake_closed(&e.channel))
-            && let Some(closed) = self.current.remove(&key)
+            .is_some_and(|e| !e.generation.accepts_new_session(now))
+            && let Some(previous) = self.current.remove(&key)
         {
-            self.retiring.push(closed);
+            self.retiring.push(previous);
         }
         let at_capacity = self.resident() >= self.max_owners;
         match self.current.entry(key) {
@@ -364,19 +409,19 @@ impl IndexOwners {
         }
     }
 
-    fn retire(&mut self, channel: &Arc<UnixStream>) {
+    fn retire(&mut self, generation: &Arc<Generation>) {
         // A late timeout from an old generation cannot retire its replacement.
         // Keep serving any peers that already have a lease on this generation.
         let stale = self
             .current
-            .extract_if(|_, e| Arc::ptr_eq(&e.channel, channel));
+            .extract_if(|_, e| Arc::ptr_eq(&e.generation, generation));
         self.retiring.extend(stale.map(|(_, entry)| entry));
     }
 
     fn collect(&mut self, idle: Duration) {
         self.exiting.retain_mut(child_pending);
         for entry in self.retiring.extract_if(.., |e| {
-            Arc::strong_count(&e.channel) == 1 || !child_pending(&mut e.child)
+            Arc::strong_count(&e.generation) == 1 || !child_pending(&mut e.child)
         }) {
             entry.stop(&mut self.exiting);
         }
@@ -385,7 +430,7 @@ impl IndexOwners {
             if !child_pending(&mut entry.child) {
                 return true;
             }
-            if Arc::strong_count(&entry.channel) > 1 {
+            if Arc::strong_count(&entry.generation) > 1 {
                 entry.idle_since = None;
                 return false;
             }
@@ -440,15 +485,7 @@ fn run_pool(
     count: &AtomicUsize,
     max_sessions: usize,
 ) {
-    let mut owners = IndexOwners {
-        current: HashMap::new(),
-        retiring: Vec::new(),
-        exiting: Vec::new(),
-        // One replacement may be starting while its predecessor is exiting.
-        // Uninterruptible children still count against this finite budget.
-        max_owners: max_sessions.saturating_add(MAX_IDLE + 1),
-        max_lanes: max_sessions.saturating_mul(crate::mcp::MAX_CONCURRENT_REQUESTS),
-    };
+    let mut owners = IndexOwners::new(max_sessions);
     loop {
         let message = if owners.resident() == 0 {
             requests
@@ -460,11 +497,11 @@ fn run_pool(
         owners.collect(idle);
         match message {
             Ok(PoolMessage::Acquire(key, image, reply)) => {
-                let result = owners.acquire(key, &image);
+                let result = owners.acquire(key, &image, Instant::now());
                 count.store(owners.resident(), Ordering::Relaxed);
                 let _ = reply.send(result);
             }
-            Ok(PoolMessage::Retire(channel)) => owners.retire(&channel),
+            Ok(PoolMessage::Retire(generation)) => owners.retire(&generation),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 count.store(owners.resident(), Ordering::Relaxed)
             }
@@ -701,7 +738,9 @@ fn await_receipt(local: &mut UnixStream, owner: &UnixStream, timeout: Duration) 
         },
         libc::pollfd {
             fd: owner.as_raw_fd(),
-            events: 0,
+            // This channel has no response payload. Explicit read interest
+            // makes EOF observable through poll on both Darwin and Linux.
+            events: libc::POLLIN,
             revents: 0,
         },
     ];
@@ -881,6 +920,53 @@ fn serve_lane(mut lane: BufReader<UnixStream>, runtimes: &impl ToolResolver) -> 
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    fn owner_fixture(dir: &Path) -> Result<PathBuf> {
+        let image = dir.join("owner");
+        // The pool supplies a lifetime pipe on stdin. This fixture stays
+        // alive until its parent releases that pipe or terminates the child.
+        std::fs::write(&image, "#!/bin/sh\nexec cat >/dev/null\n")?;
+        std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o700))?;
+        Ok(image)
+    }
+
+    #[test]
+    fn retries_replace_an_owner_that_never_served_a_client() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let image = owner_fixture(dir.path())?;
+        let key = RuntimeKey::resolve(dir.path(), None, &[], true)?;
+        let mut owners = IndexOwners::new(3);
+        let first = owners.acquire(key.clone(), &image, Instant::now())?;
+        let retry = first.generation.started + STARTUP_IO_TIMEOUT;
+        assert_eq!(owners.acquire(key.clone(), &image, retry)?.pid, first.pid);
+        let expired = retry + STARTUP_IO_TIMEOUT;
+        let next = owners.acquire(key.clone(), &image, expired)?;
+        assert_ne!(next.pid, first.pid);
+        // A pending client can finish on its original owner while new clients
+        // have a recovery path. Ready owners have no cold-start deadline.
+        assert_eq!(unsafe { libc::kill(first.pid as libc::pid_t, 0) }, 0);
+        next.mark_ready();
+        assert_eq!(
+            owners
+                .acquire(key, &image, expired + STARTUP_IO_TIMEOUT)?
+                .pid,
+            next.pid
+        );
+        owners.shutdown();
+        Ok(())
+    }
+
+    #[test]
+    fn receipt_wait_observes_owner_loss_while_the_sender_retains_the_endpoint() -> Result<()> {
+        let (sender, owner) = UnixStream::pair()?;
+        let (mut local, remote) = UnixStream::pair()?;
+        fds::send_fd(&sender, remote.as_fd())?;
+        drop(owner);
+        let error = await_receipt(&mut local, &sender, Duration::from_secs(2)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        drop(remote);
+        Ok(())
+    }
 
     #[test]
     fn failed_initialization_closes_intake_before_answering_all_admitted_clients() -> Result<()> {
@@ -1073,11 +1159,7 @@ mod tests {
     #[test]
     fn timed_out_generation_is_replaced_without_stopping_healthy_peers() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let image = dir.path().join("owner");
-        // No request processing is needed to exercise the pool's lifecycle.
-        // exec keeps the fixture a single, directly owned child.
-        std::fs::write(&image, "#!/bin/sh\nexec sleep 30\n")?;
-        std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o700))?;
+        let image = owner_fixture(dir.path())?;
         let pool = RuntimePool::new(4)?;
         let key = RuntimeKey::resolve(dir.path(), None, &[], true)?;
         let first = pool.acquire(key.clone(), &image)?;

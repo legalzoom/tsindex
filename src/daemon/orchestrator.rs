@@ -1713,7 +1713,7 @@ impl WorkerStartup {
             .bootstrap
             .take()
             .context("duplicate worker runtime request")?;
-        super::fds::send_fd(&channel, runtime.channel.as_fd())
+        super::fds::send_fd(&channel, runtime.channel())
             .context("failed to connect worker to its index runtime")?;
         handle
             .info
@@ -1791,6 +1791,9 @@ fn supervise_session(
                 .context("invalid worker readiness acknowledgement")?;
             if ready.protocol != PROTOCOL_VERSION {
                 bail!("worker protocol differs from daemon; run `tsindex daemon restart`");
+            }
+            if let Some(runtime) = &startup.runtime {
+                runtime.mark_ready();
             }
             ready_bytes.drain(..=end);
             break;

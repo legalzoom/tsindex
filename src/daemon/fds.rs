@@ -468,7 +468,16 @@ mod tests {
                     return Err(io::Error::last_os_error());
                 }
                 set_fd_flags(raw, 0)?;
-                sweep_cloexec(raw + 1)
+                #[cfg(target_os = "linux")]
+                {
+                    // Parallel tests can fill every slot below the new limit.
+                    // This child uses no stdin. Reserve a slot for procfs so
+                    // the native inventory path is exercised deterministically.
+                    libc::close(libc::STDIN_FILENO);
+                }
+                // Give the sweep only the new limit. The native inventory
+                // must discover the inherited descriptor above that ceiling.
+                sweep_cloexec(64)
             });
         }
         assert!(cmd.status()?.success());

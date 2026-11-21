@@ -281,7 +281,9 @@ fn systemd_quote(value: &str) -> String {
 }
 
 pub(super) fn invocation_binary() -> Result<PathBuf> {
-    let running = env::current_exe().context("failed to determine current tsindex executable")?;
+    let running = env::current_exe().context(
+        "cannot locate the tsindex executable; a private Linux daemon needs /proc/self/exe in its PID namespace",
+    )?;
     let current = fs::metadata(&running)?;
     // current_exe can name a versioned package target. Preserve the invocation
     // link across upgrades only when it identifies the file we actually ran.

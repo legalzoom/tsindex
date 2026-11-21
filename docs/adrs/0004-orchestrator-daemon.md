@@ -48,6 +48,9 @@ connection waits for initialization before the worker announces readiness.
 A blocked configuration read stays inside the inspectable session child. Both
 children check their loaded settings and executable identity. Linux uses the
 mapped executable inode, and macOS uses its mapped UUID when available.
+An owner that has never completed a session startup has two startup windows
+to do so. After that, new attachments get a fresh owner while existing
+attempts can finish on the earlier generation.
 
 Each connection has a separate MCP worker so closing a session can interrupt
 its running edits and discard its queued requests. A session reuses at most

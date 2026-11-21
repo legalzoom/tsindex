@@ -248,6 +248,12 @@ its first lookup connection and waits for index initialization before sending
 its readiness acknowledgement. Checkout filesystem I/O stays in a child that
 can be inspected and stopped throughout startup.
 
+The first worker to acknowledge readiness confirms its owner's generation.
+An owner still waiting for this first success after two 120-second startup
+windows stops accepting new sessions. The next attachment gets a fresh owner,
+and pending clients can finish on the old one. After a successful startup,
+slow lookups never trip this cold-start deadline.
+
 The runtime key includes the canonical checkout, explicit database override
 (which disables repo pruning), normalized language filters, refresh policy,
 effective configuration digest, and executable image. Both the session worker

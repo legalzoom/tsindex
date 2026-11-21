@@ -1387,11 +1387,11 @@ fn atomic_executable_replacement_keeps_worker_startup_available() -> Result<()> 
 
 #[test]
 fn session_listing_pages_bounded_summaries_and_keeps_detail_separate() -> Result<()> {
-    let daemon = common::TestDaemon::start()?;
+    let daemon = common::TestDaemon::start_with_nofile(256)?;
     let dir = tempdir_in("/tmp")?;
     build_fixture(dir.path(), "lib.py", "def target():\n    return 1\n")?;
-    let mut streams = Vec::new();
-    for _ in 0..12 {
+    let mut last = None;
+    for i in 0..12 {
         let (mut stream, ready) = raw_session(&daemon.socket, dir.path())?;
         assert_eq!(ready["kind"], "session_ready");
         writeln!(
@@ -1409,16 +1409,26 @@ fn session_listing_pages_bounded_summaries_and_keeps_detail_separate() -> Result
                 .get("result")
                 .is_some()
         );
-        streams.push(stream);
+        // History and live sessions share a pagination cursor. Build more
+        // than one page even when the launcher's descriptor cap is smaller.
+        if i == 11 {
+            last = Some(stream);
+        } else {
+            drop(stream);
+            daemon.wait_active_sessions(0, Duration::from_secs(3))?;
+        }
     }
-    let sessions = daemon_json(&daemon.socket, &["daemon", "sessions"])?;
+    let sessions = daemon_json(&daemon.socket, &["daemon", "sessions", "--all"])?;
     let active = sessions["active"].as_array().unwrap();
-    assert_eq!(active.len(), 12);
-    for session in active {
+    let recent = sessions["recent"].as_array().unwrap();
+    assert_eq!((active.len(), recent.len()), (1, 11));
+    let mut ids = std::collections::HashSet::new();
+    for session in active.iter().chain(recent) {
+        assert!(ids.insert(session["session_id"].as_str().unwrap()));
         assert!(session["harness_name"].as_str().unwrap().len() <= 256);
         assert!(session.get("recent_stderr").is_none());
     }
-    drop(streams);
+    drop(last);
     daemon.wait_active_sessions(0, Duration::from_secs(5))?;
     Ok(())
 }

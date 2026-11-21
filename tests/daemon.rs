@@ -120,18 +120,25 @@ impl McpSession {
         serde_json::from_str(text).context("tool text is not JSON")
     }
 
-    fn close_gracefully(mut self) -> Result<()> {
-        drop(self.child.stdin.take());
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while self.child.try_wait()?.is_none() {
-            if Instant::now() >= deadline {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-                bail!("proxy did not exit cleanly after stdin EOF");
+    fn wait_for_exit(
+        &mut self,
+        timeout: Duration,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let status = self.child.try_wait()?;
+            if status.is_some() || Instant::now() >= deadline {
+                return Ok(status);
             }
             thread::sleep(Duration::from_millis(20));
         }
-        let status = self.child.wait()?;
+    }
+
+    fn close_gracefully(mut self) -> Result<()> {
+        drop(self.child.stdin.take());
+        let Some(status) = self.wait_for_exit(Duration::from_secs(5))? else {
+            bail!("proxy did not exit cleanly after stdin EOF");
+        };
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
@@ -962,19 +969,22 @@ fn proxy_half_close_waits_for_a_slow_accepted_call() -> Result<()> {
         .with_context(|| {
             use std::io::Read;
 
-            // Both the worker and its proxy can close the response stream. Preserve
-            // the daemon's account of the exit before the fixture cleans them up.
-            let status = proxy.child.try_wait();
+            // Closing stdout can precede waitable exit. Give the proxy time to
+            // finish reporting the cause before the fixture cleans it up.
+            let status = proxy.wait_for_exit(Duration::from_secs(2));
             let mut stderr = String::new();
             if matches!(status, Ok(Some(_)))
                 && let Some(pipe) = proxy.child.stderr.take()
             {
                 let _ = pipe.take(16 * 1024).read_to_string(&mut stderr);
             }
+            let mut log = String::new();
+            if let Ok(file) = fs::File::open(&daemon.log) {
+                let _ = file.take(16 * 1024).read_to_string(&mut log);
+            }
             format!(
-                "missing reply after worker resumed: proxy={status:?}, stderr={stderr:?}, session={:?}\n{}",
-                client.session_detail(&session.session_id),
-                daemon.read_log()
+                "missing reply after worker resumed: proxy={status:?}, stderr={stderr:?}, session={:?}\n{log}",
+                client.session_detail(&session.session_id)
             )
         })??;
     let response: Value = serde_json::from_str(&response)?;

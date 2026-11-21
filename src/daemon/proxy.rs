@@ -271,7 +271,44 @@ struct ProxyStdout {
 enum OutputMode {
     Write,
     Socket,
+    #[cfg(any(target_os = "macos", test))]
+    PollStream,
     PollPipe,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn socket_option(fd: BorrowedFd<'_>, option: libc::c_int) -> io::Result<libc::c_int> {
+    let mut value: libc::c_int = 0;
+    let mut size = std::mem::size_of_val(&value) as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            option,
+            (&raw mut value).cast(),
+            &mut size,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(value)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_socket_mode(fd: BorrowedFd<'_>, flags: libc::c_int) -> io::Result<OutputMode> {
+    if flags & libc::O_NONBLOCK != 0 {
+        return Ok(OutputMode::Socket);
+    }
+    if socket_option(fd, libc::SO_TYPE)? == libc::SOCK_STREAM {
+        return Ok(OutputMode::PollStream);
+    }
+    // Readiness promises space for only the low-water mark. Splitting a
+    // larger datagram would change its boundaries, so require nonblocking I/O.
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "use a stream socket or a nonblocking message-oriented socket for MCP stdout",
+    ))
 }
 
 impl ProxyStdout {
@@ -288,7 +325,14 @@ impl ProxyStdout {
             return Err(io::Error::from_raw_os_error(libc::EBADF));
         }
         let mode = if kind.is_socket() {
-            OutputMode::Socket
+            #[cfg(target_os = "macos")]
+            {
+                darwin_socket_mode(file.as_fd(), flags)?
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                OutputMode::Socket
+            }
         } else if kind.is_fifo() {
             // Linux procfs reopens the pipe with an independent file description.
             // Some sandboxes omit procfs or disallow reopening an inherited pipe.
@@ -364,33 +408,48 @@ impl ProxyStdout {
     }
 
     fn try_write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        match self.mode {
-            OutputMode::Write => self.file.write(bytes),
-            OutputMode::Socket => {
-                let n = unsafe {
-                    libc::send(
-                        self.file.as_raw_fd(),
-                        bytes.as_ptr().cast(),
-                        bytes.len(),
-                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-                    )
-                };
-                if n < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(n as usize)
-                }
-            }
+        let bytes = match self.mode {
+            OutputMode::Write => return self.file.write(bytes),
             OutputMode::PollPipe => {
                 // MCP dedicates this pipe's byte stream to one writer. With no
                 // competing writer, Linux and Darwin leave at least PIPE_BUF
                 // bytes available after write readiness and a read only frees more.
-                if !self.wait_writable(0)? {
-                    return Err(io::ErrorKind::WouldBlock.into());
-                }
-                self.file.write(&bytes[..bytes.len().min(libc::PIPE_BUF)])
+                let chunk = self.writable_prefix(bytes, libc::PIPE_BUF)?;
+                return self.file.write(chunk);
             }
+            OutputMode::Socket => bytes,
+            #[cfg(any(target_os = "macos", test))]
+            OutputMode::PollStream => {
+                // XNU can wait for send-buffer space even with MSG_DONTWAIT.
+                // POLLOUT promises SO_SNDLOWAT bytes to this stream's sole
+                // writer. Read the current threshold without changing the socket.
+                let lowat = socket_option(self.file.as_fd(), libc::SO_SNDLOWAT)?;
+                if lowat <= 0 {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+                self.writable_prefix(bytes, lowat as usize)?
+            }
+        };
+        let n = unsafe {
+            libc::send(
+                self.file.as_raw_fd(),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+        if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
         }
+    }
+
+    fn writable_prefix<'a>(&self, bytes: &'a [u8], limit: usize) -> io::Result<&'a [u8]> {
+        if !self.wait_writable(0)? {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        Ok(&bytes[..bytes.len().min(limit)])
     }
 
     fn wait_writable(&self, timeout_ms: i32) -> io::Result<bool> {
@@ -523,19 +582,85 @@ mod tests {
 
     #[test]
     fn socket_stdout_preserves_flags_and_stops_when_its_reader_stalls() -> io::Result<()> {
+        for exercise_polled_stream in [false, true] {
+            let (mut socket, _reader) = UnixStream::pair()?;
+            let chunk = [0; 8192];
+            socket.set_nonblocking(true)?;
+            loop {
+                match socket.write(&chunk) {
+                    Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                    Ok(_) => (),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(error),
+                }
+            }
+            socket.set_nonblocking(false)?;
+            // Keep a regression in the kernel send path from hanging the test
+            // suite. The relay itself must see backpressure before this expires.
+            let watchdog = Duration::from_secs(4);
+            socket.set_write_timeout(Some(watchdog))?;
+            let before = flags(&socket);
+            let mut stdout = ProxyStdout::new(socket.as_fd())?;
+            if exercise_polled_stream {
+                stdout.mode = darwin_socket_mode(socket.as_fd(), before)?;
+            }
+            let start = Instant::now();
+            assert!(!stdout.relay(&chunk, &AtomicBool::new(true))?);
+            assert!(start.elapsed() < watchdog / 2, "blocked in socket send");
+            assert_eq!(flags(&socket), before);
+            assert_eq!(socket.write_timeout()?, Some(watchdog));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stream_stdout_drains_in_order_across_write_readiness_thresholds() -> io::Result<()> {
         let (socket, mut reader) = UnixStream::pair()?;
+        reader.set_read_timeout(Some(Duration::from_secs(4)))?;
+        socket.set_write_timeout(Some(Duration::from_secs(4)))?;
         let before = flags(&socket);
         let mut stdout = ProxyStdout::new(socket.as_fd())?;
-        assert!(stdout.relay(b"mcp", &AtomicBool::new(false))?);
-        let mut reply = [0; 3];
-        reader.read_exact(&mut reply)?;
-        assert_eq!(&reply, b"mcp");
+        stdout.mode = darwin_socket_mode(socket.as_fd(), before)?;
+        let lowat = socket_option(socket.as_fd(), libc::SO_SNDLOWAT)? as usize;
+        let size = 8192.max(2 * lowat + 1);
+        let payload: Vec<_> = (0..size).map(|n| (n % 251) as u8).collect();
+        thread::scope(|scope| -> io::Result<()> {
+            let received = scope.spawn(move || -> io::Result<_> {
+                let mut data = vec![0; size];
+                reader.read_exact(&mut data)?;
+                Ok(data)
+            });
+            let first = stdout.try_write(&payload)?;
+            assert!((1..=lowat).contains(&first));
+            assert!(stdout.relay(&payload[first..], &AtomicBool::new(false))?);
+            assert_eq!(received.join().unwrap()?, payload);
+            Ok(())
+        })?;
         assert_eq!(flags(&socket), before);
-        let cancel = AtomicBool::new(true);
-        // The reader stays open. Each successful send fills the bounded socket
-        // buffer until per-write nonblocking delivery observes backpressure.
-        let chunk = [0; 8192];
-        while stdout.relay(&chunk, &cancel)? {}
+        assert_eq!(
+            socket_option(socket.as_fd(), libc::SO_SNDLOWAT)? as usize,
+            lowat
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn darwin_message_socket_stdout_retains_datagram_boundaries() -> io::Result<()> {
+        let (socket, reader) = std::os::unix::net::UnixDatagram::pair()?;
+        assert!(matches!(
+            darwin_socket_mode(socket.as_fd(), flags(&socket)),
+            Err(error) if error.kind() == io::ErrorKind::Unsupported
+        ));
+        socket.set_nonblocking(true)?;
+        reader.set_read_timeout(Some(Duration::from_secs(4)))?;
+        let before = flags(&socket);
+        let mut stdout = ProxyStdout::new(socket.as_fd())?;
+        stdout.mode = darwin_socket_mode(socket.as_fd(), before)?;
+        let payload = [23; 511];
+        assert!(stdout.relay(&payload, &AtomicBool::new(false))?);
+        let mut received = [0; 512];
+        let len = reader.recv(&mut received)?;
+        assert_eq!(&received[..len], &payload);
         assert_eq!(flags(&socket), before);
         Ok(())
     }

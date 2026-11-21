@@ -540,6 +540,10 @@ Managed startup acknowledges a session after its worker initializes. A
 dedicated outcome connection carries its final status through daemon stop and
 restart, while the MCP socket carries protocol messages. Worker
 startup errors reach the client's stderr and produce a failing exit status.
+For socket-backed MCP stdout, use a connected stream socket. On macOS, a
+message-oriented socket such as a datagram socket must already be nonblocking.
+The proxy preserves the launcher's descriptor flags.
+
 Normal stdin EOF drains accepted requests. Explicit termination uses a bounded
 shutdown deadline independently of worker pipe progress, then terminates and
 reaps the worker. Linux and manual foreground daemons also clear its owned

@@ -309,6 +309,12 @@ containment because a helper can leave its assigned process group. Linux's
 cgroup backstop applies to whole-service stops. Manual daemons depend on their
 own process supervision.
 
+The stdio proxy owns the MCP byte stream. It preserves the launcher's output
+descriptor flags. On macOS, a blocking stream socket can sleep on a full send
+buffer even with a per-call nonblocking flag. The proxy waits for write
+readiness and limits each send to the socket's send low-water mark. A
+message-oriented socket must already be nonblocking to preserve each message.
+
 Admission derives from the inherited `RLIMIT_NOFILE` soft limit and the
 requested `TSINDEX_MAX_SESSIONS`. The daemon counts available descriptor
 numbers after opening its own runtime handles. The per-session budget covers

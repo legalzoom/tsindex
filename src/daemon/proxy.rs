@@ -645,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn darwin_message_socket_stdout_retains_datagram_boundaries() -> io::Result<()> {
+    fn darwin_message_socket_stdout_sends_a_relay_chunk_in_one_datagram() -> io::Result<()> {
         let (socket, reader) = std::os::unix::net::UnixDatagram::pair()?;
         assert!(matches!(
             darwin_socket_mode(socket.as_fd(), flags(&socket)),
@@ -667,10 +667,13 @@ mod tests {
 
     #[test]
     fn pipe_stdout_bounds_writes_with_an_inherited_blocking_descriptor() -> io::Result<()> {
-        let (mut reader, writer) = io::pipe()?;
+        let (mut reader, mut writer) = io::pipe()?;
+        // Darwin records the first ordinary write in F_GETFL (FWASWRITTEN).
+        // Take the baseline after the caller's prefix, then compare every flag.
+        writer.write_all(b"m")?;
         let before = flags(&writer);
         let mut stdout = ProxyStdout::new(writer.as_fd())?;
-        assert!(stdout.relay(b"mcp", &AtomicBool::new(false))?);
+        assert!(stdout.relay(b"cp", &AtomicBool::new(false))?);
         let mut reply = [0; 3];
         reader.read_exact(&mut reply)?;
         assert_eq!(&reply, b"mcp");

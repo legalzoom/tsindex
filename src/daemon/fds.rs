@@ -415,6 +415,9 @@ mod tests {
             io::ErrorKind::InvalidData
         );
         let (session, mut peer) = UnixStream::pair()?;
+        // Darwin rejects new socket options after the last peer closes. Arm
+        // the deadline while connected so EOF can verify every right was released.
+        peer.set_read_timeout(Some(Duration::from_secs(1)))?;
         let mut control = Control::<{ control_space(2) }>::new();
         let mut marker = FD_MARKER;
         let mut iov = libc::iovec {
@@ -437,7 +440,6 @@ mod tests {
             io::ErrorKind::InvalidData
         );
         drop(session);
-        peer.set_read_timeout(Some(Duration::from_secs(1)))?;
         assert_eq!(
             peer.read(&mut [0])?,
             0,

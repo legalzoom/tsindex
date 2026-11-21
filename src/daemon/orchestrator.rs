@@ -2001,7 +2001,10 @@ fn supervise_session(
             }
         }
         let pending_before_write = to_client.len();
-        if flush_pending(writer, &mut to_client).is_err() {
+        if let Err(error) = flush_pending(writer, &mut to_client) {
+            // A failed reply write and a kernel disconnect probe share an
+            // exit reason. Retain the write error for transport diagnostics.
+            eprintln!("tsindex: session {session_id} could not write its reply: {error}");
             return Ok("client_disconnected".into());
         }
         if worker_exited && to_client.len() < pending_before_write {

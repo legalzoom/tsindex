@@ -343,10 +343,13 @@ sends the reaped worker's final status on that existing connection even during
 whole-daemon shutdown. If a full disconnect or drain deadline triggers
 termination, the session retains that cause and the daemon logs the worker
 status. An ordinary stdin EOF keeps the reply channel open until the worker
-exits and its output drains. Newline-delimited MCP messages pass through
-16 MiB relay buffers. Worker
-startup has a 120-second deadline. A stop notification wakes supervision
-independently of blocked pipes. Shutdown has a finite graceful phase followed
+exits. After exit, each successful write renews a five-second deadline for
+draining its output. A raw client on macOS must close its final socket
+descriptor to abandon a reply. A shutdown on a retained descriptor can look
+like an ordinary input EOF to the daemon. Newline-delimited MCP messages pass
+through 16 MiB relay buffers. Worker startup has a 120-second deadline.
+A stop notification wakes supervision independently of blocked pipes.
+Shutdown has a finite graceful phase followed
 by TERM/KILL and child reaping, targeting the owned worker group or the direct
 child according to the platform launch mode. Session summaries are paginated.
 Per-session diagnostics retain up to 16 KiB and are fetched separately through

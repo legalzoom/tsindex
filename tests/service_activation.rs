@@ -299,6 +299,22 @@ fn login_clients_discover_installed_socket_and_preserve_explicit_isolation() -> 
         ))
     };
     ensure!(status_socket(&mut command())? == socket);
+    let standard_runtime = PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() }));
+    let endpoint = |default: &Path| -> Result<()> {
+        fs::write(
+            config.join("tsindex.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "socket": socket, "default_socket": default,
+            }))?,
+        )?;
+        Ok(())
+    };
+    endpoint(&standard_runtime.join("tsindex/daemon.sock"))?;
+    ensure!(status_socket(command().env_remove("XDG_RUNTIME_DIR"))? == socket);
+    ensure!(status_socket(&mut command())? == runtime.join("tsindex/daemon.sock"));
+    endpoint(&scratch.path().join(".tsindex/run/daemon.sock"))?;
+    ensure!(status_socket(command().env("XDG_RUNTIME_DIR", &standard_runtime))? == socket);
+    endpoint(&runtime.join("tsindex/daemon.sock"))?;
     let independent = scratch.path().join("independent.sock");
     ensure!(status_socket(command().arg("--socket").arg(&independent))? == independent);
     ensure!(status_socket(command().env("TSINDEX_SOCKET", &independent))? == independent);
@@ -361,6 +377,7 @@ fn login_clients_discover_installed_socket_and_preserve_explicit_isolation() -> 
 #[cfg(target_os = "linux")]
 #[test]
 fn invalid_replacement_executable_preserves_existing_installation() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     let scratch = private_scratch()?;
     let config = scratch.path().join("config/systemd/user");
     fs::create_dir_all(&config)?;
@@ -369,7 +386,13 @@ fn invalid_replacement_executable_preserves_existing_installation() -> Result<()
     let socket = scratch.path().join("d.sock");
     let regular = scratch.path().join("plain");
     fs::write(&regular, "regular non-executable file")?;
-    for invalid in [&regular, &config] {
+    let invalid_image = scratch.path().join("invalid-image");
+    fs::write(&invalid_image, "not an executable format")?;
+    fs::set_permissions(&invalid_image, fs::Permissions::from_mode(0o700))?;
+    let not_tsindex = scratch.path().join("not-tsindex");
+    fs::write(&not_tsindex, "#!/bin/sh\nprintf 'another program 1.0\\n'\n")?;
+    fs::set_permissions(&not_tsindex, fs::Permissions::from_mode(0o700))?;
+    for invalid in [&regular, &config, &invalid_image, &not_tsindex] {
         let output = Command::new(BIN)
             .arg("--socket")
             .arg(&socket)
@@ -382,7 +405,9 @@ fn invalid_replacement_executable_preserves_existing_installation() -> Result<()
         ensure!(!output.status.success());
         let error = String::from_utf8_lossy(&output.stderr);
         ensure!(
-            error.contains("cannot execute") || error.contains("regular file"),
+            error.contains("cannot execute")
+                || error.contains("regular file")
+                || error.contains("did not identify itself as tsindex"),
             "{error}"
         );
         ensure!(fs::read_to_string(&service)? == "[Service]\n");

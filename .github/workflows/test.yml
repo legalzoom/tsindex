@@ -118,7 +118,7 @@ jobs:
         run: |
           cargo test --locked --lib daemon::
           cargo test --locked --lib lifecycle::
-          cargo test --locked --no-fail-fast --test daemon --test lifecycle --test service_activation
+          cargo test --locked --no-fail-fast --test cli --test daemon --test lifecycle --test service_activation
       - name: Exercise installed daemon through the CLI
         # The clean-runner install has its own service name and preflight.
         # Report its result even if an isolated daemon fixture failed.

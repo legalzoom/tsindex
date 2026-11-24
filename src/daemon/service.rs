@@ -3,9 +3,11 @@
 
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io;
+use std::io::{self, Read};
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -196,11 +198,11 @@ fn render_systemd_unit_with_home(
 ) -> String {
     let mut exec_start = format!(
         "{} daemon run --socket-activated",
-        systemd_quote(&binary.to_string_lossy())
+        systemd_quote(&binary.to_string_lossy(), false)
     );
     if let Some(socket) = socket {
         exec_start.push_str(" --socket ");
-        exec_start.push_str(&systemd_quote(&socket.to_string_lossy()));
+        exec_start.push_str(&systemd_quote(&socket.to_string_lossy(), true));
     }
     let home_env = home
         .map(|value| {
@@ -237,14 +239,14 @@ pub fn render_systemd_socket(binary: &Path, socket: &Path) -> String {
     // https://www.freedesktop.org/software/systemd/man/latest/systemd.socket.html
     format!(
         "[Unit]\nDescription=tsindex activation socket\n\n[Socket]\nExecStartPre={} --socket {} daemon check-socket\nListenStream={}\nSocketMode=0600\nDirectoryMode=0700\nAccept=no\n\n[Install]\nWantedBy=sockets.target\n",
-        systemd_quote(&binary.to_string_lossy()),
-        systemd_quote(&socket.to_string_lossy()),
+        systemd_quote(&binary.to_string_lossy(), false),
+        systemd_quote(&socket.to_string_lossy(), true),
         socket.to_string_lossy().replace('%', "%%")
     )
 }
 
 fn systemd_environment_quote(value: &str) -> String {
-    systemd_quote(value).replace("$$", "$")
+    systemd_quote(value, false)
 }
 
 fn xml_escape(value: &str) -> String {
@@ -262,7 +264,7 @@ fn xml_escape(value: &str) -> String {
     out
 }
 
-fn systemd_quote(value: &str) -> String {
+fn systemd_quote(value: &str, expand_arguments: bool) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
     for ch in value.chars() {
@@ -270,7 +272,8 @@ fn systemd_quote(value: &str) -> String {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
             '%' => out.push_str("%%"),
-            '$' => out.push_str("$$"),
+            // systemd expands dollars in argv but not in the executable token.
+            '$' if expand_arguments => out.push_str("$$"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             _ => out.push(ch),
@@ -331,6 +334,46 @@ fn resolve_binary(binary_override: Option<&Path>) -> Result<PathBuf> {
             .with_context(|| format!("cannot execute {binary:?}"));
     }
     Ok(binary)
+}
+
+fn verify_service_binary(binary: &Path) -> Result<()> {
+    let (mut output, stdout) = UnixStream::pair()?;
+    output.set_nonblocking(true)?;
+    let mut command = Command::new(binary);
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(OwnedFd::from(stdout)))
+        .stderr(Stdio::null());
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("cannot execute {binary:?}"))?;
+    drop(command);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            result => {
+                let _ = child.kill();
+                let _ = child.wait();
+                result?;
+                bail!("service executable {binary:?} timed out responding to --version");
+            }
+        }
+    };
+    let mut buf = [0; 256];
+    if !status.success()
+        || !output.read(&mut buf).is_ok_and(|len| {
+            let version = &buf[..len];
+            version.starts_with(b"tsindex ") && version.ends_with(b"\n")
+        })
+    {
+        bail!(
+            "service executable {binary:?} did not identify itself as tsindex (--version: {status})"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -473,8 +516,10 @@ pub fn install_service(
     _socket_override: Option<&Path>,
     binary_override: Option<&Path>,
 ) -> Result<(ServiceInfo, DaemonStatus)> {
-    let endpoint_exists = validate_socket_node(paths)?;
+    validate_service_socket_path(&paths.socket_path)?;
+    let endpoint_exists = inspect_socket_node(paths)?;
     let binary = resolve_binary(binary_override)?;
+    verify_service_binary(&binary)?;
     // Rendered service paths must survive the manager's text format. Check
     // every installer-controlled path before disrupting an existing service.
     if let Some(home) = resolved_service_home()? {
@@ -535,7 +580,7 @@ pub fn install_service(
 /// Validate immediately before a new listener is bound, including automatic
 /// systemd socket-unit activation at login. Stop existing listeners first.
 pub fn check_socket(paths: &DaemonPaths) -> Result<()> {
-    if !validate_socket_node(paths)? {
+    if !inspect_socket_node(paths)? {
         return Ok(());
     }
     match crate::daemon::connect_with_timeout(&paths.socket_path, Duration::from_millis(300)) {
@@ -555,19 +600,18 @@ pub fn check_socket(paths: &DaemonPaths) -> Result<()> {
     }
 }
 
-fn validate_socket_node(paths: &DaemonPaths) -> Result<bool> {
-    let bytes = paths.socket_path.as_os_str().as_encoded_bytes();
+fn validate_service_socket_path(path: &Path) -> Result<()> {
+    require_service_text(path)?;
     // ListenStream parses a raw value, trims trailing whitespace, and treats a
     // terminal backslash as a line continuation. Reject ambiguous paths before
     // creating service files or asking a manager to bind the endpoint.
-    if paths.socket_path.to_str().is_none()
-        || bytes.iter().any(u8::is_ascii_control)
-        || bytes.last().is_some_and(u8::is_ascii_whitespace)
-        || bytes.last() == Some(&b'\\')
+    let bytes = path.as_os_str().as_bytes();
+    if cfg!(target_os = "linux")
+        && (bytes.last().is_some_and(u8::is_ascii_whitespace) || bytes.last() == Some(&b'\\'))
     {
         bail!("service socket path cannot be represented safely in an activation unit");
     }
-    inspect_socket_node(paths)
+    Ok(())
 }
 
 fn inspect_socket_node(paths: &DaemonPaths) -> Result<bool> {
@@ -819,7 +863,10 @@ pub fn client_paths(socket: Option<&Path>) -> Result<DaemonPaths> {
     }
     if let Some(install) = installed_endpoint()? {
         let ordinary_login = match &install.default_socket {
-            Some(default) => *default == selected.socket_path,
+            Some(default) => {
+                *default == selected.socket_path
+                    || ordinary_linux_defaults(default, &selected.socket_path)
+            }
             // Legacy metadata lacks its install-time runtime directory. A
             // custom Linux XDG directory remains isolated until reinstallation.
             None => {
@@ -837,6 +884,18 @@ pub fn client_paths(socket: Option<&Path>) -> Result<DaemonPaths> {
         }
     }
     Ok(selected)
+}
+
+fn ordinary_linux_defaults(installed: &Path, selected: &Path) -> bool {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    let uid = crate::daemon::current_uid();
+    let home = home_path(".tsindex");
+    let session =
+        crate::daemon::default_socket_path(Some(format!("/run/user/{uid}").into()), &home, uid);
+    let fallback = crate::daemon::default_socket_path(None, &home, uid);
+    (installed == session && selected == fallback) || (installed == fallback && selected == session)
 }
 
 fn installed_endpoint_matches(paths: &DaemonPaths) -> Result<bool> {
@@ -1212,7 +1271,7 @@ pub fn uninstall_service(paths: &DaemonPaths) -> Result<PathBuf> {
 
 /// Start the selected endpoint through its installed manager or as a manual daemon.
 pub fn start_daemon(paths: &DaemonPaths, socket_override: Option<&Path>) -> Result<DaemonStatus> {
-    validate_socket_node(paths)?;
+    inspect_socket_node(paths)?;
     if installed_endpoint_matches(paths)? {
         start_os_service()?;
         return wait_for_daemon_ready(paths, START_TIMEOUT);
@@ -1284,7 +1343,7 @@ pub fn stop_daemon(paths: &DaemonPaths) -> Result<bool> {
 
 /// Keep a manager-owned listener available while its supervisor is replaced.
 pub fn restart_daemon(paths: &DaemonPaths, socket_override: Option<&Path>) -> Result<DaemonStatus> {
-    validate_socket_node(paths)?;
+    inspect_socket_node(paths)?;
     if installed_endpoint_matches(paths)? {
         start_os_service()?;
         #[cfg(target_os = "linux")]
@@ -1387,5 +1446,17 @@ mod tests {
         let unit = render_systemd_unit(Path::new("/usr/bin/tsindex"), None);
         assert!(unit.contains("ExecStart=\"/usr/bin/tsindex\" daemon run --socket-activated\n"));
         assert!(!unit.contains("--socket "));
+    }
+
+    #[test]
+    fn systemd_dollars_are_escaped_only_in_command_arguments() {
+        let binary = Path::new("/opt/build$/tsindex");
+        let socket = Path::new("/run/user/1000/$name.sock");
+        let service = render_systemd_unit(binary, Some(socket));
+        let activation = render_systemd_socket(binary, socket);
+        assert!(service.contains("ExecStart=\"/opt/build$/tsindex\" "));
+        assert!(activation.contains("ExecStartPre=\"/opt/build$/tsindex\" "));
+        assert!(service.contains("--socket \"/run/user/1000/$$name.sock\""));
+        assert!(activation.contains("--socket \"/run/user/1000/$$name.sock\""));
     }
 }

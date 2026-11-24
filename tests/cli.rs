@@ -389,7 +389,17 @@ fn detached_daemon_releases_inherited_launcher_descriptors() -> Result<()> {
             .env("XDG_CONFIG_HOME", dir.path());
         command
     };
+    struct StopOnDrop(Option<Command>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            if let Some(command) = &mut self.0 {
+                let _ = command.output();
+            }
+        }
+    }
     let (mut observer, endpoint) = UnixStream::pair()?;
+    // Darwin can reject SO_RCVTIMEO after the last peer disconnects.
+    observer.set_read_timeout(Some(Duration::from_secs(2)))?;
     let fd = endpoint.as_raw_fd();
     let mut start = launcher();
     start.args(["daemon", "start"]);
@@ -403,23 +413,24 @@ fn detached_daemon_releases_inherited_launcher_descriptors() -> Result<()> {
             Ok(())
         });
     }
+    let mut stop = launcher();
+    stop.args(["daemon", "stop"]);
+    let mut cleanup = StopOnDrop(Some(stop));
     let started = start.output()?;
     drop(endpoint);
-    // Capture the result before asserting so even a regression stops the daemon.
-    observer.set_read_timeout(Some(Duration::from_secs(2)))?;
-    let disconnected = observer.read(&mut [0]);
-    let stopped = launcher().args(["daemon", "stop"]).output()?;
     assert!(
         started.status.success(),
         "{}",
         String::from_utf8_lossy(&started.stderr)
     );
+    assert_eq!(observer.read(&mut [0])?, 0);
+    let stopped = cleanup.0.as_mut().unwrap().output()?;
     assert!(
         stopped.status.success(),
         "{}",
         String::from_utf8_lossy(&stopped.stderr)
     );
-    assert_eq!(disconnected?, 0);
+    cleanup.0 = None;
     Ok(())
 }
 

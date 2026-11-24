@@ -1450,3 +1450,182 @@ fn launchd_manager_activates_isolated_service() -> Result<()> {
     wait_gone(restarted)?;
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn pre_activation_replacement_binary_is_rejected_before_stopping_service() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let scratch = private_scratch()?;
+    let bin = scratch.path().join("bin");
+    fs::create_dir(&bin)?;
+    let calls = scratch.path().join("manager-calls");
+    for manager_name in ["systemctl", "launchctl"] {
+        let manager = bin.join(manager_name);
+        fs::write(
+            &manager,
+            "#!/bin/sh\nprintf \"%s\\n\" \"$*\" >>\"$FAKE_MANAGER_CALLS\"\nexit 42\n",
+        )?;
+        fs::set_permissions(&manager, fs::Permissions::from_mode(0o700))?;
+    }
+    let old_binary = scratch.path().join("pre-activation-tsindex");
+    fs::write(
+        &old_binary,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf \"tsindex 2.0.0\\n\"; exit 0; fi\nexit 2\n",
+    )?;
+    fs::set_permissions(&old_binary, fs::Permissions::from_mode(0o700))?;
+
+    let socket = scratch.path().join("d.sock");
+    let output = Command::new(BIN)
+        .arg("--socket")
+        .arg(&socket)
+        .args(["daemon", "install", "--binary"])
+        .arg(&old_binary)
+        .env("HOME", scratch.path())
+        .env("XDG_CONFIG_HOME", scratch.path().join("config"))
+        .env("PATH", &bin)
+        .env("FAKE_MANAGER_CALLS", &calls)
+        .output()?;
+    ensure!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    ensure!(
+        stderr.contains("socket-activated"),
+        "expected activation preflight error, got: {stderr}"
+    );
+    ensure!(
+        !calls.exists(),
+        "preflight must reject incompatible binaries before invoking the service manager"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_start_recreates_missing_nested_socket_directories_before_bootstrap() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let scratch = private_scratch()?;
+    let agents = scratch.path().join("Library/LaunchAgents");
+    fs::create_dir_all(&agents)?;
+    let nested_parent = scratch.path().join("removed-outer/removed-inner");
+    let socket = nested_parent.join("daemon.sock");
+    let plist = agents.join("com.legalzoom.tsindex.daemon.plist");
+    let log = nested_parent.join(".daemon.sock.tsindex/daemon.log");
+    fs::write(
+        &plist,
+        tsindex::daemon::service::render_launchd_plist(
+            Path::new(BIN),
+            Some(&socket),
+            &log,
+            "/usr/bin:/bin",
+        ),
+    )?;
+    fs::write(
+        agents.join("com.legalzoom.tsindex.daemon.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "socket": socket,
+            "default_socket": scratch.path().join(".tsindex/run/daemon.sock"),
+        }))?,
+    )?;
+
+    let bin = scratch.path().join("bin");
+    fs::create_dir(&bin)?;
+    let launchctl = bin.join("launchctl");
+    let observed = scratch.path().join("observed");
+    fs::write(
+        &launchctl,
+        format!(
+            r#"#!/bin/sh
+case "$1" in
+  print)
+    printf 'Could not find service\n' >&2
+    exit 113
+    ;;
+  bootstrap)
+    if [ -d "{dir}" ] && [ -f "{owner}" ]; then
+      printf 'ready\n' > "{observed}"
+      exit 42
+    fi
+    printf 'missing-dir\n' > "{observed}"
+    exit 43
+    ;;
+esac
+exit 1
+"#,
+            dir = nested_parent.display(),
+            owner = nested_parent.join(".daemon.sock.tsindex/owner").display(),
+            observed = observed.display()
+        ),
+    )?;
+    fs::set_permissions(&launchctl, fs::Permissions::from_mode(0o700))?;
+
+    ensure!(!scratch.path().join("removed-outer").exists());
+    let output = Command::new(BIN)
+        .args(["daemon", "start"])
+        .env("HOME", scratch.path())
+        .env("PATH", &bin)
+        .env_remove("TSINDEX_HOME")
+        .env_remove("TSINDEX_SOCKET")
+        .output()?;
+    ensure!(!output.status.success());
+    ensure!(
+        fs::read_to_string(&observed)?.trim() == "ready",
+        "start_os_service must recreate private socket and metadata dirs before launchctl bootstrap; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn socketless_legacy_linux_unit_discovers_manager_runtime_socket_without_shell_xdg() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let scratch = private_scratch()?;
+    let mgr_runtime = scratch.path().join("mgr-runtime");
+    let config = scratch.path().join("config/systemd/user");
+    fs::create_dir_all(&config)?;
+    fs::write(
+        config.join("tsindex.service"),
+        format!(
+            "[Unit]\nAfter=default.target\n[Service]\nExecStart={} daemon run\nRestart=on-failure\n[Install]\nWantedBy=default.target\n",
+            serde_json::to_string(BIN)?
+        ),
+    )?;
+    let bin = scratch.path().join("bin");
+    fs::create_dir(&bin)?;
+    let manager = bin.join("systemctl");
+    fs::write(
+        &manager,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *show-environment*) printf 'XDG_RUNTIME_DIR={}\\n' ;;\n  *) exit 0 ;;\nesac\n",
+            mgr_runtime.display()
+        ),
+    )?;
+    fs::set_permissions(&manager, fs::Permissions::from_mode(0o700))?;
+
+    let output = Command::new(BIN)
+        .args(["daemon", "status", "--json"])
+        .env("HOME", scratch.path())
+        .env("XDG_CONFIG_HOME", scratch.path().join("config"))
+        .env("PATH", &bin)
+        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("TSINDEX_HOME")
+        .env_remove("TSINDEX_SOCKET")
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    ensure!(
+        status["socket"]
+            == mgr_runtime
+                .join("tsindex/daemon.sock")
+                .to_string_lossy()
+                .as_ref(),
+        "expected manager runtime socket, got: {status}"
+    );
+    Ok(())
+}

@@ -336,15 +336,25 @@ fn resolve_binary(binary_override: Option<&Path>) -> Result<PathBuf> {
     Ok(binary)
 }
 
-fn verify_service_binary(binary: &Path) -> Result<()> {
-    let (mut output, stdout) = UnixStream::pair()?;
-    output.set_nonblocking(true)?;
+fn probe_service_binary(
+    binary: &Path,
+    args: &[&str],
+    capture_stdout: bool,
+) -> Result<(std::process::ExitStatus, Vec<u8>)> {
     let mut command = Command::new(binary);
     command
-        .arg("--version")
+        .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(OwnedFd::from(stdout)))
         .stderr(Stdio::null());
+    let output_reader = if capture_stdout {
+        let (output, stdout) = UnixStream::pair()?;
+        output.set_nonblocking(true)?;
+        command.stdout(Stdio::from(OwnedFd::from(stdout)));
+        Some(output)
+    } else {
+        command.stdout(Stdio::null());
+        None
+    };
     let mut child = command
         .spawn()
         .with_context(|| format!("cannot execute {binary:?}"))?;
@@ -358,20 +368,51 @@ fn verify_service_binary(binary: &Path) -> Result<()> {
                 let _ = child.kill();
                 let _ = child.wait();
                 result?;
-                bail!("service executable {binary:?} timed out responding to --version");
+                bail!(
+                    "service executable {binary:?} timed out responding to `{}`",
+                    args.join(" ")
+                );
             }
         }
     };
-    let mut buf = [0; 256];
-    if !status.success()
-        || !output.read(&mut buf).is_ok_and(|len| {
-            let version = &buf[..len];
-            version.starts_with(b"tsindex ") && version.ends_with(b"\n")
-        })
-    {
+    let mut captured = Vec::new();
+    if let Some(mut output) = output_reader {
+        let mut buf = [0; 256];
+        if let Ok(len) = output.read(&mut buf) {
+            captured.extend_from_slice(&buf[..len]);
+        }
+    }
+    Ok((status, captured))
+}
+
+fn verify_service_binary(binary: &Path) -> Result<()> {
+    let (status, version) = probe_service_binary(binary, &["--version"], true)?;
+    if !(status.success() && version.starts_with(b"tsindex ") && version.ends_with(b"\n")) {
         bail!(
             "service executable {binary:?} did not identify itself as tsindex (--version: {status})"
         );
+    }
+    // Verify the commands required by the generated activation units before
+    // stopping the currently running service or modifying unit definitions.
+    let (status, _) = probe_service_binary(
+        binary,
+        &["daemon", "run", "--socket-activated", "--help"],
+        false,
+    )?;
+    if !status.success() {
+        bail!(
+            "service executable {binary:?} does not support socket-activated daemon units (`daemon run --socket-activated`: {status})"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let (status, _) =
+            probe_service_binary(binary, &["daemon", "check-socket", "--help"], false)?;
+        if !status.success() {
+            bail!(
+                "service executable {binary:?} does not support systemd socket validation (`daemon check-socket`: {status})"
+            );
+        }
     }
     Ok(())
 }
@@ -510,6 +551,15 @@ fn read_log_tail(log_path: &Path) -> String {
     lines[start..].join("\n")
 }
 
+fn prepare_service_dirs(paths: &DaemonPaths) -> Result<()> {
+    ensure_private_dir(paths.socket_dir()?)?;
+    crate::daemon::orchestrator::prepare_metadata_dir(paths)?;
+    if let Some(log_dir) = paths.log_path.parent() {
+        ensure_private_dir(log_dir)?;
+    }
+    Ok(())
+}
+
 /// Install and activate the user service at the resolved endpoint.
 pub fn install_service(
     paths: &DaemonPaths,
@@ -531,11 +581,7 @@ pub fn install_service(
         require_service_text(Path::new(&path))?;
     }
     let _install_lock = installation_lock()?;
-    ensure_private_dir(paths.socket_dir()?)?;
-    crate::daemon::orchestrator::prepare_metadata_dir(paths)?;
-    if let Some(log_dir) = paths.log_path.parent() {
-        ensure_private_dir(log_dir)?;
-    }
+    prepare_service_dirs(paths)?;
     let previous = PreviousInstall::capture()?;
     let owner = capture_running_daemon(paths, true)?;
     // Selecting an unrelated live endpoint must fail before stopping a current
@@ -938,15 +984,10 @@ fn legacy_default_socket() -> PathBuf {
     )
 }
 
-#[cfg(target_os = "linux")]
-fn endpoint_from_service() -> Result<PathBuf> {
-    let source = fs::read_to_string(service_file_path())?;
-    let command = source
-        .lines()
-        .find_map(|line| line.strip_prefix("ExecStart="))
-        .context("installed service has no ExecStart; run `tsindex daemon install` again")?;
+#[cfg(any(target_os = "linux", test))]
+fn parse_systemd_words(input: &str) -> Result<Vec<String>> {
     let mut args = Vec::new();
-    let mut remaining = command.trim();
+    let mut remaining = input.trim();
     // Our original renderer emitted JSON-compatible double-quoted paths and
     // plain command words. Decode that finite format without executing a shell.
     while !remaining.is_empty() {
@@ -967,11 +1008,153 @@ fn endpoint_from_service() -> Result<PathBuf> {
         }
         remaining = remaining.trim_start();
     }
-    Ok(args
+    Ok(args)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_systemd_unit_env(source: &str) -> std::collections::HashMap<String, String> {
+    let mut env = std::collections::HashMap::new();
+    let mut in_service = false;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_service = trimmed == "[Service]";
+            continue;
+        }
+        if !in_service {
+            continue;
+        }
+        let Some(value) = trimmed.strip_prefix("Environment=") else {
+            continue;
+        };
+        let Ok(words) = parse_systemd_words(value) else {
+            continue;
+        };
+        if words.is_empty() {
+            env.clear();
+            continue;
+        }
+        for word in words {
+            if let Some((key, val)) = word.split_once('=') {
+                env.insert(key.to_string(), val.to_string());
+            }
+        }
+    }
+    env
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_manager_environment(output: &str) -> std::collections::HashMap<String, String> {
+    let mut env = std::collections::HashMap::new();
+    for line in output.lines() {
+        let Some((key, raw)) = line.split_once('=') else {
+            continue;
+        };
+        let value = if raw.starts_with('"') && raw.ends_with('"') {
+            serde_json::from_str::<String>(raw).unwrap_or_else(|_| raw.to_string())
+        } else {
+            raw.to_string()
+        };
+        env.insert(key.to_string(), value);
+    }
+    env
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_user_environment() -> Option<String> {
+    let output = Command::new("systemctl")
+        .args(["--user", "show-environment"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    (!text.trim().is_empty()).then_some(text)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn endpoint_from_systemd_unit(
+    source: &str,
+    manager_env: impl FnOnce() -> Option<String>,
+    fallback_xdg_runtime_dir: Option<std::ffi::OsString>,
+    default_home: &Path,
+    uid: u32,
+) -> Result<PathBuf> {
+    let command = source
+        .lines()
+        .find_map(|line| line.strip_prefix("ExecStart="))
+        .context("installed service has no ExecStart; run `tsindex daemon install` again")?;
+    let args = parse_systemd_words(command)?;
+    if let Some(socket) = args
         .windows(2)
         .find(|pair| pair[0] == "--socket")
         .map(|pair| PathBuf::from(&pair[1]))
-        .unwrap_or_else(legacy_default_socket))
+    {
+        return Ok(socket);
+    }
+    // A socketless legacy unit receives XDG_RUNTIME_DIR (and any unit
+    // Environment= overrides) from systemd --user rather than the invoking shell.
+    let unit_env = parse_systemd_unit_env(source);
+    let mgr_env = manager_env().map(|text| parse_manager_environment(&text));
+    let lookup = |key: &str| -> Option<String> {
+        if let Some(value) = unit_env.get(key) {
+            return (!value.is_empty()).then(|| value.clone());
+        }
+        mgr_env
+            .as_ref()
+            .and_then(|map| map.get(key))
+            .filter(|value| !value.is_empty())
+            .cloned()
+    };
+    if let Some(socket) = lookup("TSINDEX_SOCKET") {
+        return Ok(PathBuf::from(socket));
+    }
+    if let Some(home) = lookup("TSINDEX_HOME") {
+        return Ok(PathBuf::from(home).join("run").join("daemon.sock"));
+    }
+    let xdg_runtime_dir = if unit_env.contains_key("XDG_RUNTIME_DIR") {
+        unit_env
+            .get("XDG_RUNTIME_DIR")
+            .filter(|value| !value.is_empty())
+            .map(std::ffi::OsString::from)
+    } else if let Some(mgr) = &mgr_env {
+        mgr.get("XDG_RUNTIME_DIR")
+            .filter(|value| !value.is_empty())
+            .map(std::ffi::OsString::from)
+    } else {
+        fallback_xdg_runtime_dir
+    };
+    #[cfg(target_os = "linux")]
+    {
+        Ok(crate::daemon::default_socket_path(
+            xdg_runtime_dir,
+            default_home,
+            uid,
+        ))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if let Some(runtime) = xdg_runtime_dir.filter(|value| !value.is_empty()) {
+            let candidate = PathBuf::from(runtime).join("tsindex").join("daemon.sock");
+            if candidate.as_os_str().as_encoded_bytes().len() <= 100 {
+                return Ok(candidate);
+            }
+        }
+        Ok(crate::daemon::default_socket_path(None, default_home, uid))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn endpoint_from_service() -> Result<PathBuf> {
+    let source = fs::read_to_string(service_file_path())?;
+    endpoint_from_systemd_unit(
+        &source,
+        systemd_user_environment,
+        env::var_os("XDG_RUNTIME_DIR"),
+        &home_path(".tsindex"),
+        crate::daemon::current_uid(),
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -1134,7 +1317,9 @@ fn start_os_service() -> Result<()> {
         return Ok(());
     }
     let socket = endpoint_from_service()?;
-    check_socket(&DaemonPaths::resolve(Some(&socket))?)?;
+    let paths = DaemonPaths::resolve(Some(&socket))?;
+    check_socket(&paths)?;
+    prepare_service_dirs(&paths)?;
     let domain = format!("gui/{}", crate::daemon::current_uid());
     manager_output(
         Command::new("launchctl")
@@ -1458,5 +1643,122 @@ mod tests {
         assert!(activation.contains("ExecStartPre=\"/opt/build$/tsindex\" "));
         assert!(service.contains("--socket \"/run/user/1000/$$name.sock\""));
         assert!(activation.contains("--socket \"/run/user/1000/$$name.sock\""));
+    }
+
+    #[test]
+    fn verify_service_binary_rejects_binary_without_activation_support() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir_in("/tmp")?;
+        let pre_activation = dir.path().join("old-tsindex");
+        fs::write(
+            &pre_activation,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'tsindex 2.0.0\\n'; exit 0; fi\nexit 2\n",
+        )?;
+        fs::set_permissions(&pre_activation, fs::Permissions::from_mode(0o700))?;
+
+        let error = verify_service_binary(&pre_activation).unwrap_err();
+        assert!(
+            error.to_string().contains("socket-activated"),
+            "unexpected error: {error:#}"
+        );
+
+        #[cfg(target_os = "linux")]
+        {
+            let missing_check_socket = dir.path().join("no-check-socket");
+            fs::write(
+                &missing_check_socket,
+                "#!/bin/sh\ncase \"$*\" in\n  --version) printf 'tsindex 2.0.0\\n'; exit 0 ;;\n  'daemon run --socket-activated --help') exit 0 ;;\n  *) exit 2 ;;\nesac\n",
+            )?;
+            fs::set_permissions(&missing_check_socket, fs::Permissions::from_mode(0o700))?;
+            let error = verify_service_binary(&missing_check_socket).unwrap_err();
+            assert!(
+                error.to_string().contains("check-socket"),
+                "unexpected error: {error:#}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn socketless_legacy_systemd_unit_resolves_from_manager_environment() -> Result<()> {
+        let legacy =
+            "[Unit]\nAfter=default.target\n[Service]\nExecStart=\"/usr/bin/tsindex\" daemon run\n";
+        let home = Path::new("/home/dev/.tsindex");
+
+        // Invoking shell unset XDG_RUNTIME_DIR, but systemd --user supplies it.
+        let socket = endpoint_from_systemd_unit(
+            legacy,
+            || Some("HOME=/home/dev\nXDG_RUNTIME_DIR=/run/user/1000\n".into()),
+            None,
+            home,
+            1000,
+        )?;
+        assert_eq!(socket, PathBuf::from("/run/user/1000/tsindex/daemon.sock"));
+
+        // Manager environment without XDG_RUNTIME_DIR does not inherit client shell XDG_RUNTIME_DIR.
+        let socket = endpoint_from_systemd_unit(
+            legacy,
+            || Some("HOME=/home/dev\n".into()),
+            Some("/tmp/client-runtime".into()),
+            home,
+            1000,
+        )?;
+        assert_eq!(socket, PathBuf::from("/home/dev/.tsindex/run/daemon.sock"));
+
+        // Unit-level Environment= overrides manager environment.
+        let with_home = "[Service]\nEnvironment=\"TSINDEX_HOME=/opt/tsindex-home\"\nExecStart=\"/usr/bin/tsindex\" daemon run\n";
+        let socket = endpoint_from_systemd_unit(
+            with_home,
+            || Some("XDG_RUNTIME_DIR=/run/user/1000\n".into()),
+            None,
+            home,
+            1000,
+        )?;
+        assert_eq!(socket, PathBuf::from("/opt/tsindex-home/run/daemon.sock"));
+
+        // Explicit --socket skips manager environment lookup entirely.
+        let explicit =
+            "[Service]\nExecStart=\"/usr/bin/tsindex\" daemon run --socket \"/tmp/custom.sock\"\n";
+        let socket = endpoint_from_systemd_unit(
+            explicit,
+            || panic!("manager environment should not be queried when --socket is explicit"),
+            None,
+            home,
+            1000,
+        )?;
+        assert_eq!(socket, PathBuf::from("/tmp/custom.sock"));
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_service_dirs_recreates_missing_nested_endpoint_ancestors() -> Result<()> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir_in("/tmp")?;
+        let outer = dir.path().join("outer");
+        let inner = outer.join("inner");
+        let socket = inner.join("daemon.sock");
+        let paths = DaemonPaths::resolve(Some(&socket))?;
+        assert!(!outer.exists());
+
+        check_socket(&paths)?;
+        prepare_service_dirs(&paths)?;
+        assert!(inner.is_dir());
+        assert_eq!(
+            fs::symlink_metadata(&inner)?.permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(paths.lock_path.parent().unwrap().join("owner").is_file());
+
+        // Symlink socket directories must still be rejected by validation.
+        let target = dir.path().join("target");
+        fs::create_dir(&target)?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700))?;
+        let link_dir = dir.path().join("link-dir");
+        symlink(&target, &link_dir)?;
+        let link_paths = DaemonPaths::resolve(Some(&link_dir.join("daemon.sock")))?;
+        assert!(prepare_service_dirs(&link_paths).is_err());
+        Ok(())
     }
 }

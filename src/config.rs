@@ -188,6 +188,13 @@ impl TsIndexConfig {
         fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))?;
         Ok(path)
     }
+
+    /// Any configured ignore file (`[ignore].extra` or `[[repos]].ignore`) is
+    /// passed to `ignore::WalkBuilder::add_ignore`, which opens relative paths
+    /// and anchors patterns against the process working directory.
+    pub fn has_explicit_ignore_files(&self) -> bool {
+        !self.ignore.extra.is_empty() || self.repos.iter().any(|repo| !repo.ignore.is_empty())
+    }
 }
 
 pub fn config_path(root: &Path) -> PathBuf {

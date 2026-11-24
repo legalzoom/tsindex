@@ -402,7 +402,7 @@ fn directory_inputs(dir: &Path) -> Vec<PathBuf> {
 }
 
 #[allow(deprecated)] // Match the pinned ignore crate's home-directory lookup.
-fn global_inputs() -> Vec<PathBuf> {
+pub(crate) fn global_inputs() -> Vec<PathBuf> {
     let home = std::env::home_dir();
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|value| !value.is_empty())

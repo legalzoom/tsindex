@@ -110,13 +110,13 @@ fn sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
 
 pub fn watcher_lease_path(runtime: &Runtime) -> Result<PathBuf> {
     Ok(sidecar_path(
-        &runtime.db_path,
+        &key(&runtime.db_path),
         &format!("watch-{}.lock", configuration(runtime)?),
     ))
 }
 
 pub fn refresh_lease_path(db_path: &Path) -> PathBuf {
-    sidecar_path(db_path, "refresh.lock")
+    sidecar_path(&key(db_path), "refresh.lock")
 }
 
 struct Primary {
@@ -150,16 +150,26 @@ fn configuration(runtime: &Runtime) -> Result<String> {
     ))?;
     let mut digest = Sha256::new();
     digest.update(input);
-    // The same relative ignore filename can describe different rules for
-    // callers sharing a database. Do not reuse their watcher or freshness.
-    if runtime
-        .config
-        .ignore
-        .extra
-        .iter()
-        .any(|path| Path::new(path).is_relative())
-    {
-        digest.update(std::env::current_dir()?.as_os_str().as_encoded_bytes());
+    // Global Git exclude inputs come from each process's environment (HOME,
+    // XDG_CONFIG_HOME, core.excludesFile). Keep watcher leases and freshness
+    // markers scoped to the effective rule sources this process evaluates.
+    let global_excludes = crate::ignore_inputs::global_inputs();
+    digest.update(b"\0global-git-excludes:");
+    digest.update((global_excludes.len() as u64).to_le_bytes());
+    for path in global_excludes {
+        let resolved = key(&path);
+        let bytes = resolved.as_os_str().as_encoded_bytes();
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+    }
+    // Every configured ignore file (`[ignore].extra` or `[[repos]].ignore`),
+    // relative or absolute, is matched against the process working directory.
+    if runtime.config.has_explicit_ignore_files() {
+        let cwd = std::env::current_dir()?;
+        let bytes = cwd.as_os_str().as_encoded_bytes();
+        digest.update(b"\0explicit-ignore-cwd:");
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
     }
     Ok(format!("{:x}", digest.finalize()))
 }
@@ -179,7 +189,7 @@ fn generation(runtime: &Runtime) -> Result<i64> {
 pub fn refresh_marker_path(db_path: &Path) -> PathBuf {
     // Direct Runtime users need not have generated .tsindex ignore rules.
     // Keep maintenance artifacts outside the source extension allowlist.
-    sidecar_path(db_path, "refresh-state")
+    sidecar_path(&key(db_path), "refresh-state")
 }
 
 fn marker_refreshed_at(runtime: &Runtime) -> Option<Instant> {
@@ -246,8 +256,43 @@ fn primaries() -> &'static Mutex<HashMap<PathBuf, Arc<Primary>>> {
     PRIMARIES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Resolve existing targets, symlinked parents, and dangling symlink leaves to
+/// one canonical path so direct and managed runtimes coalesce sidecars.
+pub(crate) fn canonical_target(path: &Path) -> std::io::Result<PathBuf> {
+    resolve_canonical_target(path, 0)
+}
+
+fn resolve_canonical_target(path: &Path, depth: u8) -> std::io::Result<PathBuf> {
+    match path.canonicalize() {
+        Ok(resolved) => Ok(resolved),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if depth < 40
+                && let Ok(meta) = fs::symlink_metadata(path)
+                && meta.file_type().is_symlink()
+            {
+                let target = fs::read_link(path)?;
+                let next = if target.is_absolute() {
+                    target
+                } else {
+                    path.parent().unwrap_or(Path::new("")).join(target)
+                };
+                return resolve_canonical_target(&next, depth + 1);
+            }
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .ok_or(error)?;
+            Ok(resolve_canonical_target(parent, depth)?.join(
+                path.file_name()
+                    .ok_or_else(|| std::io::Error::other("missing path filename"))?,
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn key(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    canonical_target(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn primary(path: &Path) -> Option<Arc<Primary>> {

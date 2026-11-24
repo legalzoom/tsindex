@@ -1157,3 +1157,141 @@ fn refresh_failure_is_reported_instead_of_returning_old_results() -> Result<()> 
     }
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn symlinked_db_paths_coalesce_maintenance_sidecars_and_keep_legacy_writer_lease() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let (_dir, root) = fixture()?;
+    let target_dir = tempfile::tempdir_in("/tmp")?;
+    let alias_dir = tempfile::tempdir_in("/tmp")?;
+    let real_db = target_dir.path().join("index.db");
+    let alias_db = alias_dir.path().join("alias.db");
+    symlink(&real_db, &alias_db)?;
+
+    // Even before the database file exists (dangling symlink), maintenance
+    // sidecars coalesce onto the canonical target while the legacy writer lease
+    // stays next to the supplied alias path.
+    assert_eq!(
+        maintenance::refresh_marker_path(&alias_db),
+        maintenance::refresh_marker_path(&real_db)
+    );
+    assert_eq!(
+        maintenance::refresh_lease_path(&alias_db),
+        maintenance::refresh_lease_path(&real_db)
+    );
+    assert_eq!(
+        maintenance::writer_lease_path(&alias_db),
+        alias_db.with_extension("ingest.lock")
+    );
+    assert_ne!(
+        maintenance::writer_lease_path(&alias_db),
+        maintenance::writer_lease_path(&real_db)
+    );
+
+    let mut config = TsIndexConfig::default();
+    config.languages.include = vec!["python".into()];
+    config.server.worktree_refresh_ms = 60_000;
+    let direct_alias = Runtime::new(root.clone(), alias_db.clone(), config.clone(), vec![]);
+    let managed_real = Runtime::new(root.clone(), real_db.clone(), config, vec![]);
+
+    assert_eq!(
+        maintenance::watcher_lease_path(&direct_alias)?,
+        maintenance::watcher_lease_path(&managed_real)?
+    );
+
+    // A refresh recorded through the alias must be reused by the target runtime.
+    maintenance::reconcile_if_due(&direct_alias)?;
+    fs::write(
+        root.join("a.py"),
+        "def after_shared_refresh():\n    return 2\n",
+    )?;
+    maintenance::reconcile_if_due(&managed_real)?;
+    let still_old = managed_real.get_symbol(tsindex::index::GetSymbolArgs {
+        name: Some("before_edit".into()),
+        names: None,
+        kind: None,
+        file_glob: None,
+        repo: None,
+        include_body: false,
+        context_lines: 0,
+        max_body_lines: None,
+        limit: Some(10),
+        offset: None,
+    })?;
+    assert_eq!(
+        still_old.total, 1,
+        "managed runtime did not reuse alias refresh marker"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn global_git_excludes_scope_watcher_leases_and_freshness_markers() -> Result<()> {
+    let (_dir, root) = fixture()?;
+    fs::write(root.join("secret.py"), "def secret_fn():\n    return 9\n")?;
+    let mut config = TsIndexConfig::default();
+    config.languages.include = vec!["python".into()];
+    config.server.worktree_refresh_ms = 60_000;
+    config.write(&root)?;
+
+    let home = tempfile::tempdir_in("/tmp")?;
+    let xdg_excluding = tempfile::tempdir_in("/tmp")?;
+    let xdg_plain = tempfile::tempdir_in("/tmp")?;
+    fs::create_dir_all(xdg_excluding.path().join("git"))?;
+    fs::write(xdg_excluding.path().join("git/ignore"), "secret.py\n")?;
+
+    let mcp_lookup = |xdg: &Path, name: &str| -> Result<Value> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new(env!("CARGO_BIN_EXE_tsindex"))
+            .arg("--root")
+            .arg(&root)
+            .args(["serve", "--mcp"])
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", xdg)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        {
+            let stdin = child.stdin.as_mut().unwrap();
+            writeln!(
+                stdin,
+                "{}",
+                json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}})
+            )?;
+            writeln!(
+                stdin,
+                "{}",
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_symbol","arguments":{"name":name}}})
+            )?;
+            stdin.flush()?;
+        }
+        drop(child.stdin.take());
+        let output = child.wait_with_output()?;
+        anyhow::ensure!(output.status.success(), "mcp server failed");
+        let lines: Vec<&str> = std::str::from_utf8(&output.stdout)?.lines().collect();
+        let reply: Value = serde_json::from_str(lines.last().context("missing reply")?)?;
+        let text = reply["result"]["content"][0]["text"]
+            .as_str()
+            .context("missing tool content")?;
+        Ok(serde_json::from_str(text)?)
+    };
+
+    // First process excludes secret.py and writes a fresh marker scoped to its
+    // global gitignore environment.
+    assert_eq!(mcp_lookup(xdg_excluding.path(), "before_edit")?["total"], 1);
+    assert_eq!(mcp_lookup(xdg_excluding.path(), "secret_fn")?["total"], 0);
+
+    // Second process has a different XDG_CONFIG_HOME (no global exclude) on the
+    // same checkout and DB; it must NOT reuse the first process's marker.
+    assert_eq!(mcp_lookup(xdg_plain.path(), "secret_fn")?["total"], 1);
+
+    // Going back to the excluding XDG_CONFIG_HOME must NOT reuse the plain
+    // process's marker either.
+    assert_eq!(mcp_lookup(xdg_excluding.path(), "secret_fn")?["total"], 0);
+    Ok(())
+}

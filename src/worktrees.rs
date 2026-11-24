@@ -347,16 +347,21 @@ impl Runtimes {
         // Waiting releases its entry lock; the global registry is already free.
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut entry = state.entry.lock().unwrap_or_else(|p| p.into_inner());
-        let refresh = Duration::from_millis(self.primary.config.server.worktree_refresh_ms);
+        let primary_refresh = Duration::from_millis(self.primary.config.server.worktree_refresh_ms);
         // A different owner can publish this shared DB during our warm
         // interval. Check the live generation without relying on the marker
-        // still being present.
+        // still being present, and cap reuse by the linked checkout's interval.
         if !entry.pending
             && !entry
                 .refreshed
                 .as_ref()
                 .zip(entry.runtime.as_ref())
-                .is_some_and(|(completed, runtime)| completed.is_current(runtime, refresh))
+                .is_some_and(|(completed, runtime)| {
+                    let refresh = primary_refresh.min(Duration::from_millis(
+                        runtime.config.server.worktree_refresh_ms,
+                    ));
+                    completed.is_current(runtime, refresh)
+                })
         {
             let mut config = self.primary.config.clone();
             if let Some(workspace) = self

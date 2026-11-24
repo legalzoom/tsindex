@@ -623,6 +623,67 @@ fn warm_linked_checkout_reconciles_after_another_owner_publishes() -> Result<()>
 }
 
 #[test]
+fn warm_linked_checkout_honors_linked_refresh_interval() -> Result<()> {
+    let daemon = common::TestDaemon::start_with_env(&[("TSINDEX_RUNTIME_IDLE_SECS", "60")])?;
+    let fixture = tempdir_in("/tmp")?;
+    let main = fixture.path().join("main");
+    let linked = fixture.path().join("topic");
+    build_fixture(
+        &linked,
+        "lib.py",
+        "def old_linked_symbol():\n    return 1\n",
+    )?;
+    link_checkout(&main, &linked, "topic")?;
+    build_fixture(&main, "main.py", "def main_symbol():\n    return 1\n")?;
+
+    let mut primary_cfg = TsIndexConfig::load(&main)?;
+    primary_cfg.server.worktree_refresh_ms = 60_000;
+    primary_cfg.write(&main)?;
+
+    let mut linked_cfg = TsIndexConfig::load(&linked)?;
+    linked_cfg.server.worktree_refresh_ms = 250;
+    linked_cfg.write(&linked)?;
+
+    let mut first = McpSession::connect(&daemon.socket, &main, "warm-first")?;
+    let owner_pid = managed_session(&daemon, "warm-first")?.runtime_pid;
+    assert_eq!(
+        first.call_tool(
+            "get_symbol",
+            json!({"repo": &linked, "names": ["old_linked_symbol"]})
+        )?["total"],
+        1
+    );
+    first.close_gracefully()?;
+
+    fs::write(
+        linked.join("lib.py"),
+        "def new_linked_symbol():\n    return 2\n",
+    )?;
+    thread::sleep(Duration::from_millis(400));
+
+    let mut second = McpSession::connect(&daemon.socket, &main, "warm-second")?;
+    assert_eq!(
+        managed_session(&daemon, "warm-second")?.runtime_pid,
+        owner_pid
+    );
+    assert_eq!(
+        second.call_tool(
+            "get_symbol",
+            json!({"repo": &linked, "names": ["old_linked_symbol"]})
+        )?["total"],
+        0
+    );
+    assert_eq!(
+        second.call_tool(
+            "get_symbol",
+            json!({"repo": &linked, "names": ["new_linked_symbol"]})
+        )?["total"],
+        1
+    );
+    second.close_gracefully()
+}
+
+#[test]
 fn freshly_seeded_checkout_retains_its_projected_runtime_key() -> Result<()> {
     let daemon = common::TestDaemon::start()?;
     let fixture = tempdir_in("/tmp")?;

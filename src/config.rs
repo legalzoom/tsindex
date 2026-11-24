@@ -180,12 +180,54 @@ impl TsIndexConfig {
     }
 
     pub fn write(&self, root: &Path) -> Result<PathBuf> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
         let config_dir = root.join(".tsindex");
         fs::create_dir_all(&config_dir)
             .with_context(|| format!("failed to create {}", config_dir.display()))?;
         let path = config_dir.join("config.toml");
         let raw = toml::to_string_pretty(self).context("failed to serialize config")?;
-        fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))?;
+        // Publish atomically so concurrent readers (e.g. managed clients joining
+        // a linked checkout during preparation) never see an empty or partial file.
+        let pid = std::process::id();
+        let (temporary, mut file) = loop {
+            let seq = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+            let candidate = config_dir.join(format!(".config.toml.{pid}.{seq}.tmp"));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => break (candidate, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to write {}", path.display()));
+                }
+            }
+        };
+        let result = (|| -> Result<()> {
+            file.write_all(raw.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            match fs::rename(&temporary, &path) {
+                Ok(()) => Ok(()),
+                #[cfg(windows)]
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let _ = fs::remove_file(&path);
+                    fs::rename(&temporary, &path)?;
+                    Ok(())
+                }
+                Err(error) => Err(error.into()),
+            }
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result.with_context(|| format!("failed to write {}", path.display()))?;
         Ok(path)
     }
 
@@ -203,4 +245,61 @@ pub fn config_path(root: &Path) -> PathBuf {
 
 pub fn db_path(root: &Path) -> PathBuf {
     root.join(".tsindex").join("index.db")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::thread;
+
+    #[test]
+    fn config_write_publishes_atomically_under_concurrent_reads() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().to_path_buf();
+        let mut config = TsIndexConfig::default();
+        config.repos.push(RepoConfig {
+            name: "alpha".into(),
+            path: ".".into(),
+            languages: vec!["rust".into(), "python".into()],
+            ignore: vec!["custom.ignore".into()],
+        });
+        config.write(&root)?;
+
+        let done = Arc::new(AtomicBool::new(false));
+        let reader_done = Arc::clone(&done);
+        let reader_root = root.clone();
+        let reader = thread::spawn(move || -> Result<usize> {
+            let mut reads = 0usize;
+            while !reader_done.load(Ordering::Relaxed) || reads < 50 {
+                let loaded = TsIndexConfig::load(&reader_root)?;
+                anyhow::ensure!(
+                    loaded.repos.len() == 1 && loaded.repos[0].name == "alpha",
+                    "observed partial or default config during concurrent write"
+                );
+                reads += 1;
+            }
+            Ok(reads)
+        });
+
+        for _ in 0..80 {
+            config.write(&root)?;
+        }
+        done.store(true, Ordering::Relaxed);
+        let reads = reader.join().expect("reader thread panicked")?;
+        assert!(reads >= 50);
+
+        let leftovers: Vec<_> = fs::read_dir(root.join(".tsindex"))?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "unexpected temporary config files left behind: {leftovers:?}"
+        );
+        Ok(())
+    }
 }

@@ -1273,8 +1273,14 @@ fn global_git_excludes_scope_watcher_leases_and_freshness_markers() -> Result<()
         drop(child.stdin.take());
         let output = child.wait_with_output()?;
         anyhow::ensure!(output.status.success(), "mcp server failed");
-        let lines: Vec<&str> = std::str::from_utf8(&output.stdout)?.lines().collect();
-        let reply: Value = serde_json::from_str(lines.last().context("missing reply")?)?;
+        let replies: Vec<Value> = std::str::from_utf8(&output.stdout)?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<_, _>>()?;
+        let reply = replies
+            .into_iter()
+            .find(|value| value["id"] == 2)
+            .context("missing lookup reply")?;
         let text = reply["result"]["content"][0]["text"]
             .as_str()
             .context("missing tool content")?;

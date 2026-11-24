@@ -37,12 +37,28 @@ index refresh as an eager warm-up, and exits:
 tsindex --root <target> update
 ```
 
-It does not install LaunchAgents, use `nohup`, or leave a watcher running after
-the startup command exits. `serve --mcp` runs its own in-process watcher for the
-lifetime of the server (startup refresh, then filesystem notifications), so this
-warm-up is helpful but not required for freshness once the MCP server is up. To
-keep a foreground watcher attached to the current shell for CLI-only sessions
-that never start `serve --mcp`, run:
+The startup script refreshes the index on demand and exits. The default
+`serve --mcp` runs directly in its launcher's environment, owns a coordinated
+watcher for its session, and tracks its harness process. Configure this command
+inside the harness's sandbox to retain its filesystem restrictions. For hosts
+that launch MCP outside the shell sandbox, configure an explicit sandbox
+launcher around the MCP command. See the Linux bubblewrap recipe in the
+repository README's "MCP servers and the shared daemon" section.
+
+Trusted unrestricted sessions can opt into the shared user daemon with
+`serve --mcp --via-daemon` after `tsindex daemon install`. This grants the
+session the daemon's filesystem authority, including `replace_symbol` writes.
+Compatible trusted sessions share their warm index and watcher. Each connection
+owns its pending requests and edits and reuses up to four private lookup
+connections. A timed-out accepted lookup releases that connection while other
+sessions continue. Managed startup remains inspectable until the child loads
+its settings and attaches to an initialized index owner. Use `daemon sessions`
+to inspect worker and index-owner PIDs, and `daemon status` to check effective
+capacity under the launcher's descriptor limit. Keep the daemon socket outside
+an untrusted sandbox's mounted filesystem.
+
+To keep a foreground watcher attached to the current shell for CLI-only
+sessions that never start `serve --mcp`, run:
 
 ```bash
 TSINDEX_START_MODE=watch bash "$skill_root/scripts/start-tsindex.sh"
@@ -155,7 +171,9 @@ separate `watch` only matters for CLI-only sessions.
 ## Guardrails
 
 - Keep this skill scoped to tsindex startup and code-reading behavior.
-- Do not install persistent daemons or background watchers.
+- Install or start the orchestrator only when the user requests it. The default
+  `serve --mcp` works directly. A configured `--via-daemon` launch needs its
+  selected daemon endpoint to be available.
 - Do not add product-specific paths, repo names, patterns, or MCP tools.
 - Use tsindex for code structure, not string search.
 - Fall back gracefully to `rg` and targeted reads when MCP tools are

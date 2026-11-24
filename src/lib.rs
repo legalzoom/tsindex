@@ -1,5 +1,6 @@
 pub mod app;
 pub mod config;
+pub mod daemon;
 pub mod detect;
 mod ignore_inputs;
 pub mod index;

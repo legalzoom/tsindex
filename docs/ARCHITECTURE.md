@@ -17,6 +17,9 @@ separate indexes or source-discovery rules.
 - `src/overlay.rs` owns immutable base publication, private staging, and merged
   read views. `src/maintenance.rs` coordinates database writers, watcher
   ownership, and successful full-refresh markers across server processes.
+- `src/daemon/` implements the login-started user orchestrator (`orchestrator.rs`),
+  the warm index pool (`runtime.rs`), the stdio proxy (`proxy.rs`), and service
+  management (`service.rs`) for macOS `launchd` and Linux `systemd --user`.
 
 ## Checkout storage
 
@@ -206,20 +209,162 @@ wait for an active catalog mutation, whose exclusive section includes cloning.
 This fence coordinates requests within one HTTP server. Existing host, origin,
 size, and read-only tool guards remain in the HTTP dispatch path.
 
-## Process ownership
+## MCP launch context and process ownership
 
-`src/lifecycle.rs` monitors an owning process every five seconds on a dedicated
-thread, starting before index initialization. MCP infers its immediate parent;
-an explicit `--session-pid` replaces parent monitoring and also enables cleanup
-for HTTP servers and watchers. Inferred owners that cannot be inspected retain
-parent-PID-only tracking; inspection failures after capture do not imply exit.
+`tsindex --root <path> serve --mcp` runs the MCP server inside its launching
+process's environment. This preserves a harness's kernel sandbox when its MCP
+command executes there. Shell sandboxes and MCP hosts can use different launch
+contexts, so a host that starts MCP externally must wrap the executable in its
+sandbox launcher. The README includes a Linux bubblewrap command that grants
+one writable workspace and read-only runtime dependencies. Source data,
+databases with cached snippets, and caches share the harness's access policy.
 
-Linux reads process metadata as bytes because the kernel can truncate a process
-name inside a UTF-8 character. Only fields following the process name in
-`/proc/<pid>/stat` are decoded. Its start time detects PID reuse, and its thread
-count distinguishes a zombie leader with surviving workers from an entirely
-exited process. Both values come from the same read without scanning individual
-threads.
+Trusted clients opt into shared supervision using `--mcp --via-daemon`. The
+daemon authenticates clients by effective user identity. The proxy verifies the
+private endpoint and server credentials. On macOS a manager-owned listener can
+retain launchd's root creator credentials after handoff. Reaching the daemon
+endpoint grants that user's daemon authority, including source modification. The
+endpoint belongs outside the mount view of untrusted clients. Explicit transport
+selection keeps filesystem authority visible in the host configuration.
+
+The installed service uses a manager-owned Unix listening socket. systemd
+provides its listening descriptor to `tsindex daemon run --socket-activated` on
+Linux, and launchd provides the `Listeners` socket on macOS. The service manager
+retains endpoint ownership through a daemon restart. Installation, service
+start, and launchd bootstrap validate the reserved endpoint before binding. A
+Linux socket-unit pre-bind hook repeats that validation on activation. Manual
+foreground operation binds a private endpoint after obtaining its instance lease
+and checking its filesystem entries. Sidecars use a namespace reserved for the
+complete socket filename. Directory validation checks ownership and private
+permissions before either side connects or creates runtime files.
+
+The orchestrator starts without opening databases or registering watchers.
+A trusted session receives an MCP worker and a lease on a shared index owner.
+Startup has two stages. First, the cancellable session worker canonicalizes the
+checkout and database, loads or projects its settings, and sends its runtime
+key through its private startup pipe. The daemon supplies a matching owner's
+channel through a bootstrap socket using `SCM_RIGHTS`. The worker then opens
+its first lookup connection and waits for index initialization before sending
+its readiness acknowledgement. Checkout filesystem I/O stays in a child that
+can be inspected and stopped throughout startup.
+
+The first worker to acknowledge readiness confirms its owner's generation.
+An owner still waiting for this first success after two 120-second startup
+windows stops accepting new sessions. The next attachment gets a fresh owner,
+and pending clients can finish on the old one. After a successful startup,
+slow lookups never trip this cold-start deadline.
+
+The runtime key includes the canonical checkout, caller's working directory,
+explicit database override and its canonical target, normalized language
+filters, refresh policy, effective configuration digest, and executable image.
+The caller directory preserves relative ignore-file semantics. The explicit
+database spelling preserves the direct client's writer lease and disables
+repo pruning. Both the session worker and index owner compute the digest from
+their own loaded settings. Linux uses
+the mapped executable's device and inode from `/proc/self/exe`. macOS uses the
+mapped executable UUID when available, falling back to executable-file metadata
+for a build without a usable UUID. A generation mismatch fails initialization
+and asks the client to reconnect.
+
+Each index owner retains one `Runtimes` registry, including its primary
+maintenance coordinator and lazy linked-checkout cache. The daemon passes the
+worker a private Unix socket for this registry. Each session establishes up to
+four reusable lookup connections by passing a private socket endpoint with
+`SCM_RIGHTS`. An independent intake loop acknowledges descriptor receipt before
+the lookup can block, then sends readiness after initialization. Each connection
+serves lookup requests sequentially, while separate connections can overlap. The
+owner bounds them to four per session and four times the effective session
+maximum in aggregate. MCP request IDs stay in the session worker.
+
+A timed-out accepted lookup drops its connection. The worker, index, and other
+sessions remain usable, and its unfinished task stays charged to the session
+until it returns. Failure to acknowledge an incoming connection marks the
+owner unresponsive and retires that generation from future attachments.
+Existing peers retain access while they have leases. Queries and edits execute
+locally in the session worker against the prepared snapshot. Killing a worker
+stops its edits. Background index maintenance can finish for other clients.
+Linked-checkout reconciliation reloads the checkout's own configuration while
+retaining its warm state between refreshes.
+
+The last connection releases its lease. At most four idle owners survive for a
+default 60 seconds. Owner loss ends its attached sessions, and the next
+connection starts a new process. A new attachment that finds a stopped owner
+requests its termination before creating a replacement. Old sessions end when
+that owner exits. Current, retired, and exiting owners share a finite pool of
+`max_sessions + 5` entries, including the idle allowance and one replacement.
+A child awaiting kernel exit still counts until reaped. Pool shutdown requests
+termination for all owners and bounds its final wait to two seconds.
+
+A private lifetime pipe wakes an index owner when the daemon dies. Linux also
+ties its parent-death signal to the long-lived pool thread. Live sessions stay
+independent of the thread that accepted the first client.
+
+The daemon reserves a session slot before launching children and rejects new
+sessions during shutdown. Linux and manual foreground daemons give workers
+separate process groups for per-session cleanup. Linux also applies
+parent-death signaling to the direct worker. Service-level cleanup on Linux
+uses `KillMode=mixed`, allowing the supervisor to receive the initial
+termination signal before cgroup-wide escalation. Socket-activated macOS
+workers remain in launchd's job process group for cleanup on daemon failure.
+Their per-session stop targets the direct child PID. Current MCP workers run
+operations in-process. Future helpers on every platform need explicit
+containment because a helper can leave its assigned process group. Linux's
+cgroup backstop applies to whole-service stops. Manual daemons depend on their
+own process supervision.
+
+The stdio proxy owns the MCP byte stream. It preserves the launcher's output
+descriptor flags. On macOS, a blocking stream socket can sleep on a full send
+buffer even with a per-call nonblocking flag. The proxy waits for write
+readiness and limits each send to the socket's send low-water mark. A
+message-oriented socket must already be nonblocking. The proxy sends each
+relay write as one datagram, subject to the socket's datagram size limit.
+
+Admission derives from the inherited `RLIMIT_NOFILE` soft limit and the
+requested `TSINDEX_MAX_SESSIONS`. The daemon counts available descriptor
+numbers after opening its own runtime handles. The per-session budget covers
+worker pipe ends, exec-status handles, data sockets, startup/bootstrap pairs,
+wake descriptors, one index owner, and an outcome watcher. Separate reserves
+cover up to four idle owners, one replacement awaiting exit, and serialized
+index-owner startup. The launcher's hard limit bounds its permitted
+soft limit. Measured foreground Linux starts admitted 8 sessions at a soft limit
+of 256 and 39 at 1024 with ordinary stdio and a private socket. Existing open
+descriptors can change the result. Status exposes the computed maximum.
+
+The resulting control budget admits at most 32 finite requests or connections
+awaiting classification, retaining each permit through its response. Workers
+in `Starting` and `Active` share the effective session limit. A separate pool
+allows at most that many outcome watchers and retains each lease through its
+terminal or error response, even after the worker leaves the registry. The
+aggregate handler limit is the effective control budget plus twice the session
+maximum. The accept loop checks shutdown between accepts.
+
+Workers send a bounded internal readiness record after runtime initialization.
+The proxy receives a session acknowledgement after that record, so invalid
+configuration and worker startup failures reach stderr and exit status. It
+registers a dedicated outcome connection before relaying MCP. The supervisor
+sends the reaped worker's final status on that existing connection even during
+whole-daemon shutdown. If a full disconnect or drain deadline triggers
+termination, the session retains that cause and the daemon logs the worker
+status. An ordinary stdin EOF keeps the reply channel open until the worker
+exits. After exit, each successful write renews a five-second deadline for
+draining its output. A raw client on macOS must close its final socket
+descriptor to abandon a reply. A shutdown on a retained descriptor can look
+like an ordinary input EOF to the daemon. Newline-delimited MCP messages pass
+through 16 MiB relay buffers. Worker startup has a 120-second deadline.
+A stop notification wakes supervision independently of blocked pipes.
+Shutdown has a finite graceful phase followed
+by TERM/KILL and child reaping, targeting the owned worker group or the direct
+child according to the platform launch mode. Session summaries are paginated.
+Per-session diagnostics retain up to 16 KiB and are fetched separately through
+`daemon sessions --id`.
+
+Direct MCP and HTTP/watch ownership use `SessionLifecycle`. Managed MCP shares
+one orchestrator sweeper using `ProcessOwner`. Both inspect process identity,
+including start time for PID reuse. Linux reads process metadata as bytes and
+uses the thread count from the same stat record to distinguish an exited leader
+with surviving threads from an entirely exited process. A connection can span
+multiple conversations when its host retains the transport and owner process.
+See [ADR 0004](adrs/0004-orchestrator-daemon.md).
 
 ## Filesystem updates
 

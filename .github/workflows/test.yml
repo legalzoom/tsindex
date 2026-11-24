@@ -28,8 +28,26 @@ jobs:
             ~/.cargo/registry
             target
           key: ${{ runner.os }}-test-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Prepare sandbox and user service validation
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          test_uid="$(id -u)"
+          sudo systemctl start "user@${test_uid}.service"
+          echo "XDG_RUNTIME_DIR=/run/user/${test_uid}" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${test_uid}/bus" >> "$GITHUB_ENV"
       - name: Run tests
+        env:
+          TSINDEX_REQUIRE_SANDBOX: "1"
+          TSINDEX_REQUIRE_SYSTEMD: "1"
         run: cargo test --locked
+      - name: Exercise installed daemon through the CLI
+        env:
+          TSINDEX_TEST_INSTALL: "1"
+        run: cargo test --locked --test service_activation installed_cli_controls_native_service -- --ignored --exact
       # Fetch the immutable writer independently: squash/rebase merges and
       # branch deletion can remove it from the main checkout's fetched history.
       - name: Checkout original overlay writer
@@ -76,7 +94,7 @@ jobs:
           cargo audit --deny warnings
 
   macos-clippy:
-    name: macOS clippy
+    name: macOS clippy and lifecycle
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
@@ -94,7 +112,20 @@ jobs:
             target
           key: ${{ runner.os }}-clippy-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - name: Clippy
+        id: native_clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Test daemon and activation lifecycle
+        run: |
+          cargo test --locked --lib daemon::
+          cargo test --locked --lib lifecycle::
+          cargo test --locked --no-fail-fast --test cli --test daemon --test lifecycle --test service_activation
+      - name: Exercise installed daemon through the CLI
+        # The clean-runner install has its own service name and preflight.
+        # Report its result even if an isolated daemon fixture failed.
+        if: ${{ !cancelled() && steps.native_clippy.outcome == 'success' }}
+        env:
+          TSINDEX_TEST_INSTALL: "1"
+        run: cargo test --locked --test service_activation installed_cli_controls_native_service -- --ignored --exact
 
   secrets:
     name: secret scan

@@ -12,6 +12,7 @@ use serde::Serialize;
 
 use crate::config::{RepoConfig, TsIndexConfig, db_path};
 use crate::index::Runtime;
+use crate::maintenance::Reconciliation;
 use crate::mcp::InvalidParams;
 
 #[derive(Debug, Clone)]
@@ -148,7 +149,7 @@ struct WorktreeEntry {
     started: u64,
     completed: u64,
     failure: Option<Arc<anyhow::Error>>,
-    refreshed: Option<Instant>,
+    refreshed: Option<Reconciliation>,
 }
 
 #[derive(Default)]
@@ -346,8 +347,22 @@ impl Runtimes {
         // Waiting releases its entry lock; the global registry is already free.
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut entry = state.entry.lock().unwrap_or_else(|p| p.into_inner());
-        let refresh = Duration::from_millis(self.primary.config.server.worktree_refresh_ms);
-        if !entry.pending && entry.refreshed.is_none_or(|time| time.elapsed() >= refresh) {
+        let primary_refresh = Duration::from_millis(self.primary.config.server.worktree_refresh_ms);
+        // A different owner can publish this shared DB during our warm
+        // interval. Check the live generation without relying on the marker
+        // still being present, and cap reuse by the linked checkout's interval.
+        if !entry.pending
+            && !entry
+                .refreshed
+                .as_ref()
+                .zip(entry.runtime.as_ref())
+                .is_some_and(|(completed, runtime)| {
+                    let refresh = primary_refresh.min(Duration::from_millis(
+                        runtime.config.server.worktree_refresh_ms,
+                    ));
+                    completed.is_current(runtime, refresh)
+                })
+        {
             let mut config = self.primary.config.clone();
             if let Some(workspace) = self
                 .primary
@@ -368,7 +383,6 @@ impl Runtimes {
                 self.primary.jobs
             };
             let checkout = checkout.clone();
-            let previous = entry.runtime.clone();
             let worker_state = Arc::clone(&state);
             let generation = entry.started.checked_add(1).ok_or_else(|| {
                 anyhow!("worktree refresh generation exhausted; restart the server")
@@ -379,20 +393,13 @@ impl Runtimes {
                 .name("tsindex-worktree".into())
                 .spawn(move || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                        || -> Result<(Runtime, Instant)> {
-                            let runtime = match previous {
-                                Some(runtime)
-                                    if runtime
-                                        .config
-                                        .repos
-                                        .first()
-                                        .is_some_and(|r| r.name == checkout.name) =>
-                                {
-                                    runtime
-                                }
-                                _ => open_checkout(&checkout, &config, languages)?.with_jobs(jobs),
-                            };
-                            let refreshed = crate::maintenance::reconcile_if_due(&runtime)?;
+                        || -> Result<(Runtime, Reconciliation)> {
+                            // The index and cached generation remain warm. At
+                            // each reconciliation, reload the checkout's own
+                            // settings so a long-lived owner observes edits.
+                            let runtime =
+                                open_checkout(&checkout, &config, languages)?.with_jobs(jobs);
+                            let refreshed = crate::maintenance::reconcile(&runtime)?;
                             Ok((runtime, refreshed))
                         },
                     ))
@@ -497,6 +504,34 @@ pub fn open_checkout(
             languages,
         ));
     }
+    let config = projected_checkout_config(checkout, primary_config)?;
+    config.write(root)?;
+    let ignore = root.join(".tsindex/.gitignore");
+    let mut rules = if ignore.exists() {
+        fs::read_to_string(&ignore)?
+    } else {
+        String::new()
+    };
+    if rules.lines().last() != Some("*") {
+        if !rules.is_empty() && !rules.ends_with('\n') {
+            rules.push('\n');
+        }
+        rules.push_str("*\n");
+        fs::write(ignore, rules)?;
+    }
+    let runtime = Runtime::new(root.clone(), db, config, languages);
+    crate::overlay::prepare(checkout, &runtime)?;
+    Ok(runtime)
+}
+
+/// Compute the same checkout settings before and after its first index is seeded.
+/// The orchestrator uses this projection to coalesce simultaneous cold opens.
+pub(crate) fn projected_checkout_config(
+    checkout: &Checkout,
+    primary_config: &TsIndexConfig,
+) -> Result<TsIndexConfig> {
+    let root = &checkout.path;
+    let config_path = crate::config::config_path(root);
     let mut config = if config_path.exists() {
         TsIndexConfig::load(root)?
     } else {
@@ -531,21 +566,5 @@ pub fn open_checkout(
             .map(|r| r.ignore.clone())
             .unwrap_or_default(),
     }];
-    config.write(root)?;
-    let ignore = root.join(".tsindex/.gitignore");
-    let mut rules = if ignore.exists() {
-        fs::read_to_string(&ignore)?
-    } else {
-        String::new()
-    };
-    if rules.lines().last() != Some("*") {
-        if !rules.is_empty() && !rules.ends_with('\n') {
-            rules.push('\n');
-        }
-        rules.push_str("*\n");
-        fs::write(ignore, rules)?;
-    }
-    let runtime = Runtime::new(root.clone(), db, config, languages);
-    crate::overlay::prepare(checkout, &runtime)?;
-    Ok(runtime)
+    Ok(config)
 }

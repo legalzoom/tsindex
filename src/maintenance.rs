@@ -110,13 +110,13 @@ fn sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
 
 pub fn watcher_lease_path(runtime: &Runtime) -> Result<PathBuf> {
     Ok(sidecar_path(
-        &runtime.db_path,
+        &key(&runtime.db_path),
         &format!("watch-{}.lock", configuration(runtime)?),
     ))
 }
 
 pub fn refresh_lease_path(db_path: &Path) -> PathBuf {
-    sidecar_path(db_path, "refresh.lock")
+    sidecar_path(&key(db_path), "refresh.lock")
 }
 
 struct Primary {
@@ -135,8 +135,25 @@ struct RefreshMarker {
     generation: i64,
 }
 
+pub(crate) struct Reconciliation {
+    completed_at: Instant,
+    generation: Option<i64>,
+}
+
+impl Reconciliation {
+    pub(crate) fn is_current(&self, runtime: &Runtime, interval: Duration) -> bool {
+        self.completed_at.elapsed() < interval
+            && self
+                .generation
+                .is_some_and(|expected| generation(runtime).ok() == Some(expected))
+    }
+}
+
 fn configuration(runtime: &Runtime) -> Result<String> {
     let database = key(&runtime.db_path);
+    let mut languages = runtime.languages.clone();
+    languages.sort();
+    languages.dedup();
     let input = serde_json::to_vec(&(
         // Generations are local to one database. A copied or misplaced marker
         // must not certify another index with an equal generation number.
@@ -144,11 +161,52 @@ fn configuration(runtime: &Runtime) -> Result<String> {
         database.as_os_str().as_encoded_bytes(),
         &runtime.root,
         &runtime.config,
-        &runtime.languages,
+        &languages,
+        runtime.prune_repos,
         env!("CARGO_PKG_VERSION"),
         crate::index::SCHEMA_VERSION,
     ))?;
-    Ok(format!("{:x}", Sha256::digest(input)))
+    let mut digest = Sha256::new();
+    digest.update(input);
+    // Global Git exclude inputs come from each process's environment (HOME,
+    // XDG_CONFIG_HOME, core.excludesFile). Keep watcher leases and freshness
+    // markers scoped to the effective rule sources this process evaluates.
+    let (global_excludes, active_excludes) = crate::ignore_inputs::global_inputs_with_excludes();
+    digest.update(b"\0global-git-excludes:");
+    digest.update((global_excludes.len() as u64).to_le_bytes());
+    for path in global_excludes {
+        let resolved = key(&path);
+        let bytes = resolved.as_os_str().as_encoded_bytes();
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+    }
+    // Pinned ignore 0.4.25 anchors active global Git excludes to the process
+    // working directory, and skips them when CWD is unavailable. Scope the
+    // digest accordingly without failing absolute-path launches on missing CWD.
+    if active_excludes.is_some_and(|path| path.is_file()) {
+        match std::env::current_dir() {
+            Ok(cwd) => {
+                let resolved = key(&cwd);
+                let bytes = resolved.as_os_str().as_encoded_bytes();
+                digest.update(b"\0global-git-excludes-cwd:some:");
+                digest.update((bytes.len() as u64).to_le_bytes());
+                digest.update(bytes);
+            }
+            Err(_) => {
+                digest.update(b"\0global-git-excludes-cwd:none");
+            }
+        }
+    }
+    // Every configured ignore file (`[ignore].extra` or `[[repos]].ignore`),
+    // relative or absolute, is matched against the process working directory.
+    if runtime.config.has_explicit_ignore_files() {
+        let cwd = std::env::current_dir()?;
+        let bytes = cwd.as_os_str().as_encoded_bytes();
+        digest.update(b"\0explicit-ignore-cwd:");
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn generation(runtime: &Runtime) -> Result<i64> {
@@ -166,10 +224,10 @@ fn generation(runtime: &Runtime) -> Result<i64> {
 pub fn refresh_marker_path(db_path: &Path) -> PathBuf {
     // Direct Runtime users need not have generated .tsindex ignore rules.
     // Keep maintenance artifacts outside the source extension allowlist.
-    sidecar_path(db_path, "refresh-state")
+    sidecar_path(&key(db_path), "refresh-state")
 }
 
-fn marker_refreshed_at(runtime: &Runtime) -> Option<Instant> {
+fn marker_reconciliation(runtime: &Runtime) -> Option<Reconciliation> {
     let interval = u128::from(runtime.config.server.worktree_refresh_ms);
     if interval == 0 {
         return None;
@@ -189,9 +247,13 @@ fn marker_refreshed_at(runtime: &Runtime) -> Option<Instant> {
     }
     // Preserve the owner's completion age in a follower's monotonic cache.
     // Adding one millisecond accounts conservatively for marker clock rounding.
-    checked_at.checked_sub(
+    let completed_at = checked_at.checked_sub(
         Duration::from_millis(u64::try_from(age).ok()?).saturating_add(Duration::from_millis(1)),
-    )
+    )?;
+    Some(Reconciliation {
+        completed_at,
+        generation: Some(marker.generation),
+    })
 }
 
 /// Called after a successful build while the database's writer lease is held.
@@ -233,8 +295,43 @@ fn primaries() -> &'static Mutex<HashMap<PathBuf, Arc<Primary>>> {
     PRIMARIES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Resolve existing targets, symlinked parents, and dangling symlink leaves to
+/// one canonical path so direct and managed runtimes coalesce sidecars.
+pub(crate) fn canonical_target(path: &Path) -> std::io::Result<PathBuf> {
+    resolve_canonical_target(path, 0)
+}
+
+fn resolve_canonical_target(path: &Path, depth: u8) -> std::io::Result<PathBuf> {
+    match path.canonicalize() {
+        Ok(resolved) => Ok(resolved),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if depth < 40
+                && let Ok(meta) = fs::symlink_metadata(path)
+                && meta.file_type().is_symlink()
+            {
+                let target = fs::read_link(path)?;
+                let next = if target.is_absolute() {
+                    target
+                } else {
+                    path.parent().unwrap_or(Path::new("")).join(target)
+                };
+                return resolve_canonical_target(&next, depth + 1);
+            }
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .ok_or(error)?;
+            Ok(resolve_canonical_target(parent, depth)?.join(
+                path.file_name()
+                    .ok_or_else(|| std::io::Error::other("missing path filename"))?,
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn key(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    canonical_target(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn primary(path: &Path) -> Option<Arc<Primary>> {
@@ -367,7 +464,11 @@ pub fn refresh_if_managed(runtime: &Runtime) -> Result<()> {
 /// The returned completion time retains the shared marker's age, so caching
 /// its reuse cannot give an almost-expired full scan another entire interval.
 pub fn reconcile_if_due(runtime: &Runtime) -> Result<Instant> {
-    if let Some(completed) = marker_refreshed_at(runtime) {
+    Ok(reconcile(runtime)?.completed_at)
+}
+
+pub(crate) fn reconcile(runtime: &Runtime) -> Result<Reconciliation> {
+    if let Some(completed) = marker_reconciliation(runtime) {
         return Ok(completed);
     }
     // This lease coalesces callers before Runtime::build takes the writer
@@ -377,7 +478,7 @@ pub fn reconcile_if_due(runtime: &Runtime) -> Result<Instant> {
         Duration::from_secs(30),
     )
     .context("index freshness unavailable: refresh coordinator is busy")?;
-    if let Some(completed) = marker_refreshed_at(runtime) {
+    if let Some(completed) = marker_reconciliation(runtime) {
         return Ok(completed);
     }
     let started = Instant::now();
@@ -391,6 +492,10 @@ pub fn reconcile_if_due(runtime: &Runtime) -> Result<Instant> {
         );
     }
     // A zero interval never has a reusable marker. A concurrent publication
-    // may also invalidate it before this read; the start time is conservative.
-    Ok(marker_refreshed_at(runtime).unwrap_or(started))
+    // may also invalidate it before this read. Never cache a generation the
+    // configuration-matched marker didn't certify as ours.
+    Ok(marker_reconciliation(runtime).unwrap_or(Reconciliation {
+        completed_at: started,
+        generation: None,
+    }))
 }

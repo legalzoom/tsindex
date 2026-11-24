@@ -31,10 +31,15 @@ use crate::model::{
 use crate::watch::under_any;
 use crate::watch::{ChangeReceiver, WatchRegistry, changes};
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Runtime {
+    #[cfg_attr(unix, serde(with = "crate::daemon::native_path"))]
     pub root: PathBuf,
+    #[cfg_attr(unix, serde(with = "crate::daemon::native_path"))]
     pub db_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(unix, serde(with = "crate::daemon::native_path::optional"))]
+    writer_lease: Option<PathBuf>,
     pub config: TsIndexConfig,
     pub languages: Vec<String>,
     pub jobs: usize,
@@ -47,7 +52,9 @@ pub struct Runtime {
     /// additive read-path migration could not run (e.g. a read-only
     /// filesystem). Reads then project `0 AS partial` instead of `f.partial`
     /// so a v3 index stays readable; `partial` simply reports `false`.
+    #[serde(skip)]
     legacy_partial: AtomicBool,
+    #[serde(skip)]
     pub(crate) private_stage: bool,
 }
 
@@ -56,6 +63,7 @@ impl Clone for Runtime {
         Self {
             root: self.root.clone(),
             db_path: self.db_path.clone(),
+            writer_lease: self.writer_lease.clone(),
             config: self.config.clone(),
             languages: self.languages.clone(),
             jobs: self.jobs,
@@ -356,6 +364,7 @@ impl Runtime {
         Self {
             root,
             db_path,
+            writer_lease: None,
             config,
             languages,
             jobs: 1,
@@ -373,6 +382,19 @@ impl Runtime {
     pub fn with_repo_pruning(mut self, prune: bool) -> Self {
         self.prune_repos = prune;
         self
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_writer_lease(mut self, path: Option<PathBuf>) -> Self {
+        self.writer_lease = path;
+        self
+    }
+
+    fn writer_lease_path(&self) -> std::borrow::Cow<'_, Path> {
+        match self.writer_lease.as_deref() {
+            Some(path) => path.into(),
+            None => crate::maintenance::writer_lease_path(&self.db_path).into(),
+        }
     }
 
     pub fn initialize(&self) -> Result<()> {
@@ -401,7 +423,7 @@ impl Runtime {
             None
         } else {
             Some(crate::maintenance::FileLease::acquire(
-                crate::maintenance::writer_lease_path(&self.db_path),
+                self.writer_lease_path(),
                 Duration::from_secs(30),
             )?)
         };
@@ -617,7 +639,7 @@ impl Runtime {
             return self.build(true, None);
         }
         let _writer = crate::maintenance::FileLease::acquire(
-            crate::maintenance::writer_lease_path(&self.db_path),
+            self.writer_lease_path(),
             Duration::from_secs(30),
         )?;
         // Schema bootstrap happens once in `watch()`/`update_paths`, not per
@@ -1531,7 +1553,7 @@ impl Runtime {
         // published. Hold the checkout's writer lease through read, parse and
         // atomic rename so two replacements cannot overwrite one another.
         let _writer = crate::maintenance::FileLease::acquire(
-            crate::maintenance::writer_lease_path(&self.db_path),
+            self.writer_lease_path(),
             Duration::from_secs(30),
         )?;
         let workspaces = self.workspaces()?;

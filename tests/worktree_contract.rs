@@ -1,6 +1,10 @@
 //! Checkout behavior shared by the copied-index and proposed overlay designs.
 //! Drive real MCP processes so storage layout is free to change underneath.
 
+#![cfg(unix)]
+
+mod common;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -18,6 +22,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_tsindex");
 
 struct CheckoutFixture {
     _directory: TempDir,
+    daemon: common::TestDaemon,
     main: PathBuf,
     alpha: PathBuf,
     beta: PathBuf,
@@ -68,8 +73,10 @@ impl CheckoutFixture {
             "fixture build failed: {}",
             String::from_utf8_lossy(&result.stderr)
         );
+        let daemon = common::TestDaemon::start()?;
         Ok(Self {
             _directory: directory,
+            daemon,
             main,
             alpha,
             beta,
@@ -93,14 +100,16 @@ struct McpClient {
 }
 
 impl McpClient {
-    fn start(root: &Path, label: &str) -> Result<Self> {
+    fn start(root: &Path, socket: &Path, label: &str) -> Result<Self> {
         let stderr = root.parent().context("checkout has no parent")?.join(label);
         let mut child = Command::new(BIN)
+            .arg("--socket")
+            .arg(socket)
             .arg("--root")
             .arg(root)
             // The primary is already built. Worktree requests still use their
             // ordinary on-demand refresh, without unrelated watcher traffic.
-            .args(["--no-refresh", "serve", "--mcp"])
+            .args(["--no-refresh", "serve", "--mcp", "--via-daemon"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(fs::File::create(&stderr)?)
@@ -193,7 +202,7 @@ fn read_tools_and_edits_use_the_selected_checkout() -> Result<()> {
         "a.py",
         "def identify():\n    return beta_marker()\n",
     )?;
-    let mut client = McpClient::start(&fixture.main, "routing.log")?;
+    let mut client = McpClient::start(&fixture.main, &fixture.daemon.socket, "routing.log")?;
 
     for (repo, expected_repo, marker) in [
         (json!(fixture.alpha), "alpha", "alpha_marker"),
@@ -295,7 +304,7 @@ fn removed_or_excluded_files_never_resurface_from_the_primary_index() -> Result<
             "def excluded():\n    return shared_marker()\n",
         ),
     ])?;
-    let mut client = McpClient::start(&fixture.main, "lifecycle.log")?;
+    let mut client = McpClient::start(&fixture.main, &fixture.daemon.socket, "lifecycle.log")?;
     let names = json!(["emptied", "deleted", "moved", "excluded"]);
     let initial = client.call("get_symbol", json!({"repo":"alpha", "names":names}))?;
     assert_eq!(initial["total"], 4);
@@ -327,7 +336,11 @@ fn removed_or_excluded_files_never_resurface_from_the_primary_index() -> Result<
     // Reopening exercises the persistent checkout behavior through the same
     // protocol, without asserting whether its storage is a copy or an overlay.
     drop(client);
-    let mut client = McpClient::start(&fixture.main, "lifecycle-reopened.log")?;
+    let mut client = McpClient::start(
+        &fixture.main,
+        &fixture.daemon.socket,
+        "lifecycle-reopened.log",
+    )?;
     let reopened = client.call("get_symbol", json!({"repo":"alpha", "names":names}))?;
     assert_eq!(reopened["total"], 1);
     write_source(
@@ -363,7 +376,7 @@ fn filtered_pages_count_only_the_selected_checkouts_current_files() -> Result<()
         "def other():\n    return other_marker()\n",
     )?;
     write_source(&fixture.alpha, "src/e.py", source)?;
-    let mut client = McpClient::start(&fixture.main, "pagination.log")?;
+    let mut client = McpClient::start(&fixture.main, &fixture.daemon.socket, "pagination.log")?;
 
     for (method, mut arguments, results) in [
         (
@@ -413,8 +426,8 @@ fn filtered_pages_count_only_the_selected_checkouts_current_files() -> Result<()
 #[test]
 fn independent_agent_processes_ingest_their_own_worktree_changes() -> Result<()> {
     let fixture = CheckoutFixture::new(&[("a.py", "def identify():\n    return main_marker()\n")])?;
-    let alpha_client = McpClient::start(&fixture.main, "agent-alpha.log")?;
-    let beta_client = McpClient::start(&fixture.main, "agent-beta.log")?;
+    let alpha_client = McpClient::start(&fixture.main, &fixture.daemon.socket, "agent-alpha.log")?;
+    let beta_client = McpClient::start(&fixture.main, &fixture.daemon.socket, "agent-beta.log")?;
     let start = Arc::new(Barrier::new(2));
     thread::scope(|scope| -> Result<()> {
         let mut workers = Vec::new();
@@ -470,7 +483,7 @@ fn independent_agent_processes_ingest_their_own_worktree_changes() -> Result<()>
         }
         Ok(())
     })?;
-    let mut client = McpClient::start(&fixture.main, "after-agents.log")?;
+    let mut client = McpClient::start(&fixture.main, &fixture.daemon.socket, "after-agents.log")?;
     for (repo, marker) in [
         ("main", "main_marker"),
         ("alpha", "alpha_second"),

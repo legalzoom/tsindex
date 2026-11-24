@@ -1045,17 +1045,162 @@ fn parse_systemd_unit_env(source: &str) -> std::collections::HashMap<String, Str
 
 #[cfg(any(target_os = "linux", test))]
 fn parse_manager_environment(output: &str) -> std::collections::HashMap<String, String> {
+    fn unquote_shell_value(raw: &str) -> String {
+        let mut out = Vec::with_capacity(raw.len());
+        let mut chars = raw.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '$' if chars.peek() == Some(&'\'') => {
+                    chars.next();
+                    let mut closed = false;
+                    while let Some(c) = chars.next() {
+                        if c == '\'' {
+                            closed = true;
+                            break;
+                        }
+                        if c != '\\' {
+                            let mut buf = [0u8; 4];
+                            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                            continue;
+                        }
+                        let Some(esc) = chars.next() else {
+                            return raw.to_string();
+                        };
+                        match esc {
+                            'a' => out.push(0x07),
+                            'b' => out.push(0x08),
+                            'e' | 'E' => out.push(0x1b),
+                            'f' => out.push(0x0c),
+                            'n' => out.push(b'\n'),
+                            'r' => out.push(b'\r'),
+                            't' => out.push(b'\t'),
+                            'v' => out.push(0x0b),
+                            '\\' => out.push(b'\\'),
+                            '\'' => out.push(b'\''),
+                            '"' => out.push(b'"'),
+                            'x' => {
+                                let mut val = 0u8;
+                                let mut digits = 0;
+                                while digits < 2 {
+                                    let Some(&next) = chars.peek() else { break };
+                                    let Some(d) = next.to_digit(16) else { break };
+                                    chars.next();
+                                    val = val * 16 + d as u8;
+                                    digits += 1;
+                                }
+                                if digits == 0 {
+                                    out.extend_from_slice(b"\\x");
+                                } else {
+                                    out.push(val);
+                                }
+                            }
+                            'u' | 'U' => {
+                                let max_digits = if esc == 'u' { 4 } else { 8 };
+                                let mut val = 0u32;
+                                let mut digits = 0;
+                                while digits < max_digits {
+                                    let Some(&next) = chars.peek() else { break };
+                                    let Some(d) = next.to_digit(16) else { break };
+                                    chars.next();
+                                    val = val * 16 + d;
+                                    digits += 1;
+                                }
+                                if digits > 0
+                                    && let Some(decoded) = char::from_u32(val)
+                                {
+                                    let mut buf = [0u8; 4];
+                                    out.extend_from_slice(decoded.encode_utf8(&mut buf).as_bytes());
+                                } else {
+                                    return raw.to_string();
+                                }
+                            }
+                            '0'..='7' => {
+                                let mut val = esc.to_digit(8).unwrap();
+                                for _ in 0..2 {
+                                    let Some(&next) = chars.peek() else { break };
+                                    let Some(d) = next.to_digit(8) else { break };
+                                    chars.next();
+                                    val = val * 8 + d;
+                                }
+                                out.push((val & 0xff) as u8);
+                            }
+                            other => {
+                                out.push(b'\\');
+                                let mut buf = [0u8; 4];
+                                out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
+                            }
+                        }
+                    }
+                    if !closed {
+                        return raw.to_string();
+                    }
+                }
+                '\'' => {
+                    let mut closed = false;
+                    for c in chars.by_ref() {
+                        if c == '\'' {
+                            closed = true;
+                            break;
+                        }
+                        let mut buf = [0u8; 4];
+                        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                    }
+                    if !closed {
+                        return raw.to_string();
+                    }
+                }
+                '"' => {
+                    let mut closed = false;
+                    while let Some(c) = chars.next() {
+                        if c == '"' {
+                            closed = true;
+                            break;
+                        }
+                        if c == '\\' {
+                            let Some(esc) = chars.next() else {
+                                return raw.to_string();
+                            };
+                            match esc {
+                                '$' | '`' | '"' | '\\' => out.push(esc as u8),
+                                '\n' => {}
+                                other => {
+                                    out.push(b'\\');
+                                    let mut buf = [0u8; 4];
+                                    out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
+                                }
+                            }
+                        } else {
+                            let mut buf = [0u8; 4];
+                            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                        }
+                    }
+                    if !closed {
+                        return raw.to_string();
+                    }
+                }
+                '\\' => {
+                    if let Some(esc) = chars.next() {
+                        let mut buf = [0u8; 4];
+                        out.extend_from_slice(esc.encode_utf8(&mut buf).as_bytes());
+                    } else {
+                        out.push(b'\\');
+                    }
+                }
+                other => {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+        }
+        String::from_utf8(out).unwrap_or_else(|_| raw.to_string())
+    }
+
     let mut env = std::collections::HashMap::new();
     for line in output.lines() {
         let Some((key, raw)) = line.split_once('=') else {
             continue;
         };
-        let value = if raw.starts_with('"') && raw.ends_with('"') {
-            serde_json::from_str::<String>(raw).unwrap_or_else(|_| raw.to_string())
-        } else {
-            raw.to_string()
-        };
-        env.insert(key.to_string(), value);
+        env.insert(key.to_string(), unquote_shell_value(raw));
     }
     env
 }
@@ -1093,6 +1238,7 @@ fn endpoint_from_systemd_unit(
     {
         return Ok(socket);
     }
+    let socket_activated = args.iter().any(|arg| arg == "--socket-activated");
     // A socketless legacy unit receives XDG_RUNTIME_DIR (and any unit
     // Environment= overrides) from systemd --user rather than the invoking shell.
     let unit_env = parse_systemd_unit_env(source);
@@ -1111,7 +1257,18 @@ fn endpoint_from_systemd_unit(
         return Ok(PathBuf::from(socket));
     }
     if let Some(home) = lookup("TSINDEX_HOME") {
-        return Ok(PathBuf::from(home).join("run").join("daemon.sock"));
+        let modern = PathBuf::from(&home).join("run").join("daemon.sock");
+        if socket_activated {
+            return Ok(modern);
+        }
+        // The original socketless unit layout placed TSINDEX_HOME sockets at
+        // `$TSINDEX_HOME/daemon.sock`; prefer `$TSINDEX_HOME/run/daemon.sock`
+        // only when only the newer path exists on disk.
+        let legacy = PathBuf::from(&home).join("daemon.sock");
+        if modern.exists() && !legacy.exists() {
+            return Ok(modern);
+        }
+        return Ok(legacy);
     }
     let xdg_runtime_dir = if unit_env.contains_key("XDG_RUNTIME_DIR") {
         unit_env
@@ -1706,7 +1863,7 @@ mod tests {
         )?;
         assert_eq!(socket, PathBuf::from("/home/dev/.tsindex/run/daemon.sock"));
 
-        // Unit-level Environment= overrides manager environment.
+        // Original socketless units placed TSINDEX_HOME sockets at `$TSINDEX_HOME/daemon.sock`.
         let with_home = "[Service]\nEnvironment=\"TSINDEX_HOME=/opt/tsindex-home\"\nExecStart=\"/usr/bin/tsindex\" daemon run\n";
         let socket = endpoint_from_systemd_unit(
             with_home,
@@ -1715,7 +1872,90 @@ mod tests {
             home,
             1000,
         )?;
+        assert_eq!(socket, PathBuf::from("/opt/tsindex-home/daemon.sock"));
+
+        // Socket-activated units without `--socket` still use `$TSINDEX_HOME/run/daemon.sock`.
+        let socket_activated_home = "[Service]\nEnvironment=\"TSINDEX_HOME=/opt/tsindex-home\"\nExecStart=\"/usr/bin/tsindex\" daemon run --socket-activated\n";
+        let socket = endpoint_from_systemd_unit(
+            socket_activated_home,
+            || Some("XDG_RUNTIME_DIR=/run/user/1000\n".into()),
+            None,
+            home,
+            1000,
+        )?;
         assert_eq!(socket, PathBuf::from("/opt/tsindex-home/run/daemon.sock"));
+
+        // If only `$TSINDEX_HOME/run/daemon.sock` exists on disk, prefer it.
+        let temp_home = tempfile::tempdir_in("/tmp")?;
+        fs::create_dir_all(temp_home.path().join("run"))?;
+        fs::write(temp_home.path().join("run/daemon.sock"), "")?;
+        let socket = endpoint_from_systemd_unit(
+            legacy,
+            || Some(format!("TSINDEX_HOME={}\n", temp_home.path().display())),
+            None,
+            home,
+            1000,
+        )?;
+        assert_eq!(socket, temp_home.path().join("run/daemon.sock"));
+
+        // `systemctl --user show-environment` shell-quotes paths with spaces or special chars.
+        let socket = endpoint_from_systemd_unit(
+            legacy,
+            || Some("TSINDEX_SOCKET=$'/tmp/my dir/it\\'s.sock'\n".into()),
+            None,
+            home,
+            1000,
+        )?;
+        assert_eq!(socket, PathBuf::from("/tmp/my dir/it's.sock"));
+
+        let socket = endpoint_from_systemd_unit(
+            legacy,
+            || Some("TSINDEX_SOCKET='/tmp/single quoted/daemon.sock'\n".into()),
+            None,
+            home,
+            1000,
+        )?;
+        assert_eq!(socket, PathBuf::from("/tmp/single quoted/daemon.sock"));
+
+        let socket = endpoint_from_systemd_unit(
+            legacy,
+            || Some("TSINDEX_SOCKET=\"/tmp/double quoted/\\$name.sock\"\n".into()),
+            None,
+            home,
+            1000,
+        )?;
+        assert_eq!(socket, PathBuf::from("/tmp/double quoted/$name.sock"));
+
+        let socket = endpoint_from_systemd_unit(
+            legacy,
+            || Some("TSINDEX_SOCKET=/tmp/escaped\\ dir/daemon.sock\n".into()),
+            None,
+            home,
+            1000,
+        )?;
+        assert_eq!(socket, PathBuf::from("/tmp/escaped dir/daemon.sock"));
+
+        let socket = endpoint_from_systemd_unit(
+            legacy,
+            || Some("TSINDEX_SOCKET=$'/tmp/caf\\xc3\\xa9/daemon.sock'\n".into()),
+            None,
+            home,
+            1000,
+        )?;
+        assert_eq!(socket, PathBuf::from("/tmp/café/daemon.sock"));
+
+        // Empty shell-quoted TSINDEX_SOCKET falls through to XDG_RUNTIME_DIR.
+        let socket = endpoint_from_systemd_unit(
+            legacy,
+            || Some("TSINDEX_SOCKET=$''\nXDG_RUNTIME_DIR=$'/run/user/my 1000'\n".into()),
+            None,
+            home,
+            1000,
+        )?;
+        assert_eq!(
+            socket,
+            PathBuf::from("/run/user/my 1000/tsindex/daemon.sock")
+        );
 
         // Explicit --socket skips manager environment lookup entirely.
         let explicit =

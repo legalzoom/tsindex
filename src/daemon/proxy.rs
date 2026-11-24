@@ -314,15 +314,19 @@ struct ProxyStdout {
     mode: OutputMode,
 }
 
+// `libc::PIPE_BUF` is `c_int` on illumos/Solaris and `usize` elsewhere.
+#[allow(clippy::unnecessary_cast)]
+const PIPE_BUF: usize = libc::PIPE_BUF as usize;
+
 enum OutputMode {
     Write,
     Socket,
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", target_os = "aix", test))]
     PollStream,
     PollPipe,
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "aix", test))]
 fn socket_option(fd: BorrowedFd<'_>, option: libc::c_int) -> io::Result<libc::c_int> {
     let mut value: libc::c_int = 0;
     let mut size = std::mem::size_of_val(&value) as libc::socklen_t;
@@ -341,7 +345,7 @@ fn socket_option(fd: BorrowedFd<'_>, option: libc::c_int) -> io::Result<libc::c_
     Ok(value)
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "aix", test))]
 fn darwin_socket_mode(fd: BorrowedFd<'_>, flags: libc::c_int) -> io::Result<OutputMode> {
     if flags & libc::O_NONBLOCK != 0 {
         return Ok(OutputMode::Socket);
@@ -371,11 +375,11 @@ impl ProxyStdout {
             return Err(io::Error::from_raw_os_error(libc::EBADF));
         }
         let mode = if kind.is_socket() {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "aix"))]
             {
                 darwin_socket_mode(file.as_fd(), flags)?
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "aix")))]
             {
                 OutputMode::Socket
             }
@@ -460,15 +464,16 @@ impl ProxyStdout {
                 // MCP dedicates this pipe's byte stream to one writer. With no
                 // competing writer, Linux and Darwin leave at least PIPE_BUF
                 // bytes available after write readiness and a read only frees more.
-                let chunk = self.writable_prefix(bytes, libc::PIPE_BUF)?;
+                let chunk = self.writable_prefix(bytes, PIPE_BUF)?;
                 return self.file.write(chunk);
             }
             OutputMode::Socket => bytes,
-            #[cfg(any(target_os = "macos", test))]
+            #[cfg(any(target_os = "macos", target_os = "aix", test))]
             OutputMode::PollStream => {
-                // XNU can wait for send-buffer space even with MSG_DONTWAIT.
-                // POLLOUT promises SO_SNDLOWAT bytes to this stream's sole
-                // writer. Read the current threshold without changing the socket.
+                // XNU can wait for send-buffer space even with MSG_DONTWAIT, and
+                // AIX does not expose MSG_DONTWAIT. POLLOUT promises SO_SNDLOWAT
+                // bytes to this stream's sole writer. Read the current threshold
+                // without changing the socket.
                 let lowat = socket_option(self.file.as_fd(), libc::SO_SNDLOWAT)?;
                 if lowat <= 0 {
                     return Err(io::ErrorKind::InvalidData.into());
@@ -476,12 +481,16 @@ impl ProxyStdout {
                 self.writable_prefix(bytes, lowat as usize)?
             }
         };
+        #[cfg(not(target_os = "aix"))]
+        let send_flags = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
+        #[cfg(target_os = "aix")]
+        let send_flags = libc::MSG_NOSIGNAL;
         let n = unsafe {
             libc::send(
                 self.file.as_raw_fd(),
                 bytes.as_ptr().cast(),
                 bytes.len(),
-                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                send_flags,
             )
         };
         if n < 0 {
@@ -720,8 +729,8 @@ mod tests {
             file: File::from(writer.as_fd().try_clone_to_owned()?),
             mode: OutputMode::PollPipe,
         };
-        let chunk = vec![0; libc::PIPE_BUF * 2];
-        assert_eq!(stdout.try_write(&chunk)?, libc::PIPE_BUF);
+        let chunk = vec![0; PIPE_BUF * 2];
+        assert_eq!(stdout.try_write(&chunk)?, PIPE_BUF);
         let cancel = AtomicBool::new(true);
         while stdout.relay(&chunk, &cancel)? {}
         assert_eq!(flags(&writer), before);

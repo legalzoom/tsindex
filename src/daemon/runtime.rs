@@ -757,16 +757,33 @@ fn read_reply(lane: &mut BufReader<UnixStream>) -> Result<Reply> {
 
 const RECEIVED: u8 = 1;
 
-fn intake_closed(channel: &UnixStream) -> bool {
-    // The owner never writes on its intake. A non-consuming EOF check works
-    // even while its final private replies keep the process alive.
+#[cfg(any(target_os = "aix", test))]
+fn intake_closed_via_poll(channel: &UnixStream) -> bool {
+    let mut fd = libc::pollfd {
+        fd: channel.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ready = loop {
+        let rc = unsafe { libc::poll(&mut fd, 1, 0) };
+        if rc < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        break rc;
+    };
+    if ready <= 0 {
+        return false;
+    }
+    if fd.revents & libc::POLLIN == 0 {
+        return fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
+    }
     let mut byte = 0u8;
     let n = unsafe {
         libc::recv(
             channel.as_raw_fd(),
             (&raw mut byte).cast(),
             1,
-            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            libc::MSG_PEEK,
         )
     };
     n == 0
@@ -775,6 +792,33 @@ fn intake_closed(channel: &UnixStream) -> bool {
                 io::Error::last_os_error().kind(),
                 io::ErrorKind::ConnectionReset | io::ErrorKind::NotConnected
             ))
+}
+
+fn intake_closed(channel: &UnixStream) -> bool {
+    // The owner never writes on its intake. A non-consuming EOF check works
+    // even while its final private replies keep the process alive.
+    #[cfg(target_os = "aix")]
+    {
+        intake_closed_via_poll(channel)
+    }
+    #[cfg(not(target_os = "aix"))]
+    {
+        let mut byte = 0u8;
+        let n = unsafe {
+            libc::recv(
+                channel.as_raw_fd(),
+                (&raw mut byte).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        n == 0
+            || (n < 0
+                && matches!(
+                    io::Error::last_os_error().kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::NotConnected
+                ))
+    }
 }
 
 fn await_receipt(local: &mut UnixStream, owner: &UnixStream, timeout: Duration) -> io::Result<()> {
@@ -1341,6 +1385,22 @@ mod tests {
         drop(release);
         drop(resolver);
         listener.join().unwrap()?;
+        Ok(())
+    }
+
+    #[test]
+    fn intake_closed_via_poll_detects_open_readable_and_closed_streams() -> Result<()> {
+        let (mut left, mut right) = UnixStream::pair()?;
+        assert!(!intake_closed_via_poll(&left));
+
+        right.write_all(&[0x5a])?;
+        assert!(!intake_closed_via_poll(&left));
+        let mut buf = [0u8; 1];
+        left.read_exact(&mut buf)?;
+        assert_eq!(buf, [0x5a]);
+
+        drop(right);
+        assert!(intake_closed_via_poll(&left));
         Ok(())
     }
 }

@@ -1518,14 +1518,15 @@ fn atomic_executable_replacement_keeps_worker_startup_available() -> Result<()> 
     let exe = dir.path().join("tsindex");
     let socket = dir.path().join("d.sock");
     fs::copy(BIN, &exe)?;
-    let mut daemon = Command::new(&exe)
-        .arg("--socket")
-        .arg(&socket)
-        .args(["daemon", "run"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let mut daemon = spawn_copied_daemon(
+        Command::new(&exe)
+            .arg("--socket")
+            .arg(&socket)
+            .args(["daemon", "run"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )?;
     struct Guard<'a>(&'a mut Child);
     impl Drop for Guard<'_> {
         fn drop(&mut self) {
@@ -1908,6 +1909,22 @@ impl Drop for WrappedDaemon {
     }
 }
 
+fn spawn_copied_daemon(command: &mut Command) -> Result<Child> {
+    // A concurrent test's fork can briefly retain the copy's writable fd
+    // until it execs. Linux rejects execution of that inode in the meantime.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match command.spawn() {
+            Err(error)
+                if error.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            result => return result.context("failed to start copied test daemon"),
+        }
+    }
+}
+
 /// Run the real orchestrator with a fixture wrapper for its child entry points.
 fn start_with_worker_wrapper(
     dir: &Path,
@@ -1922,7 +1939,7 @@ fn start_with_worker_wrapper(
     let exe = dir.join("tsindex");
     let socket = dir.join("d.sock");
     fs::copy(BIN, &exe)?;
-    let child = WrappedDaemon(
+    let child = WrappedDaemon(spawn_copied_daemon(
         Command::new(&exe)
             .env("TSINDEX_TEST_RUNTIME_EXE", BIN)
             .arg("--socket")
@@ -1930,9 +1947,8 @@ fn start_with_worker_wrapper(
             .args(["daemon", "run"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?,
-    );
+            .stderr(Stdio::null()),
+    )?);
     let client = DaemonClient::new(DaemonPaths::resolve(Some(&socket))?);
     let deadline = Instant::now() + Duration::from_secs(5);
     while client.ping().is_err() {

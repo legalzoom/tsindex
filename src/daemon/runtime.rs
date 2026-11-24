@@ -129,12 +129,26 @@ impl RuntimeKey {
         } else {
             TsIndexConfig::load_or_default(&root)?
         };
-        // Only require and key on the caller's working directory when the
-        // checkout configures explicit ignore files that match relative to cwd.
-        let caller_dir = if settings.has_explicit_ignore_files() {
-            caller_dir.unwrap_or(&root).canonicalize()?
-        } else {
-            root.clone()
+        // Preserve any usable caller working directory so worker/owner
+        // matchers (including anchored global Git ignores and linked checkouts
+        // discovered after startup) evaluate against the caller's ignore base
+        // and incompatible caller bases do not share an owner. Fall back to
+        // `root` only when the caller cwd is unavailable and explicit ignore
+        // files do not require it.
+        let caller_dir = match caller_dir {
+            Some(dir) => match dir.canonicalize() {
+                Ok(dir) if dir.is_dir() => dir,
+                Ok(_) if !settings.has_explicit_ignore_files() => root.clone(),
+                Ok(_) => bail!("caller working directory must be a directory"),
+                Err(_) if !settings.has_explicit_ignore_files() => root.clone(),
+                Err(error) => {
+                    return Err(error).context("cannot resolve caller working directory");
+                }
+            },
+            None if settings.has_explicit_ignore_files() => {
+                bail!("caller working directory is required by configured ignore files");
+            }
+            None => root.clone(),
         };
         let mut languages = languages.to_owned();
         languages.sort();
@@ -1227,21 +1241,34 @@ mod tests {
         let root = dir.path().join("repo");
         let caller_a = dir.path().join("caller-a");
         let caller_b = dir.path().join("caller-b");
+        let caller_file = dir.path().join("not-a-dir");
         std::fs::create_dir_all(&root)?;
         std::fs::create_dir_all(&caller_a)?;
         std::fs::create_dir_all(&caller_b)?;
+        std::fs::write(&caller_file, "file")?;
         let missing = dir.path().join("mount-ns-only");
 
-        // Without explicit ignore files, an unreachable caller_dir is ignored
-        // and distinct caller cwds share one runtime key.
+        // Without explicit ignore files, unavailable caller_dirs fall back to
+        // root, while usable caller_dirs are preserved and keep distinct keys
+        // so anchored global Git ignores and linked checkouts match direct MCP.
         let key_missing = RuntimeKey::resolve(&root, None, &[], true, Some(&missing))?;
+        let key_file = RuntimeKey::resolve(&root, None, &[], true, Some(&caller_file))?;
         let key_none = RuntimeKey::resolve(&root, None, &[], true, None)?;
+        let key_root = RuntimeKey::resolve(&root, None, &[], true, Some(&root))?;
         let key_a = RuntimeKey::resolve(&root, None, &[], true, Some(&caller_a))?;
+        let key_a_again = RuntimeKey::resolve(&root, None, &[], true, Some(&caller_a))?;
+        let key_b = RuntimeKey::resolve(&root, None, &[], true, Some(&caller_b))?;
         assert!(key_missing == key_none);
-        assert!(key_missing == key_a);
+        assert!(key_missing == key_file);
+        assert!(key_missing == key_root);
+        assert!(key_a == key_a_again);
+        assert!(key_a != key_root);
+        assert!(key_a != key_b);
+        assert_eq!(key_a.caller_dir, caller_a.canonicalize()?);
+        assert_eq!(key_root.caller_dir, root.canonicalize()?);
 
-        // With per-repo [[repos]].ignore or absolute ignore files, caller_dir
-        // is required and separates runtime keys by caller directory.
+        // With per-repo [[repos]].ignore or absolute ignore files, a usable
+        // caller_dir is required and separates runtime keys by caller directory.
         let mut config = TsIndexConfig::default();
         config.repos.push(crate::config::RepoConfig {
             name: "repo".into(),
@@ -1251,6 +1278,8 @@ mod tests {
         });
         config.write(&root)?;
         assert!(RuntimeKey::resolve(&root, None, &[], true, Some(&missing)).is_err());
+        assert!(RuntimeKey::resolve(&root, None, &[], true, Some(&caller_file)).is_err());
+        assert!(RuntimeKey::resolve(&root, None, &[], true, None).is_err());
         let key_a = RuntimeKey::resolve(&root, None, &[], true, Some(&caller_a))?;
         let key_b = RuntimeKey::resolve(&root, None, &[], true, Some(&caller_b))?;
         assert!(key_a != key_b);

@@ -2439,6 +2439,186 @@ fn managed_indexes_isolate_per_repo_and_absolute_ignore_files_by_caller_cwd() ->
 }
 
 #[test]
+fn managed_lookups_preserve_caller_dir_for_linked_ignores_and_global_excludes() -> Result<()> {
+    // Case 1: primary checkout has no explicit ignore files, but a linked
+    // worktree discovered after startup loads a caller-relative ignore file.
+    {
+        let daemon = common::TestDaemon::start()?;
+        let dir = tempdir_in("/tmp")?;
+        let main = dir.path().join("main");
+        let wt = dir.path().join("wt");
+        let caller_a = dir.path().join("caller-a");
+        let caller_b = dir.path().join("caller-b");
+        fs::create_dir_all(main.join(".git"))?;
+        fs::create_dir(&caller_a)?;
+        fs::create_dir(&caller_b)?;
+        fs::write(main.join("main.py"), "def main_sym():\n    pass\n")?;
+        fs::write(caller_a.join("wt-rules.txt"), "secret.py\n")?;
+        fs::write(caller_b.join("wt-rules.txt"), "\n")?;
+
+        let mut main_cfg = TsIndexConfig::default();
+        main_cfg.languages.include = vec!["python".into()];
+        main_cfg.server.worktree_refresh_ms = 60_000;
+        main_cfg.write(&main)?;
+
+        let mut a = McpSession::connect_configured(&daemon.socket, &main, "linked-a", |cmd| {
+            cmd.current_dir(&caller_a);
+        })?;
+        assert_eq!(
+            a.call_tool("get_symbol", json!({"name":"main_sym"}))?["total"],
+            1
+        );
+
+        // Create the linked worktree with its own relative ignore file AFTER
+        // the primary owner is already running.
+        link_checkout(&main, &wt, "wt")?;
+        fs::write(wt.join("keep.py"), "def wt_keep():\n    pass\n")?;
+        fs::write(wt.join("secret.py"), "def wt_secret():\n    pass\n")?;
+        let mut wt_cfg = TsIndexConfig::default();
+        wt_cfg.languages.include = vec!["python".into()];
+        wt_cfg.server.worktree_refresh_ms = 60_000;
+        wt_cfg.ignore.extra = vec!["wt-rules.txt".into()];
+        wt_cfg.write(&wt)?;
+
+        assert_eq!(
+            a.call_tool("get_symbol", json!({"repo":"wt", "name":"wt_keep"}))?["total"],
+            1
+        );
+        assert_eq!(
+            a.call_tool("get_symbol", json!({"repo":"wt", "name":"wt_secret"}))?["total"],
+            0
+        );
+
+        let mut b = McpSession::connect_configured(&daemon.socket, &main, "linked-b", |cmd| {
+            cmd.current_dir(&caller_b);
+        })?;
+        assert_ne!(
+            managed_session(&daemon, "linked-a")?.runtime_pid,
+            managed_session(&daemon, "linked-b")?.runtime_pid
+        );
+        assert_eq!(
+            b.call_tool("get_symbol", json!({"repo":"wt", "name":"wt_secret"}))?["total"],
+            1
+        );
+        b.close_gracefully()?;
+        a.close_gracefully()?;
+    }
+
+    // Case 2: primary checkout has no explicit ignore files, and an anchored
+    // global Git ignore (`/repo/secret.py`) depends on the caller's cwd even
+    // when daemon and client share identical HOME / XDG_CONFIG_HOME.
+    {
+        let home = tempdir_in("/tmp")?;
+        let xdg = tempdir_in("/tmp")?;
+        fs::create_dir_all(xdg.path().join("git"))?;
+        fs::write(xdg.path().join("git/ignore"), "/repo/secret.py\n")?;
+        let home_str = home.path().to_string_lossy().into_owned();
+        let xdg_str = xdg.path().to_string_lossy().into_owned();
+        let daemon = common::TestDaemon::start_with_env(&[
+            ("HOME", home_str.as_str()),
+            ("XDG_CONFIG_HOME", xdg_str.as_str()),
+        ])?;
+
+        let dir = tempdir_in("/tmp")?;
+        let root = dir.path().join("repo");
+        fs::create_dir_all(root.join(".git"))?;
+        fs::write(root.join("keep.py"), "def global_keep():\n    pass\n")?;
+        fs::write(root.join("secret.py"), "def global_secret():\n    pass\n")?;
+        let mut config = TsIndexConfig::default();
+        config.languages.include = vec!["python".into()];
+        config.server.worktree_refresh_ms = 60_000;
+        config.write(&root)?;
+
+        // Direct MCP baseline from parent dir omits `global_secret`.
+        let direct_db = dir.path().join("direct.db");
+        let mut direct_child = Command::new(BIN)
+            .arg("--root")
+            .arg(&root)
+            .arg("--db")
+            .arg(&direct_db)
+            .args(["serve", "--mcp"])
+            .current_dir(dir.path())
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", xdg.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        {
+            let stdin = direct_child.stdin.as_mut().unwrap();
+            writeln!(
+                stdin,
+                "{}",
+                json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"direct-global","version":"1"}}})
+            )?;
+            writeln!(
+                stdin,
+                "{}",
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_symbol","arguments":{"name":"global_secret"}}})
+            )?;
+            stdin.flush()?;
+        }
+        drop(direct_child.stdin.take());
+        let direct_out = direct_child.wait_with_output()?;
+        assert!(direct_out.status.success());
+        let direct_reply = std::str::from_utf8(&direct_out.stdout)?
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .find(|value| value["id"] == 2)
+            .context("missing direct lookup reply")?;
+        let direct_payload: Value = serde_json::from_str(
+            direct_reply["result"]["content"][0]["text"]
+                .as_str()
+                .context("missing direct tool content")?,
+        )?;
+        assert_eq!(direct_payload["total"], 0);
+
+        // Managed MCP from parent dir must match direct MCP.
+        let parent_db = dir.path().join("managed-parent.db");
+        let mut parent =
+            McpSession::connect_configured(&daemon.socket, &root, "global-parent", |cmd| {
+                cmd.current_dir(dir.path())
+                    .arg("--db")
+                    .arg(&parent_db)
+                    .env("HOME", home.path())
+                    .env("XDG_CONFIG_HOME", xdg.path());
+            })?;
+        assert_eq!(
+            parent.call_tool("get_symbol", json!({"name":"global_keep"}))?["total"],
+            1
+        );
+        assert_eq!(
+            parent.call_tool("get_symbol", json!({"name":"global_secret"}))?["total"],
+            0
+        );
+
+        // Managed MCP from inside `repo` gets a separate owner and sees `global_secret`.
+        let inside_db = dir.path().join("managed-inside.db");
+        let mut inside =
+            McpSession::connect_configured(&daemon.socket, &root, "global-inside", |cmd| {
+                cmd.current_dir(&root)
+                    .arg("--db")
+                    .arg(&inside_db)
+                    .env("HOME", home.path())
+                    .env("XDG_CONFIG_HOME", xdg.path());
+            })?;
+        assert_ne!(
+            managed_session(&daemon, "global-parent")?.runtime_pid,
+            managed_session(&daemon, "global-inside")?.runtime_pid
+        );
+        assert_eq!(
+            inside.call_tool("get_symbol", json!({"name":"global_secret"}))?["total"],
+            1
+        );
+        inside.close_gracefully()?;
+        parent.close_gracefully()?;
+    }
+    Ok(())
+}
+
+#[test]
 fn worker_exiting_cleanly_after_timed_out_lookups_retires_saturated_owner() -> Result<()> {
     let dir = tempdir_in("/tmp")?;
     let root = dir.path().join("repo");

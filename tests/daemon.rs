@@ -584,6 +584,45 @@ fn shared_index_reuses_the_in_memory_linked_checkout_across_clients() -> Result<
 }
 
 #[test]
+fn warm_linked_checkout_reconciles_after_another_owner_publishes() -> Result<()> {
+    let daemon = common::TestDaemon::start_with_env(&[("TSINDEX_RUNTIME_IDLE_SECS", "60")])?;
+    let fixture = tempdir_in("/tmp")?;
+    let main = fixture.path().join("main");
+    let linked = fixture.path().join("topic");
+    // Use a materialized linked index, where CLI language filters affect
+    // publication (overlays always publish the configured language set).
+    build_fixture(&linked, "lib.py", "def linked_symbol():\n    return 1\n")?;
+    link_checkout(&main, &linked, "topic")?;
+    build_fixture(&main, "main.py", "def main_symbol():\n    return 1\n")?;
+    let mut config = TsIndexConfig::load(&main)?;
+    config.server.worktree_refresh_ms = 60_000;
+    config.write(&main)?;
+    config.write(&linked)?;
+    fs::write(linked.join("lib.rs"), "pub fn rust_only() {}\n")?;
+    let lookup = json!({"repo": linked, "names": ["rust_only"]});
+
+    let mut python = McpSession::connect(&daemon.socket, &main, "python-first")?;
+    let python_owner = managed_session(&daemon, "python-first")?.runtime_pid;
+    assert_eq!(python.call_tool("get_symbol", lookup.clone())?["total"], 0);
+    python.close_gracefully()?;
+
+    let mut rust = McpSession::connect_configured(&daemon.socket, &main, "rust", |command| {
+        command.args(["--languages", "rust"]);
+    })?;
+    assert_ne!(managed_session(&daemon, "rust")?.runtime_pid, python_owner);
+    assert_eq!(rust.call_tool("get_symbol", lookup.clone())?["total"], 1);
+    rust.close_gracefully()?;
+
+    let mut python = McpSession::connect(&daemon.socket, &main, "python-second")?;
+    assert_eq!(
+        managed_session(&daemon, "python-second")?.runtime_pid,
+        python_owner
+    );
+    assert_eq!(python.call_tool("get_symbol", lookup)?["total"], 0);
+    python.close_gracefully()
+}
+
+#[test]
 fn freshly_seeded_checkout_retains_its_projected_runtime_key() -> Result<()> {
     let daemon = common::TestDaemon::start()?;
     let fixture = tempdir_in("/tmp")?;

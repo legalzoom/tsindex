@@ -12,6 +12,7 @@ use serde::Serialize;
 
 use crate::config::{RepoConfig, TsIndexConfig, db_path};
 use crate::index::Runtime;
+use crate::maintenance::Reconciliation;
 use crate::mcp::InvalidParams;
 
 #[derive(Debug, Clone)]
@@ -148,7 +149,7 @@ struct WorktreeEntry {
     started: u64,
     completed: u64,
     failure: Option<Arc<anyhow::Error>>,
-    refreshed: Option<Instant>,
+    refreshed: Option<Reconciliation>,
 }
 
 #[derive(Default)]
@@ -347,7 +348,16 @@ impl Runtimes {
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut entry = state.entry.lock().unwrap_or_else(|p| p.into_inner());
         let refresh = Duration::from_millis(self.primary.config.server.worktree_refresh_ms);
-        if !entry.pending && entry.refreshed.is_none_or(|time| time.elapsed() >= refresh) {
+        // A different owner can publish this shared DB during our warm
+        // interval. Check the live generation without relying on the marker
+        // still being present.
+        if !entry.pending
+            && !entry
+                .refreshed
+                .as_ref()
+                .zip(entry.runtime.as_ref())
+                .is_some_and(|(completed, runtime)| completed.is_current(runtime, refresh))
+        {
             let mut config = self.primary.config.clone();
             if let Some(workspace) = self
                 .primary
@@ -378,13 +388,13 @@ impl Runtimes {
                 .name("tsindex-worktree".into())
                 .spawn(move || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                        || -> Result<(Runtime, Instant)> {
+                        || -> Result<(Runtime, Reconciliation)> {
                             // The index and cached generation remain warm. At
                             // each reconciliation, reload the checkout's own
                             // settings so a long-lived owner observes edits.
                             let runtime =
                                 open_checkout(&checkout, &config, languages)?.with_jobs(jobs);
-                            let refreshed = crate::maintenance::reconcile_if_due(&runtime)?;
+                            let refreshed = crate::maintenance::reconcile(&runtime)?;
                             Ok((runtime, refreshed))
                         },
                     ))

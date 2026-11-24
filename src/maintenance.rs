@@ -135,6 +135,20 @@ struct RefreshMarker {
     generation: i64,
 }
 
+pub(crate) struct Reconciliation {
+    completed_at: Instant,
+    generation: Option<i64>,
+}
+
+impl Reconciliation {
+    pub(crate) fn is_current(&self, runtime: &Runtime, interval: Duration) -> bool {
+        self.completed_at.elapsed() < interval
+            && self
+                .generation
+                .is_some_and(|expected| generation(runtime).ok() == Some(expected))
+    }
+}
+
 fn configuration(runtime: &Runtime) -> Result<String> {
     let database = key(&runtime.db_path);
     let input = serde_json::to_vec(&(
@@ -192,7 +206,7 @@ pub fn refresh_marker_path(db_path: &Path) -> PathBuf {
     sidecar_path(&key(db_path), "refresh-state")
 }
 
-fn marker_refreshed_at(runtime: &Runtime) -> Option<Instant> {
+fn marker_reconciliation(runtime: &Runtime) -> Option<Reconciliation> {
     let interval = u128::from(runtime.config.server.worktree_refresh_ms);
     if interval == 0 {
         return None;
@@ -212,9 +226,13 @@ fn marker_refreshed_at(runtime: &Runtime) -> Option<Instant> {
     }
     // Preserve the owner's completion age in a follower's monotonic cache.
     // Adding one millisecond accounts conservatively for marker clock rounding.
-    checked_at.checked_sub(
+    let completed_at = checked_at.checked_sub(
         Duration::from_millis(u64::try_from(age).ok()?).saturating_add(Duration::from_millis(1)),
-    )
+    )?;
+    Some(Reconciliation {
+        completed_at,
+        generation: Some(marker.generation),
+    })
 }
 
 /// Called after a successful build while the database's writer lease is held.
@@ -425,7 +443,11 @@ pub fn refresh_if_managed(runtime: &Runtime) -> Result<()> {
 /// The returned completion time retains the shared marker's age, so caching
 /// its reuse cannot give an almost-expired full scan another entire interval.
 pub fn reconcile_if_due(runtime: &Runtime) -> Result<Instant> {
-    if let Some(completed) = marker_refreshed_at(runtime) {
+    Ok(reconcile(runtime)?.completed_at)
+}
+
+pub(crate) fn reconcile(runtime: &Runtime) -> Result<Reconciliation> {
+    if let Some(completed) = marker_reconciliation(runtime) {
         return Ok(completed);
     }
     // This lease coalesces callers before Runtime::build takes the writer
@@ -435,7 +457,7 @@ pub fn reconcile_if_due(runtime: &Runtime) -> Result<Instant> {
         Duration::from_secs(30),
     )
     .context("index freshness unavailable: refresh coordinator is busy")?;
-    if let Some(completed) = marker_refreshed_at(runtime) {
+    if let Some(completed) = marker_reconciliation(runtime) {
         return Ok(completed);
     }
     let started = Instant::now();
@@ -449,6 +471,10 @@ pub fn reconcile_if_due(runtime: &Runtime) -> Result<Instant> {
         );
     }
     // A zero interval never has a reusable marker. A concurrent publication
-    // may also invalidate it before this read; the start time is conservative.
-    Ok(marker_refreshed_at(runtime).unwrap_or(started))
+    // may also invalidate it before this read. Never cache a generation the
+    // configuration-matched marker didn't certify as ours.
+    Ok(marker_reconciliation(runtime).unwrap_or(Reconciliation {
+        completed_at: started,
+        generation: None,
+    }))
 }

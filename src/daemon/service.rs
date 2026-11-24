@@ -987,21 +987,11 @@ fn matches_installed_login_context(
                 return default == selected_socket
                     || ordinary_linux_defaults(default, selected_socket, home, uid);
             }
-            // A custom XDG_RUNTIME_DIR only matches an install from that same
-            // runtime directory. If it exceeded the socket path limit and fell
-            // back to the ordinary home/tmp path, keep it isolated.
-            let custom_fits = xdg_runtime_dir
-                .filter(|value| !value.is_empty())
-                .is_some_and(|dir| {
-                    PathBuf::from(dir)
-                        .join("tsindex")
-                        .join("daemon.sock")
-                        .as_os_str()
-                        .as_encoded_bytes()
-                        .len()
-                        <= super::MAX_UNIX_SOCKET_PATH_BYTES
-                });
-            custom_fits && default == selected_socket
+            // A custom XDG_RUNTIME_DIR (whether direct or hashed fallback)
+            // only matches an install made in that exact runtime directory and
+            // never aliases the ordinary home/tmp fallback.
+            let ordinary_fallback = crate::daemon::default_socket_path(None, home, uid);
+            selected_socket != ordinary_fallback && default == selected_socket
         }
         // Legacy metadata lacks its install-time runtime directory. A
         // custom Linux XDG directory remains isolated until reinstallation.
@@ -1342,24 +1332,11 @@ fn endpoint_from_systemd_unit(
     } else {
         fallback_xdg_runtime_dir
     };
-    #[cfg(target_os = "linux")]
-    {
-        Ok(crate::daemon::default_socket_path(
-            xdg_runtime_dir,
-            default_home,
-            uid,
-        ))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        if let Some(runtime) = xdg_runtime_dir.filter(|value| !value.is_empty()) {
-            let candidate = PathBuf::from(runtime).join("tsindex").join("daemon.sock");
-            if candidate.as_os_str().as_encoded_bytes().len() <= 100 {
-                return Ok(candidate);
-            }
-        }
-        Ok(crate::daemon::default_socket_path(None, default_home, uid))
-    }
+    Ok(crate::daemon::linux_default_socket_path(
+        xdg_runtime_dir.as_deref(),
+        default_home,
+        uid,
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -1975,8 +1952,15 @@ mod tests {
         let session = Path::new("/run/user/1000/tsindex/daemon.sock");
         let fallback = Path::new("/home/dev/.tsindex/run/daemon.sock");
         let long_custom = std::ffi::OsString::from(format!("/tmp/{}", "x".repeat(95)));
+        let long_custom_socket =
+            crate::daemon::linux_default_socket_path(Some(long_custom.as_os_str()), home, uid);
         let short_custom = std::ffi::OsStr::new("/tmp/custom-xdg");
         let short_custom_socket = Path::new("/tmp/custom-xdg/tsindex/daemon.sock");
+
+        // An oversized custom XDG_RUNTIME_DIR resolves to a distinct fallback
+        // pathname rather than the ordinary home/tmp fallback.
+        assert_ne!(long_custom_socket, fallback);
+        assert_ne!(long_custom_socket, session);
 
         // Ordinary Linux login contexts remain equivalent across session and unset XDG_RUNTIME_DIR.
         assert!(matches_installed_login_context(
@@ -1996,11 +1980,19 @@ mod tests {
             true
         ));
 
-        // An oversized custom XDG_RUNTIME_DIR falls back to `fallback`, but must
-        // never alias an ordinary login install (session, fallback, or legacy).
+        // An oversized custom XDG_RUNTIME_DIR must never alias an ordinary
+        // login install (session, fallback, or legacy).
         assert!(!matches_installed_login_context(
             Some(session),
-            fallback,
+            &long_custom_socket,
+            Some(long_custom.as_os_str()),
+            home,
+            uid,
+            true
+        ));
+        assert!(!matches_installed_login_context(
+            Some(fallback),
+            &long_custom_socket,
             Some(long_custom.as_os_str()),
             home,
             uid,
@@ -2016,7 +2008,7 @@ mod tests {
         ));
         assert!(!matches_installed_login_context(
             None,
-            fallback,
+            &long_custom_socket,
             Some(long_custom.as_os_str()),
             home,
             uid,

@@ -205,26 +205,63 @@ impl DaemonPaths {
     }
 }
 
-fn default_socket_path(
-    xdg_runtime_dir: Option<OsString>,
-    default_home: &Path,
-    uid: u32,
-) -> PathBuf {
-    #[cfg(target_os = "linux")]
-    if let Some(runtime) = xdg_runtime_dir.filter(|value| !value.is_empty()) {
-        let candidate = PathBuf::from(runtime).join("tsindex").join("daemon.sock");
-        if candidate.as_os_str().as_encoded_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES {
-            return candidate;
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = xdg_runtime_dir;
-
+fn fallback_socket_path(default_home: &Path, uid: u32) -> PathBuf {
     let candidate = default_home.join("run").join("daemon.sock");
     if candidate.as_os_str().as_encoded_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES {
         return candidate;
     }
     PathBuf::from(format!("/tmp/tsindex-{uid}/daemon.sock"))
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn linux_default_socket_path(
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    default_home: &Path,
+    uid: u32,
+) -> PathBuf {
+    if let Some(runtime) = xdg_runtime_dir.filter(|value| !value.is_empty()) {
+        let candidate = PathBuf::from(runtime).join("tsindex").join("daemon.sock");
+        if candidate.as_os_str().as_encoded_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES {
+            return candidate;
+        }
+        // An oversized custom XDG_RUNTIME_DIR must stay isolated from the
+        // ordinary home/tmp fallback so bare commands cannot reach a login
+        // service installed at that fallback path.
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        for component in Path::new(runtime).components() {
+            let bytes = component.as_os_str().as_encoded_bytes();
+            digest.update((bytes.len() as u64).to_le_bytes());
+            digest.update(bytes);
+        }
+        let hash = digest.finalize();
+        let tag = format!(
+            "xdg-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7]
+        );
+        let home_candidate = default_home.join("run").join(&tag).join("daemon.sock");
+        if home_candidate.as_os_str().as_encoded_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES {
+            return home_candidate;
+        }
+        return PathBuf::from(format!("/tmp/tsindex-{uid}/{tag}/daemon.sock"));
+    }
+    fallback_socket_path(default_home, uid)
+}
+
+pub(crate) fn default_socket_path(
+    xdg_runtime_dir: Option<OsString>,
+    default_home: &Path,
+    uid: u32,
+) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        linux_default_socket_path(xdg_runtime_dir.as_deref(), default_home, uid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = xdg_runtime_dir;
+        fallback_socket_path(default_home, uid)
+    }
 }
 
 pub(crate) fn current_uid() -> u32 {
@@ -415,7 +452,19 @@ fn read_peer_credentials(stream: &std::os::unix::net::UnixStream) -> Result<Peer
     Ok(PeerCredentials { uid: cred.uid, pid })
 }
 
-#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "aix",
+    target_os = "nto",
+    target_os = "cygwin",
+))]
 fn read_peer_credentials(stream: &std::os::unix::net::UnixStream) -> Result<PeerCredentials> {
     use std::os::fd::AsRawFd;
 
@@ -430,6 +479,28 @@ fn read_peer_credentials(stream: &std::os::unix::net::UnixStream) -> Result<Peer
         uid: euid,
         pid: None,
     })
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "aix",
+        target_os = "nto",
+        target_os = "cygwin",
+    ))
+))]
+fn read_peer_credentials(_stream: &std::os::unix::net::UnixStream) -> Result<PeerCredentials> {
+    bail!("managed daemon peer authentication is unsupported on this platform; use direct mode")
 }
 
 /// Control messages sent to the orchestrator daemon over its Unix domain socket.
@@ -1303,6 +1374,49 @@ mod tests {
             PathBuf::from("/run/user/1000/tsindex/daemon.sock")
         );
         Ok(())
+    }
+
+    #[test]
+    fn linux_oversized_custom_xdg_runtime_dir_uses_distinct_fallback() {
+        let uid = 1000;
+        let home = Path::new("/home/dev/.tsindex");
+        let ordinary_fallback = PathBuf::from("/home/dev/.tsindex/run/daemon.sock");
+        let long_a = OsString::from(format!("/tmp/{}", "a".repeat(95)));
+        let long_a_slash = OsString::from(format!("/tmp/{}/", "a".repeat(95)));
+        let long_b = OsString::from(format!("/tmp/{}", "b".repeat(95)));
+
+        assert_eq!(
+            linux_default_socket_path(None, home, uid),
+            ordinary_fallback
+        );
+        assert_eq!(
+            linux_default_socket_path(Some(std::ffi::OsStr::new("/run/user/1000")), home, uid),
+            PathBuf::from("/run/user/1000/tsindex/daemon.sock")
+        );
+
+        let fallback_a = linux_default_socket_path(Some(long_a.as_os_str()), home, uid);
+        let fallback_a_slash = linux_default_socket_path(Some(long_a_slash.as_os_str()), home, uid);
+        let fallback_b = linux_default_socket_path(Some(long_b.as_os_str()), home, uid);
+        assert_eq!(fallback_a, fallback_a_slash);
+        assert_ne!(fallback_a, ordinary_fallback);
+        assert_ne!(fallback_b, ordinary_fallback);
+        assert_ne!(fallback_a, fallback_b);
+        assert!(fallback_a.as_os_str().as_encoded_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES);
+        assert!(fallback_b.as_os_str().as_encoded_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES);
+        assert!(fallback_a.starts_with(home.join("run")));
+
+        // Even when $HOME itself exceeds the socket limit, oversized custom
+        // XDG_RUNTIME_DIR stays distinct from /tmp/tsindex-<uid>/daemon.sock.
+        let long_home = PathBuf::from(format!("/home/{}/.tsindex", "h".repeat(90)));
+        let tmp_ordinary = PathBuf::from("/tmp/tsindex-1000/daemon.sock");
+        assert_eq!(
+            linux_default_socket_path(None, &long_home, uid),
+            tmp_ordinary
+        );
+        let tmp_custom = linux_default_socket_path(Some(long_a.as_os_str()), &long_home, uid);
+        assert_ne!(tmp_custom, tmp_ordinary);
+        assert!(tmp_custom.starts_with("/tmp/tsindex-1000"));
+        assert!(tmp_custom.as_os_str().as_encoded_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES);
     }
 
     #[test]

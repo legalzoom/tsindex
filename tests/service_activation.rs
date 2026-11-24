@@ -302,23 +302,66 @@ fn login_clients_discover_installed_socket_and_preserve_explicit_isolation() -> 
     let standard_runtime = PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() }));
     let home_fallback = scratch.path().join(".tsindex/run/daemon.sock");
     let oversized_runtime = scratch.path().join("x".repeat(95));
-    let endpoint = |default: &Path| -> Result<()> {
+    let endpoint = |installed_socket: &Path, default: &Path| -> Result<()> {
         fs::write(
             config.join("tsindex.json"),
             serde_json::to_vec(&serde_json::json!({
-                "socket": socket, "default_socket": default,
+                "socket": installed_socket, "default_socket": default,
             }))?,
         )?;
         Ok(())
     };
-    endpoint(&standard_runtime.join("tsindex/daemon.sock"))?;
+    endpoint(&socket, &standard_runtime.join("tsindex/daemon.sock"))?;
     ensure!(status_socket(command().env_remove("XDG_RUNTIME_DIR"))? == socket);
     ensure!(status_socket(&mut command())? == runtime.join("tsindex/daemon.sock"));
-    ensure!(status_socket(command().env("XDG_RUNTIME_DIR", &oversized_runtime))? == home_fallback);
-    endpoint(&home_fallback)?;
+    let oversized_socket = status_socket(command().env("XDG_RUNTIME_DIR", &oversized_runtime))?;
+    ensure!(oversized_socket != socket && oversized_socket != home_fallback);
+    endpoint(&socket, &home_fallback)?;
     ensure!(status_socket(command().env("XDG_RUNTIME_DIR", &standard_runtime))? == socket);
-    ensure!(status_socket(command().env("XDG_RUNTIME_DIR", &oversized_runtime))? == home_fallback);
-    endpoint(&runtime.join("tsindex/daemon.sock"))?;
+    ensure!(
+        status_socket(command().env("XDG_RUNTIME_DIR", &oversized_runtime))? == oversized_socket
+    );
+    // Even when the login service actually listens at the ordinary home
+    // fallback path, an oversized custom XDG_RUNTIME_DIR must stay isolated
+    // and never reach that daemon on bare lifecycle or MCP commands.
+    endpoint(&home_fallback, &home_fallback)?;
+    {
+        let _fallback_server = Daemon(
+            command()
+                .env_remove("XDG_RUNTIME_DIR")
+                .args(["daemon", "run"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?,
+        );
+        wait_ready(&home_fallback)?;
+        let out = command()
+            .env("XDG_RUNTIME_DIR", &oversized_runtime)
+            .args(["daemon", "status", "--json"])
+            .output()?;
+        ensure!(out.status.success());
+        let status: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+        ensure!(status["running"] == false);
+        ensure!(
+            PathBuf::from(status["socket"].as_str().context("socket missing")?) == oversized_socket
+        );
+        let probe_repo = scratch.path().join("probe-repo");
+        fs::create_dir(&probe_repo)?;
+        let mcp = command()
+            .env("XDG_RUNTIME_DIR", &oversized_runtime)
+            .arg("--root")
+            .arg(&probe_repo)
+            .args(["--no-refresh", "serve", "--mcp", "--via-daemon"])
+            .stdin(Stdio::null())
+            .output()?;
+        ensure!(
+            !mcp.status.success(),
+            "oversized custom XDG_RUNTIME_DIR must not reach login daemon at fallback path"
+        );
+        ensure!(client(&home_fallback)?.ping()?.total_sessions_started == 0);
+    }
+    endpoint(&socket, &runtime.join("tsindex/daemon.sock"))?;
     let independent = scratch.path().join("independent.sock");
     ensure!(status_socket(command().arg("--socket").arg(&independent))? == independent);
     ensure!(status_socket(command().env("TSINDEX_SOCKET", &independent))? == independent);

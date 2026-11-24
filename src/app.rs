@@ -812,7 +812,11 @@ fn manage_daemon(cli: &Cli, command: &DaemonCommand) -> Result<()> {
                     version: env!("CARGO_PKG_VERSION").to_string(),
                 },
             )?;
-            crate::mcp::serve_mcp_worker(&resolver)
+            let result = crate::mcp::serve_mcp_worker(&resolver);
+            if result.is_ok() && resolver.has_abandoned_lane() {
+                std::process::exit(crate::daemon::runtime::ABANDONED_LANE_EXIT);
+            }
+            result
         }
         DaemonAction::Run { socket_activated } => {
             let paths = DaemonPaths::resolve(cli.socket.as_deref())?;

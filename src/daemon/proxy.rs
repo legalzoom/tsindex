@@ -44,14 +44,30 @@ pub struct McpProxyArgs {
 /// Fails fast with an actionable message if the daemon is not running.
 pub fn run_mcp_proxy(args: McpProxyArgs) -> Result<()> {
     let paths = crate::daemon::service::client_paths(args.socket.as_deref())?;
-    let caller_dir = env::current_dir().context("failed to determine current directory")?;
+    let caller_dir = env::current_dir().ok();
     // Send absolute spellings without touching the checkout or database in
-    // the launcher. Their resolution belongs to the registered worker.
-    let root = args
-        .root
-        .as_ref()
-        .map_or_else(|| caller_dir.clone(), |path| caller_dir.join(path));
-    let db = args.db.as_ref().map(|path| caller_dir.join(path));
+    // the launcher. Their resolution belongs to the registered worker, and a
+    // self-contained absolute request does not require a usable launcher cwd.
+    let root = match &args.root {
+        Some(path) if path.is_absolute() => path.clone(),
+        Some(path) => caller_dir
+            .as_ref()
+            .context("failed to determine current directory")?
+            .join(path),
+        None => caller_dir
+            .clone()
+            .context("failed to determine current directory")?,
+    };
+    let db = match &args.db {
+        Some(path) if path.is_absolute() => Some(path.clone()),
+        Some(path) => Some(
+            caller_dir
+                .as_ref()
+                .context("failed to determine current directory")?
+                .join(path),
+        ),
+        None => None,
+    };
 
     validate_private_dir(paths.socket_dir()?).map_err(|error| {
         anyhow!(
@@ -76,7 +92,7 @@ pub fn run_mcp_proxy(args: McpProxyArgs) -> Result<()> {
         protocol: PROTOCOL_VERSION,
         client_version: env!("CARGO_PKG_VERSION").to_string(),
         root,
-        caller_dir: Some(caller_dir),
+        caller_dir,
         db,
         languages: args.languages,
         no_refresh: args.no_refresh,
@@ -167,10 +183,13 @@ pub fn run_mcp_proxy(args: McpProxyArgs) -> Result<()> {
             let _ = sent.send(result);
         });
 
-        if let Err(error) = relay_stdio(uds_reader, stdin, &cancel_blocked_output) {
-            let _ = cancel_outcomes.shutdown(Shutdown::Both);
-            return Err(error);
-        }
+        let socket_error = match relay_stdio(uds_reader, stdin, &cancel_blocked_output) {
+            Ok(socket_error) => socket_error,
+            Err(error) => {
+                let _ = cancel_outcomes.shutdown(Shutdown::Both);
+                return Err(error);
+            }
+        };
         let outcome = received
             .recv_timeout(Duration::from_secs(6))
             .map_err(|error| {
@@ -187,6 +206,17 @@ pub fn run_mcp_proxy(args: McpProxyArgs) -> Result<()> {
         ) {
             bail!("session MCP worker failed: {reason}");
         }
+        // Intentional daemon-side stops can close the data socket while stdin
+        // writes are backpressured; preserve their successful outcome while
+        // still failing unexpected transport errors.
+        if let Some(error) = socket_error
+            && !matches!(
+                reason,
+                "killed_by_user" | "daemon_shutdown" | "owner_exited"
+            )
+        {
+            return Err(error);
+        }
         Ok(())
     })
 }
@@ -195,32 +225,39 @@ fn relay_stdio(
     mut uds_reader: BufReader<UnixStream>,
     mut stdin: CancellableStdin,
     cancel_blocked_output: &AtomicBool,
-) -> Result<()> {
+) -> Result<Option<anyhow::Error>> {
     let mut uds_writer = uds_reader
         .get_ref()
         .try_clone()
         .context("failed to clone orchestrator socket")?;
     let cancellation = Arc::clone(&stdin.cancellation);
-    let output_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    let local_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    let socket_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
     let mut stdout =
         ProxyStdout::new(io::stdout().as_fd()).context("failed to prepare MCP stdout")?;
 
     thread::scope(|scope| {
         let cancel_from_egress = Arc::clone(&cancellation);
-        let egress_error = &output_error;
+        let egress_local = &local_error;
+        let egress_socket = &socket_error;
         scope.spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
-                let result = match uds_reader.read(&mut buf) {
+                match uds_reader.read(&mut buf) {
                     Ok(0) => break,
-                    Ok(n) => stdout.relay(&buf[..n], cancel_blocked_output),
-                    Err(error) => Err(error),
-                };
-                match result {
-                    Ok(true) => continue,
-                    Ok(false) => break,
+                    Ok(n) => match stdout.relay(&buf[..n], cancel_blocked_output) {
+                        Ok(true) => continue,
+                        Ok(false) => break,
+                        Err(error) => {
+                            egress_local
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get_or_insert(error.into());
+                            break;
+                        }
+                    },
                     Err(error) => {
-                        egress_error
+                        egress_socket
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .get_or_insert(error.into());
@@ -243,17 +280,19 @@ fn relay_stdio(
                 }
                 Ok(n) => {
                     if let Err(error) = uds_writer.write_all(&buf[..n]) {
-                        *output_error.lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some(error.into());
+                        socket_error
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_or_insert(error.into());
                         let _ = uds_writer.shutdown(Shutdown::Both);
                         break;
                     }
                 }
                 Err(error) => {
-                    let mut slot = output_error.lock().unwrap_or_else(|e| e.into_inner());
-                    if slot.is_none() {
-                        *slot = Some(error.into());
-                    }
+                    local_error
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_or_insert(error.into());
                     let _ = uds_writer.shutdown(Shutdown::Both);
                     break;
                 }
@@ -261,10 +300,10 @@ fn relay_stdio(
         }
     });
 
-    if let Some(error) = output_error.into_inner().unwrap_or_else(|e| e.into_inner()) {
+    if let Some(error) = local_error.into_inner().unwrap_or_else(|e| e.into_inner()) {
         return Err(error);
     }
-    Ok(())
+    Ok(socket_error.into_inner().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// The harness may keep a duplicate of stdout. File status flags belong to the

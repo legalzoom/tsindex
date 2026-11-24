@@ -945,7 +945,19 @@ impl DaemonClient {
         let line = read_bounded_line(&mut reader, MAX_CONTROL_LINE_BYTES)?;
         match serde_json::from_str::<DaemonResponse>(&line)? {
             DaemonResponse::Watching => {
-                reader.get_ref().set_read_timeout(None)?;
+                // On macOS, a daemon that already sent Watching + Session from
+                // recent history and closed the peer causes SO_RCVTIMEO clears
+                // to return EINVAL even while the terminal record stays readable.
+                if let Err(error) = reader.get_ref().set_read_timeout(None)
+                    && !matches!(
+                        error.kind(),
+                        io::ErrorKind::InvalidInput
+                            | io::ErrorKind::NotConnected
+                            | io::ErrorKind::ConnectionReset
+                    )
+                {
+                    return Err(error.into());
+                }
                 Ok(Some(reader))
             }
             DaemonResponse::Error { error } if error == OUTCOME_WATCHER_CAPACITY_ERROR => Ok(None),
@@ -1308,6 +1320,74 @@ mod tests {
         assert_eq!(first, "{\"op\":\"ping\"}\n");
         let second = read_bounded_line(&mut cursor, 1024)?;
         assert_eq!(second, "{\"jsonrpc\":\"2.0\"}\n");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watch_session_preserves_terminal_record_after_peer_closes() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir_in("/tmp")?;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket)?;
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+
+        let server = std::thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut reader = io::BufReader::new(stream.try_clone()?);
+            let _ = read_bounded_line(&mut reader, MAX_CONTROL_LINE_BYTES)?;
+            write_json_line(&mut stream, &DaemonResponse::Watching)?;
+            write_json_line(
+                &mut stream,
+                &DaemonResponse::Session {
+                    session: SessionInfo {
+                        session_id: "s-1".to_string(),
+                        state: SessionState::Exited,
+                        root: PathBuf::from("/tmp/repo"),
+                        db: None,
+                        languages: vec![],
+                        no_refresh: false,
+                        client_pid: std::process::id(),
+                        owner_pid: None,
+                        worker_pid: 999,
+                        runtime_pid: None,
+                        harness_name: None,
+                        harness_version: None,
+                        started_at: 0,
+                        last_activity_at: 0,
+                        ended_at: Some(1),
+                        requests_received: 0,
+                        responses_sent: 0,
+                        tool_calls: 0,
+                        exit_reason: Some("killed_by_user".to_string()),
+                        recent_stderr: vec![],
+                    },
+                },
+            )?;
+            // Close immediately so the client observes a closed peer while
+            // clearing SO_RCVTIMEO (which returns EINVAL on Darwin).
+            drop(reader);
+            drop(stream);
+            Ok(())
+        });
+
+        let paths = DaemonPaths::resolve(Some(&socket))?;
+        let mut reader = DaemonClient::new(paths)
+            .try_watch_session("s-1")?
+            .context("expected watching reader")?;
+        server.join().unwrap()?;
+        let line = read_bounded_line(&mut reader, MAX_CONTROL_LINE_BYTES)?;
+        match serde_json::from_str::<DaemonResponse>(&line)? {
+            DaemonResponse::Session { session } => {
+                assert_eq!(session.session_id, "s-1");
+                assert_eq!(session.state, SessionState::Exited);
+                assert_eq!(session.exit_reason.as_deref(), Some("killed_by_user"));
+            }
+            other => bail!("unexpected terminal outcome: {other:?}"),
+        }
         Ok(())
     }
 }

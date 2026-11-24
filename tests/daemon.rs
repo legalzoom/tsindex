@@ -2198,3 +2198,329 @@ fn session_detail_prunes_escaped_stderr_to_the_encoded_frame_budget() -> Result<
     client.shutdown()?;
     Ok(())
 }
+
+#[test]
+fn killing_backpressured_proxy_reads_successful_stop_outcome() -> Result<()> {
+    let dir = tempdir_in("/tmp")?;
+    let root = dir.path();
+    build_fixture(root, "lib.py", "def backpressured_sym():\n    pass\n")?;
+    let daemon = common::TestDaemon::start()?;
+    let mut session = McpSession::connect_with(&daemon.socket, root, "backpressured", &[])?;
+    let info = managed_session(&daemon, "backpressured")?;
+    let _writer = block_indexed_requests(&mut session, root)?;
+
+    // Saturate the proxy-to-daemon socket buffer with valid pipelined requests
+    // so the proxy blocks in uds_writer.write_all while the daemon kills it.
+    let mut stdin = session.child.stdin.take().unwrap();
+    let payload = format!(
+        "{}\n",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 999,
+            "method": "tools/call",
+            "params": {
+                "name": "get_symbol",
+                "arguments": {
+                    "name": "backpressured_sym",
+                    "file_glob": "x".repeat(4096)
+                }
+            }
+        })
+    );
+    let writer_thread = thread::spawn(move || {
+        for _ in 0..400 {
+            if stdin.write_all(payload.as_bytes()).is_err() {
+                break;
+            }
+        }
+    });
+    // Give the writer a brief moment to fill the socket send buffer.
+    thread::sleep(Duration::from_millis(100));
+    daemon.client()?.kill_session(info.session_id)?;
+    let _ = writer_thread.join();
+
+    let status = session
+        .wait_for_exit(Duration::from_secs(5))?
+        .context("proxy did not exit")?;
+    assert!(
+        status.success(),
+        "killing a backpressured proxy should still return success on killed_by_user, got {status}"
+    );
+    Ok(())
+}
+
+#[test]
+fn managed_mcp_starts_without_usable_caller_cwd_when_paths_are_absolute() -> Result<()> {
+    let dir = tempdir_in("/tmp")?;
+    let root = dir.path().join("repo");
+    fs::create_dir(&root)?;
+    build_fixture(&root, "lib.py", "def abs_only_sym():\n    pass\n")?;
+    let db = dir.path().join("explicit.db");
+    let daemon = common::TestDaemon::start()?;
+
+    // Part A: remove the launcher's cwd before execing `tsindex serve --mcp --via-daemon`
+    // with absolute --socket, --root, and --db.
+    let ephemeral = dir.path().join("ephemeral-cwd");
+    fs::create_dir(&ephemeral)?;
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("cd \"$1\" && rmdir \"$1\" && exec \"$2\" --socket \"$3\" --root \"$4\" --db \"$5\" serve --mcp --via-daemon")
+        .arg("--")
+        .arg(&ephemeral)
+        .arg(BIN)
+        .arg(&daemon.socket)
+        .arg(&root)
+        .arg(&db)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"removed-cwd","version":"1"}}})
+        )?;
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_symbol","arguments":{"name":"abs_only_sym"}}})
+        )?;
+        stdin.flush()?;
+    }
+    drop(child.stdin.take());
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "managed MCP failed with removed cwd: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("abs_only_sym"),
+        "missing symbol in {stdout}"
+    );
+
+    // Part B: a caller_dir that does not exist in the daemon's mount namespace
+    // must still succeed when no caller-relative ignore rules are configured.
+    let mut stream = std::os::unix::net::UnixStream::connect(&daemon.socket)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    writeln!(
+        stream,
+        "{}",
+        serde_json::to_string(&tsindex::daemon::DaemonRequest::StartSession(
+            tsindex::daemon::StartSessionRequest {
+                protocol: tsindex::daemon::PROTOCOL_VERSION,
+                client_version: env!("CARGO_PKG_VERSION").to_string(),
+                root: root.clone(),
+                caller_dir: Some(dir.path().join("foreign-mount-ns-cwd")),
+                db: Some(db),
+                languages: vec![],
+                no_refresh: false,
+                client_pid: std::process::id(),
+                owner_pid: None,
+                owner_explicit: false,
+            }
+        ))?,
+    )?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line)?;
+    let ready: Value = serde_json::from_str(&line)?;
+    assert_eq!(ready["kind"], "session_ready", "{ready}");
+    Ok(())
+}
+
+#[test]
+fn managed_indexes_isolate_per_repo_and_absolute_ignore_files_by_caller_cwd() -> Result<()> {
+    let daemon = common::TestDaemon::start()?;
+
+    // Case 1: per-repo [[repos]].ignore relative filename.
+    {
+        let dir = tempdir_in("/tmp")?;
+        let root = dir.path().join("catalog");
+        let repo_dir = root.join("svc");
+        let caller_a = dir.path().join("caller-a");
+        let caller_b = dir.path().join("caller-b");
+        fs::create_dir_all(&repo_dir)?;
+        fs::create_dir(&caller_a)?;
+        fs::create_dir(&caller_b)?;
+        fs::write(repo_dir.join("keep.py"), "def keep_sym():\n    pass\n")?;
+        fs::write(repo_dir.join("skip.py"), "def skip_sym():\n    pass\n")?;
+        fs::write(caller_a.join("repo-rules.txt"), "skip.py\n")?;
+        fs::write(caller_b.join("repo-rules.txt"), "\n")?;
+
+        let mut config = TsIndexConfig::default();
+        config.languages.include = vec!["python".into()];
+        config.server.worktree_refresh_ms = 60_000;
+        config.repos.push(tsindex::config::RepoConfig {
+            name: "svc".into(),
+            path: "svc".into(),
+            languages: vec!["python".into()],
+            ignore: vec!["repo-rules.txt".into()],
+        });
+        config.write(&root)?;
+
+        let mut a = McpSession::connect_configured(&daemon.socket, &root, "repo-a", |cmd| {
+            cmd.current_dir(&caller_a);
+        })?;
+        assert_eq!(
+            a.call_tool("get_symbol", json!({"name":"keep_sym"}))?["total"],
+            1
+        );
+        assert_eq!(
+            a.call_tool("get_symbol", json!({"name":"skip_sym"}))?["total"],
+            0
+        );
+
+        let mut b = McpSession::connect_configured(&daemon.socket, &root, "repo-b", |cmd| {
+            cmd.current_dir(&caller_b);
+        })?;
+        assert_ne!(
+            managed_session(&daemon, "repo-a")?.runtime_pid,
+            managed_session(&daemon, "repo-b")?.runtime_pid
+        );
+        assert_eq!(
+            b.call_tool("get_symbol", json!({"name":"skip_sym"}))?["total"],
+            1
+        );
+        b.close_gracefully()?;
+        a.close_gracefully()?;
+    }
+
+    // Case 2: absolute ignore file containing a cwd-anchored pattern (`/repo/skip.py`).
+    {
+        let dir = tempdir_in("/tmp")?;
+        let root = dir.path().join("repo");
+        fs::create_dir(&root)?;
+        fs::write(root.join("keep.py"), "def keep_abs():\n    pass\n")?;
+        fs::write(root.join("skip.py"), "def skip_abs():\n    pass\n")?;
+        let rules = dir.path().join("abs-rules.txt");
+        // Anchored to cwd: matches <dir>/repo/skip.py when cwd is <dir>,
+        // but does NOT match when cwd is <dir>/repo.
+        fs::write(&rules, "/repo/skip.py\n")?;
+
+        let mut config = TsIndexConfig::default();
+        config.languages.include = vec!["python".into()];
+        config.server.worktree_refresh_ms = 60_000;
+        config.ignore.extra = vec![rules.to_string_lossy().into_owned()];
+        config.write(&root)?;
+
+        let mut parent =
+            McpSession::connect_configured(&daemon.socket, &root, "abs-parent", |cmd| {
+                cmd.current_dir(dir.path());
+            })?;
+        assert_eq!(
+            parent.call_tool("get_symbol", json!({"name":"keep_abs"}))?["total"],
+            1
+        );
+        assert_eq!(
+            parent.call_tool("get_symbol", json!({"name":"skip_abs"}))?["total"],
+            0
+        );
+
+        let mut inside =
+            McpSession::connect_configured(&daemon.socket, &root, "abs-inside", |cmd| {
+                cmd.current_dir(&root);
+            })?;
+        assert_ne!(
+            managed_session(&daemon, "abs-parent")?.runtime_pid,
+            managed_session(&daemon, "abs-inside")?.runtime_pid
+        );
+        assert_eq!(
+            inside.call_tool("get_symbol", json!({"name":"skip_abs"}))?["total"],
+            1
+        );
+        inside.close_gracefully()?;
+        parent.close_gracefully()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn worker_exiting_cleanly_after_timed_out_lookups_retires_saturated_owner() -> Result<()> {
+    let dir = tempdir_in("/tmp")?;
+    let root = dir.path().join("repo");
+    fs::create_dir(&root)?;
+    build_fixture(&root, "lib.py", "def recovered_live():\n    pass\n")?;
+    let flag = dir.path().join("first-worker-ran");
+    let script = format!(
+        r#"#!/bin/sh
+case " $* " in
+  *" daemon worker "*)
+    if [ ! -f "{flag}" ]; then
+      : > "{flag}"
+      "$TSINDEX_TEST_RUNTIME_EXE" "$@"
+      status=$?
+      if [ "$status" -eq 0 ]; then
+        exit 76
+      fi
+      exit "$status"
+    fi
+    ;;
+esac
+exec "$TSINDEX_TEST_RUNTIME_EXE" "$@"
+"#,
+        flag = flag.display()
+    );
+
+    let daemon_dir = tempdir_in("/tmp")?;
+    fs::set_permissions(daemon_dir.path(), fs::Permissions::from_mode(0o700))?;
+    let exe = daemon_dir.path().join("tsindex");
+    let socket = daemon_dir.path().join("d.sock");
+    fs::copy(BIN, &exe)?;
+    let _daemon = WrappedDaemon(spawn_copied_daemon(
+        Command::new(&exe)
+            .env("TSINDEX_TEST_RUNTIME_EXE", BIN)
+            .env("TSINDEX_MAX_SESSIONS", "1")
+            .arg("--socket")
+            .arg(&socket)
+            .args(["daemon", "run"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )?);
+    let client =
+        tsindex::daemon::DaemonClient::new(tsindex::daemon::DaemonPaths::resolve(Some(&socket))?);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while client.ping().is_err() {
+        assert!(Instant::now() < deadline, "copied daemon did not start");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let helper = daemon_dir.path().join("worker-wrapper");
+    fs::write(&helper, script)?;
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700))?;
+    fs::rename(helper, exe)?;
+
+    let mut first = McpSession::connect(&socket, &root, "first-abandoned")?;
+    let first_runtime_pid =
+        daemon_json(&socket, &["daemon", "sessions"])?["active"][0]["runtime_pid"]
+            .as_u64()
+            .context("missing first runtime_pid")? as u32;
+    assert_eq!(
+        first.call_tool("get_symbol", json!({"name":"recovered_live"}))?["total"],
+        1
+    );
+    // Worker answers every request and exits with ABANDONED_LANE_EXIT (76).
+    // Proxy must still treat the session as a clean exit (status 0).
+    first.close_gracefully()?;
+
+    let mut next = McpSession::connect(&socket, &root, "second-fresh")?;
+    let second_runtime_pid =
+        daemon_json(&socket, &["daemon", "sessions"])?["active"][0]["runtime_pid"]
+            .as_u64()
+            .context("missing second runtime_pid")? as u32;
+    assert_ne!(
+        second_runtime_pid, first_runtime_pid,
+        "owner generation must be retired after ABANDONED_LANE_EXIT"
+    );
+    let live = next.call_tool(
+        "query",
+        json!({"language":"python", "query":"(function_definition name: (identifier) @name)"}),
+    )?;
+    assert!(live.to_string().contains("recovered_live"), "{live}");
+    next.close_gracefully()?;
+    client.shutdown()?;
+    Ok(())
+}

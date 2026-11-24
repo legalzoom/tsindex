@@ -31,6 +31,9 @@ pub(super) const MAX_IDLE: usize = 4;
 // Distinguish an unresponsive shared resolver from a failed tool or an
 // independently cancelled MCP worker when the supervisor reaps the child.
 pub(super) const LOOKUP_TIMEOUT_EXIT: i32 = 75;
+/// Signal cleanly that a worker exited normally after timing out at least one
+/// owner lookup, so the supervisor retires its generation for new attachments.
+pub(crate) const ABANDONED_LANE_EXIT: i32 = 76;
 
 fn generation_digest(config: &TsIndexConfig) -> Result<String> {
     // Both children calculate this themselves. A package replacement between
@@ -68,20 +71,7 @@ fn running_image() -> Result<[u8; 16]> {
 
 // Existing parents can be aliases even when a requested DB does not exist yet.
 fn canonical_target(path: &Path) -> io::Result<PathBuf> {
-    match path.canonicalize() {
-        Ok(path) => Ok(path),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let parent = path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .ok_or(error)?;
-            Ok(canonical_target(parent)?.join(
-                path.file_name()
-                    .ok_or_else(|| io::Error::other("missing database filename"))?,
-            ))
-        }
-        Err(error) => Err(error),
-    }
+    crate::maintenance::canonical_target(path)
 }
 
 #[derive(Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,8 +104,14 @@ impl RuntimeKey {
             .canonicalize()
             .context("cannot resolve checkout root")?;
         ensure!(root.is_dir(), "workspace root must be a directory");
-        let caller_dir = caller_dir.unwrap_or(&root).canonicalize()?;
-        let supplied_db = db.map(|path| caller_dir.join(path));
+        let supplied_db = match db {
+            Some(path) if path.is_absolute() => Some(path.to_path_buf()),
+            Some(path) => {
+                let base = caller_dir.unwrap_or(&root).canonicalize()?;
+                Some(base.join(path))
+            }
+            None => None,
+        };
         let db = supplied_db.as_deref().map(canonical_target).transpose()?;
         let writer_lease = supplied_db
             .as_deref()
@@ -132,6 +128,13 @@ impl RuntimeKey {
             crate::worktrees::projected_checkout_config(&checkout, &main)?
         } else {
             TsIndexConfig::load_or_default(&root)?
+        };
+        // Only require and key on the caller's working directory when the
+        // checkout configures explicit ignore files that match relative to cwd.
+        let caller_dir = if settings.has_explicit_ignore_files() {
+            caller_dir.unwrap_or(&root).canonicalize()?
+        } else {
+            root.clone()
         };
         let mut languages = languages.to_owned();
         languages.sort();
@@ -576,6 +579,7 @@ pub(crate) struct SessionResolver {
     session: [u8; 16],
     idle: Mutex<Vec<BufReader<UnixStream>>>,
     lookup_timeout: Duration,
+    abandoned_lane: AtomicBool,
 }
 
 impl SessionResolver {
@@ -615,6 +619,10 @@ impl SessionResolver {
         Ok(resolver)
     }
 
+    pub(crate) fn has_abandoned_lane(&self) -> bool {
+        self.abandoned_lane.load(Ordering::Acquire)
+    }
+
     fn attach(channel: UnixStream, lookup_timeout: Duration) -> Result<Self> {
         let mut session = [0u8; 16];
         std::fs::File::open("/dev/urandom")?.read_exact(&mut session)?;
@@ -623,6 +631,7 @@ impl SessionResolver {
             session,
             idle: Mutex::new(Vec::new()),
             lookup_timeout,
+            abandoned_lane: AtomicBool::new(false),
         };
         let first = resolver.open_lane()?;
         resolver
@@ -685,7 +694,13 @@ impl SessionResolver {
         write_bounded_json(lane.get_mut(), &request, MAX_MCP_FRAME_BYTES)?;
         // A timeout after admission releases just this stream. The server
         // charges its running task to this session until prepare actually ends.
-        let reply = read_reply(&mut lane).context("index lookup did not complete")?;
+        let reply = match read_reply(&mut lane) {
+            Ok(reply) => reply,
+            Err(error) => {
+                self.abandoned_lane.store(true, Ordering::Release);
+                return Err(error).context("index lookup did not complete");
+            }
+        };
         self.idle
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1203,6 +1218,100 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_key_ignores_unusable_caller_dir_unless_explicit_ignores_exist() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("repo");
+        let caller_a = dir.path().join("caller-a");
+        let caller_b = dir.path().join("caller-b");
+        std::fs::create_dir_all(&root)?;
+        std::fs::create_dir_all(&caller_a)?;
+        std::fs::create_dir_all(&caller_b)?;
+        let missing = dir.path().join("mount-ns-only");
+
+        // Without explicit ignore files, an unreachable caller_dir is ignored
+        // and distinct caller cwds share one runtime key.
+        let key_missing = RuntimeKey::resolve(&root, None, &[], true, Some(&missing))?;
+        let key_none = RuntimeKey::resolve(&root, None, &[], true, None)?;
+        let key_a = RuntimeKey::resolve(&root, None, &[], true, Some(&caller_a))?;
+        assert!(key_missing == key_none);
+        assert!(key_missing == key_a);
+
+        // With per-repo [[repos]].ignore or absolute ignore files, caller_dir
+        // is required and separates runtime keys by caller directory.
+        let mut config = TsIndexConfig::default();
+        config.repos.push(crate::config::RepoConfig {
+            name: "repo".into(),
+            path: ".".into(),
+            languages: vec![],
+            ignore: vec!["/abs/rules.txt".into()],
+        });
+        config.write(&root)?;
+        assert!(RuntimeKey::resolve(&root, None, &[], true, Some(&missing)).is_err());
+        let key_a = RuntimeKey::resolve(&root, None, &[], true, Some(&caller_a))?;
+        let key_b = RuntimeKey::resolve(&root, None, &[], true, Some(&caller_b))?;
+        assert!(key_a != key_b);
+        Ok(())
+    }
+
+    #[test]
+    fn abandoned_lookup_marks_resolver_for_generation_retirement() -> Result<()> {
+        use std::sync::Condvar;
+        type Gate = Arc<(Mutex<bool>, Condvar)>;
+        struct Release(Gate);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                *self.0.0.lock().unwrap() = true;
+                self.0.1.notify_all();
+            }
+        }
+        struct Blocking {
+            gate: Gate,
+            real: Runtimes,
+        }
+        impl ToolResolver for Blocking {
+            fn prepare(&self, repo: Option<&str>, live: bool) -> Result<PreparedTool> {
+                if !live {
+                    drop(
+                        self.gate
+                            .1
+                            .wait_while(self.gate.0.lock().unwrap(), |open| !*open)
+                            .unwrap(),
+                    );
+                }
+                self.real.prepare(repo, true)
+            }
+        }
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().to_path_buf();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Release(gate.clone());
+        let (sender, owner) = UnixStream::pair()?;
+        let listener = thread::spawn(move || {
+            serve_lanes(owner, 4, || {
+                Ok(Blocking {
+                    gate,
+                    real: Runtimes::new(crate::index::Runtime::new(
+                        root.clone(),
+                        db_path(&root),
+                        TsIndexConfig::default(),
+                        vec![],
+                    )),
+                })
+            })
+        });
+        let resolver = SessionResolver::attach(sender, Duration::from_millis(100))?;
+        assert!(!resolver.has_abandoned_lane());
+        resolver.prepare(None, true)?;
+        assert!(!resolver.has_abandoned_lane());
+        assert!(resolver.prepare(None, false).is_err());
+        assert!(resolver.has_abandoned_lane());
+        drop(release);
+        drop(resolver);
+        listener.join().unwrap()?;
         Ok(())
     }
 }

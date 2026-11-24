@@ -1385,18 +1385,22 @@ fn run_session(
         .unwrap_or_else(|e| e.into_inner())
         .responses_sent;
     let pending_replies = handle.replies_expected.load(Ordering::Relaxed) > replies_sent;
+    let abandoned_lanes = status
+        .as_ref()
+        .is_ok_and(|status| status.code() == Some(super::runtime::ABANDONED_LANE_EXIT));
     if let Some(runtime) = &startup.runtime
         && (pending_replies
-            || status
-                .as_ref()
-                .is_ok_and(|status| status.code() == Some(super::runtime::LOOKUP_TIMEOUT_EXIT)))
+            || abandoned_lanes
+            || !status.as_ref().is_ok_and(|status| status.success()))
     {
-        // A killed worker can leave blocked lookup lanes behind. Isolate new
-        // admissions from those lanes while existing peers retain their owner.
+        // A killed, failed, or lane-abandoning worker can leave blocked lookup
+        // lanes behind. Isolate new admissions while existing peers keep theirs.
         core.runtimes.retire(runtime);
     }
     let status_note = match status {
-        Ok(status) if !status.success() => Some(format!("worker_status_{status}")),
+        Ok(status) if !status.success() && !abandoned_lanes => {
+            Some(format!("worker_status_{status}"))
+        }
         Ok(_) => None,
         Err(error) => Some(format!("worker_wait_failed: {error}")),
     };

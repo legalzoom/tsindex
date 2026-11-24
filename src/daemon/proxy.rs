@@ -30,7 +30,7 @@ const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct McpProxyArgs {
-    pub root: PathBuf,
+    pub root: Option<PathBuf>,
     pub db: Option<PathBuf>,
     pub languages: Vec<String>,
     pub no_refresh: bool,
@@ -44,8 +44,14 @@ pub struct McpProxyArgs {
 /// Fails fast with an actionable message if the daemon is not running.
 pub fn run_mcp_proxy(args: McpProxyArgs) -> Result<()> {
     let paths = crate::daemon::service::client_paths(args.socket.as_deref())?;
-    let root = absolutize(&args.root)?;
-    let db = args.db.as_deref().map(absolutize).transpose()?;
+    let caller_dir = env::current_dir().context("failed to determine current directory")?;
+    // Send absolute spellings without touching the checkout or database in
+    // the launcher. Their resolution belongs to the registered worker.
+    let root = args
+        .root
+        .as_ref()
+        .map_or_else(|| caller_dir.clone(), |path| caller_dir.join(path));
+    let db = args.db.as_ref().map(|path| caller_dir.join(path));
 
     validate_private_dir(paths.socket_dir()?).map_err(|error| {
         anyhow!(
@@ -70,6 +76,7 @@ pub fn run_mcp_proxy(args: McpProxyArgs) -> Result<()> {
         protocol: PROTOCOL_VERSION,
         client_version: env!("CARGO_PKG_VERSION").to_string(),
         root,
+        caller_dir: Some(caller_dir),
         db,
         languages: args.languages,
         no_refresh: args.no_refresh,
@@ -529,17 +536,6 @@ fn reopen_output(path: &Path, expected: &Metadata) -> io::Result<File> {
         ));
     }
     Ok(file)
-}
-
-fn absolutize(path: &Path) -> Result<PathBuf> {
-    let joined = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        env::current_dir()
-            .context("failed to determine current directory")?
-            .join(path)
-    };
-    Ok(joined.canonicalize().unwrap_or(joined))
 }
 
 #[cfg(test)]

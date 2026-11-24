@@ -471,6 +471,8 @@ pub enum DaemonAction {
     Worker {
         #[arg(long)]
         runtime_fd: i32,
+        #[arg(long)]
+        caller_dir: Option<PathBuf>,
     },
     /// Internal owner of a compatible checkout's warm indexing state.
     #[command(hide = true)]
@@ -481,6 +483,10 @@ pub enum DaemonAction {
         generation: String,
         #[arg(long)]
         max_lanes: usize,
+        #[arg(long)]
+        caller_dir: Option<PathBuf>,
+        #[arg(long)]
+        writer_lease: Option<PathBuf>,
     },
 }
 
@@ -748,9 +754,8 @@ pub fn run() -> Result<()> {
 
 #[cfg(unix)]
 fn run_mcp_via_daemon(cli: &Cli, command: &ServeCommand) -> Result<()> {
-    let root = resolve_root(cli.root.as_deref())?;
     crate::daemon::proxy::run_mcp_proxy(crate::daemon::proxy::McpProxyArgs {
-        root,
+        root: cli.root.clone(),
         db: cli.db.clone(),
         languages: cli.languages.clone(),
         no_refresh: cli.no_refresh,
@@ -773,26 +778,32 @@ fn manage_daemon(cli: &Cli, command: &DaemonCommand) -> Result<()> {
             runtime_fd,
             generation,
             max_lanes,
+            caller_dir,
+            writer_lease,
         } => crate::daemon::runtime::serve_index(*runtime_fd, *max_lanes, || {
-            let root = cli
-                .root
+            let base = caller_dir
                 .as_deref()
+                .or(cli.root.as_deref())
                 .context("missing shared index checkout")?;
-            std::env::set_current_dir(root)?;
+            std::env::set_current_dir(base)?;
             with_runtime(cli, |runtime| {
-                let runtime = runtime.with_jobs(0);
+                let runtime = runtime.with_jobs(0).with_writer_lease(writer_lease.clone());
                 crate::daemon::runtime::verify_generation(&runtime.config, generation)?;
                 spawn_background_watch(cli, &runtime)?;
                 Ok(crate::worktrees::Runtimes::new(runtime))
             })
         }),
-        DaemonAction::Worker { runtime_fd } => {
+        DaemonAction::Worker {
+            runtime_fd,
+            caller_dir,
+        } => {
             let resolver = crate::daemon::runtime::SessionResolver::connect(
                 *runtime_fd,
                 cli.root.as_deref().context("missing MCP checkout")?,
                 cli.db.as_deref(),
                 &cli.languages,
                 cli.no_refresh,
+                caller_dir.as_deref(),
             )?;
             crate::daemon::write_json_line(
                 &mut std::io::stdout(),

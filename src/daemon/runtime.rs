@@ -86,9 +86,17 @@ fn canonical_target(path: &Path) -> io::Result<PathBuf> {
 
 #[derive(Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct RuntimeKey {
+    #[serde(with = "super::native_path")]
     root: PathBuf,
+    #[serde(with = "super::native_path")]
+    caller_dir: PathBuf,
     // An explicit DB disables repo pruning even if it names the default file.
+    #[serde(with = "super::native_path::optional")]
     db: Option<PathBuf>,
+    // Direct and older clients derive their lease from the supplied DB path,
+    // even if it is a symlink to the canonical database above.
+    #[serde(with = "super::native_path::optional")]
+    writer_lease: Option<PathBuf>,
     languages: Vec<String>,
     no_refresh: bool,
     generation: String,
@@ -100,14 +108,18 @@ impl RuntimeKey {
         db: Option<&Path>,
         languages: &[String],
         no_refresh: bool,
+        caller_dir: Option<&Path>,
     ) -> Result<Self> {
         let root = root
             .canonicalize()
             .context("cannot resolve checkout root")?;
         ensure!(root.is_dir(), "workspace root must be a directory");
-        let db = db
-            .map(|path| canonical_target(&root.join(path)))
-            .transpose()?;
+        let caller_dir = caller_dir.unwrap_or(&root).canonicalize()?;
+        let supplied_db = db.map(|path| caller_dir.join(path));
+        let db = supplied_db.as_deref().map(canonical_target).transpose()?;
+        let writer_lease = supplied_db
+            .as_deref()
+            .map(crate::maintenance::writer_lease_path);
         let checkout = if db.is_none() && !db_path(&root).exists() {
             crate::worktrees::discover(&root)?
                 .into_iter()
@@ -126,7 +138,9 @@ impl RuntimeKey {
         languages.dedup();
         Ok(Self {
             root,
+            caller_dir,
             db,
+            writer_lease,
             languages,
             no_refresh,
             generation: generation_digest(&settings)?,
@@ -220,9 +234,14 @@ impl Entry {
             .arg(&key.generation)
             .arg("--max-lanes")
             .arg(max_lanes.to_string())
+            .arg("--caller-dir")
+            .arg(&key.caller_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
+        if let Some(lease) = &key.writer_lease {
+            cmd.arg("--writer-lease").arg(lease);
+        }
         fds::prepare_exec(&mut cmd, Some(receiver.as_fd()))?;
         // Linux ties parent-death delivery to the spawning thread. The pool
         // manager lives for the daemon's lifetime, independently of any client.
@@ -566,10 +585,11 @@ impl SessionResolver {
         db: Option<&Path>,
         languages: &[String],
         no_refresh: bool,
+        caller_dir: Option<&Path>,
     ) -> Result<Self> {
         let bootstrap = inherited_socket(fd)?;
-        let key = RuntimeKey::resolve(root, db, languages, no_refresh)?;
-        std::env::set_current_dir(&key.root)?;
+        let key = RuntimeKey::resolve(root, db, languages, no_refresh, caller_dir)?;
+        std::env::set_current_dir(&key.caller_dir)?;
         super::write_json_line(
             &mut io::stdout(),
             &WorkerRuntimeRequest {
@@ -934,7 +954,7 @@ mod tests {
     fn retries_replace_an_owner_that_never_served_a_client() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let image = owner_fixture(dir.path())?;
-        let key = RuntimeKey::resolve(dir.path(), None, &[], true)?;
+        let key = RuntimeKey::resolve(dir.path(), None, &[], true, None)?;
         let mut owners = IndexOwners::new(3);
         let first = owners.acquire(key.clone(), &image, Instant::now())?;
         let retry = first.generation.started + STARTUP_IO_TIMEOUT;
@@ -1161,7 +1181,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let image = owner_fixture(dir.path())?;
         let pool = RuntimePool::new(4)?;
-        let key = RuntimeKey::resolve(dir.path(), None, &[], true)?;
+        let key = RuntimeKey::resolve(dir.path(), None, &[], true, None)?;
         let first = pool.acquire(key.clone(), &image)?;
         let peer = pool.acquire(key.clone(), &image)?;
         assert_eq!(first.pid, peer.pid);

@@ -14,6 +14,64 @@ pub(crate) mod runtime;
 #[cfg(unix)]
 pub mod service;
 
+// Preserve the existing JSON strings for UTF-8 paths while allowing Unix
+// paths with arbitrary bytes to make the round trip without lossy conversion.
+#[cfg(unix)]
+pub(crate) mod native_path {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::path::{Path, PathBuf};
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum WirePath {
+        Text(String),
+        Bytes(Vec<u8>),
+    }
+
+    impl From<WirePath> for PathBuf {
+        fn from(value: WirePath) -> Self {
+            match value {
+                WirePath::Text(text) => text.into(),
+                WirePath::Bytes(bytes) => OsString::from_vec(bytes).into(),
+            }
+        }
+    }
+
+    pub fn serialize<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
+        if let Some(text) = path.to_str() {
+            serializer.serialize_str(text)
+        } else {
+            serializer.serialize_bytes(path.as_os_str().as_bytes())
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<PathBuf, D::Error> {
+        WirePath::deserialize(deserializer).map(Into::into)
+    }
+
+    pub mod optional {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(
+            path: &Option<PathBuf>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            #[derive(Serialize)]
+            struct Native<'a>(#[serde(serialize_with = "super::serialize")] &'a Path);
+            path.as_deref().map(Native).serialize(serializer)
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<PathBuf>, D::Error> {
+            Option::<WirePath>::deserialize(deserializer).map(|path| path.map(Into::into))
+        }
+    }
+}
+
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -31,6 +89,8 @@ pub const STARTUP_IO_TIMEOUT: Duration = Duration::from_secs(120);
 pub const MAX_MCP_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CONTROL_LINE_BYTES: usize = 64 * 1024;
 pub const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const OUTCOME_WATCHER_CAPACITY_ERROR: &str =
+    "maximum concurrent outcome watchers reached";
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
 
 /// Filesystem locations used by one orchestrator daemon instance.
@@ -394,8 +454,13 @@ pub enum DaemonRequest {
 pub struct StartSessionRequest {
     pub protocol: u32,
     pub client_version: String,
+    #[cfg_attr(unix, serde(with = "native_path"))]
     pub root: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(unix, serde(with = "native_path::optional"))]
+    pub caller_dir: Option<PathBuf>,
     #[serde(default)]
+    #[cfg_attr(unix, serde(with = "native_path::optional"))]
     pub db: Option<PathBuf>,
     #[serde(default)]
     pub languages: Vec<String>,
@@ -421,8 +486,10 @@ pub enum SessionState {
 pub struct SessionInfo {
     pub session_id: String,
     pub state: SessionState,
+    #[cfg_attr(unix, serde(with = "native_path"))]
     pub root: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(unix, serde(default, with = "native_path::optional"))]
     pub db: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub languages: Vec<String>,
@@ -838,6 +905,26 @@ impl DaemonClient {
         &self,
         session_id: &str,
     ) -> Result<io::BufReader<std::os::unix::net::UnixStream>> {
+        // An earlier watch may still be delivering its final reply even after
+        // the worker's admission slot was returned. Preserve the data socket
+        // while that bounded control write releases its watcher permit.
+        let deadline = std::time::Instant::now() + CONTROL_IO_TIMEOUT + Duration::from_millis(250);
+        loop {
+            match self.try_watch_session(session_id)? {
+                Some(watch) => return Ok(watch),
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                None => bail!("{OUTCOME_WATCHER_CAPACITY_ERROR}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn try_watch_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<io::BufReader<std::os::unix::net::UnixStream>>> {
         let mut stream = self.connect()?;
         stream.set_read_timeout(Some(CONTROL_IO_TIMEOUT))?;
         stream.set_write_timeout(Some(CONTROL_IO_TIMEOUT))?;
@@ -852,8 +939,9 @@ impl DaemonClient {
         match serde_json::from_str::<DaemonResponse>(&line)? {
             DaemonResponse::Watching => {
                 reader.get_ref().set_read_timeout(None)?;
-                Ok(reader)
+                Ok(Some(reader))
             }
+            DaemonResponse::Error { error } if error == OUTCOME_WATCHER_CAPACITY_ERROR => Ok(None),
             DaemonResponse::Error { error } => bail!("{error}"),
             other => bail!("unexpected response to watch_session: {other:?}"),
         }

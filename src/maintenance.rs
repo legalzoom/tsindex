@@ -148,7 +148,20 @@ fn configuration(runtime: &Runtime) -> Result<String> {
         env!("CARGO_PKG_VERSION"),
         crate::index::SCHEMA_VERSION,
     ))?;
-    Ok(format!("{:x}", Sha256::digest(input)))
+    let mut digest = Sha256::new();
+    digest.update(input);
+    // The same relative ignore filename can describe different rules for
+    // callers sharing a database. Do not reuse their watcher or freshness.
+    if runtime
+        .config
+        .ignore
+        .extra
+        .iter()
+        .any(|path| Path::new(path).is_relative())
+    {
+        digest.update(std::env::current_dir()?.as_os_str().as_encoded_bytes());
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn generation(runtime: &Runtime) -> Result<i64> {

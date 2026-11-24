@@ -155,6 +155,7 @@ struct SessionHandle {
     outcome_wake: UnixStream,
     watcher_registered: AtomicBool,
     forced_stop: AtomicBool,
+    replies_expected: AtomicU64,
     stop_reason: Mutex<Option<String>>,
     stderr_lines: Mutex<VecDeque<String>>,
 }
@@ -362,10 +363,13 @@ impl DaemonCore {
     }
 
     fn list_sessions(&self, include_recent: bool) -> (Vec<SessionInfo>, Vec<SessionInfo>) {
-        let mut active: Vec<SessionInfo> = self
+        // Keep the active lock through the history snapshot so a session
+        // cannot appear in both halves while finish_session moves it.
+        let active_guard = self
             .active_sessions
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(|e| e.into_inner());
+        let mut active: Vec<SessionInfo> = active_guard
             .values()
             .map(|session| session.snapshot())
             .collect();
@@ -381,6 +385,7 @@ impl DaemonCore {
         } else {
             Vec::new()
         };
+        drop(active_guard);
         (active, recent)
     }
 
@@ -455,8 +460,8 @@ impl DaemonCore {
                     bail!("session outcome watcher must be the original proxy process");
                 }
             }
-            let lease = WatcherLease::try_acquire(self)
-                .context("maximum concurrent outcome watchers reached")?;
+            let lease =
+                WatcherLease::try_acquire(self).context(super::OUTCOME_WATCHER_CAPACITY_ERROR)?;
             if handle.watcher_registered.swap(true, Ordering::AcqRel) {
                 bail!("session already has an outcome watcher");
             }
@@ -979,34 +984,43 @@ fn handle_connection(
             offset,
         } => {
             let (active, recent) = core.list_sessions(include_recent);
-            let total = active.len() + recent.len();
-            let active_count = active.len();
+            // Offset is an opaque cursor over admission sequence, not a row
+            // count. Exiting between pages never shifts a later session back.
+            let mut rows: Vec<_> = active
+                .into_iter()
+                .map(|info| (false, info))
+                .chain(recent.into_iter().map(|info| (true, info)))
+                .map(|(recent, info)| {
+                    let seq = info
+                        .session_id
+                        .rsplit_once('-')
+                        .and_then(|(_, seq)| seq.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    (seq, recent, info)
+                })
+                .filter(|(seq, _, _)| *seq > offset)
+                .collect();
+            rows.sort_unstable_by_key(|(seq, _, _)| *seq);
+            let last = rows.last().map(|(seq, _, _)| *seq).unwrap_or(offset);
             let mut active_page = Vec::new();
             let mut recent_page = Vec::new();
             let mut byte_budget = MAX_CONTROL_LINE_BYTES - 4096;
-            let mut consumed = 0;
-            for (index, mut info) in active
-                .into_iter()
-                .chain(recent)
-                .enumerate()
-                .skip(offset)
-                .take(SESSION_PAGE_SIZE)
-            {
+            let mut cursor = offset;
+            for (seq, is_recent, mut info) in rows.into_iter().take(SESSION_PAGE_SIZE) {
                 summarize_session(&mut info);
                 let size = serde_json::to_vec(&info)?.len() + 1;
                 if size > byte_budget {
                     break;
                 }
                 byte_budget -= size;
-                consumed += 1;
-                if index < active_count {
-                    active_page.push(info);
-                } else {
+                cursor = seq;
+                if is_recent {
                     recent_page.push(info);
+                } else {
+                    active_page.push(info);
                 }
             }
-            let next_offset = (offset.saturating_add(consumed) < total)
-                .then_some(offset.saturating_add(consumed));
+            let next_offset = (cursor < last).then_some(cursor);
             write_json_line(
                 &mut writer,
                 &DaemonResponse::Sessions {
@@ -1146,10 +1160,8 @@ fn handle_start_session(
         )?;
         return Ok(());
     }
-    let seq = core.next_session_seq.fetch_add(1, Ordering::Relaxed);
-    let session_id = format!("{}-{seq}", core.instance_id);
     let tracked_owner_pid = owner.as_ref().map(ProcessOwner::pid);
-    let handle = {
+    let (session_id, handle) = {
         let mut active = core
             .active_sessions
             .lock()
@@ -1166,6 +1178,8 @@ fn handle_start_session(
             )?;
             return Ok(());
         }
+        let seq = core.next_session_seq.fetch_add(1, Ordering::Relaxed);
+        let session_id = format!("{}-{seq}", core.instance_id);
         // Allocate wake descriptors only after this slot is reserved.
         let (supervisor_wake, outcome_wake) = UnixStream::pair()?;
         let handle = Arc::new(SessionHandle {
@@ -1196,11 +1210,12 @@ fn handle_start_session(
             outcome_wake,
             watcher_registered: AtomicBool::new(false),
             forced_stop: AtomicBool::new(false),
+            replies_expected: AtomicU64::new(0),
             stop_reason: Mutex::new(None),
             stderr_lines: Mutex::new(VecDeque::new()),
         });
         active.insert(session_id.clone(), Arc::clone(&handle));
-        handle
+        (session_id, handle)
     };
     // The Starting record now bounds the handler through startup and teardown.
     drop(pending);
@@ -1363,18 +1378,25 @@ fn run_session(
     drop(child.stdin.take());
     drop(child.stdout.take());
     drop(child.stderr.take());
-    let status_note = match reap_worker(&mut child, core.worker_groups) {
-        Ok(status) if !status.success() => {
-            // Only the worker knows whether the owner's independent intake
-            // failed to acknowledge a connection. A slow checkout or an
-            // accepted lookup can time out while healthy peers keep running.
-            if status.code() == Some(super::runtime::LOOKUP_TIMEOUT_EXIT)
-                && let Some(runtime) = &startup.runtime
-            {
-                core.runtimes.retire(runtime);
-            }
-            Some(format!("worker_status_{status}"))
-        }
+    let status = reap_worker(&mut child, core.worker_groups);
+    let replies_sent = handle
+        .info
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .responses_sent;
+    let pending_replies = handle.replies_expected.load(Ordering::Relaxed) > replies_sent;
+    if let Some(runtime) = &startup.runtime
+        && (pending_replies
+            || status
+                .as_ref()
+                .is_ok_and(|status| status.code() == Some(super::runtime::LOOKUP_TIMEOUT_EXIT)))
+    {
+        // A killed worker can leave blocked lookup lanes behind. Isolate new
+        // admissions from those lanes while existing peers retain their owner.
+        core.runtimes.retire(runtime);
+    }
+    let status_note = match status {
+        Ok(status) if !status.success() => Some(format!("worker_status_{status}")),
         Ok(_) => None,
         Err(error) => Some(format!("worker_wait_failed: {error}")),
     };
@@ -1420,6 +1442,9 @@ fn spawn_worker(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(caller_dir) = &request.caller_dir {
+        cmd.arg("--caller-dir").arg(caller_dir);
+    }
     super::fds::prepare_exec(&mut cmd, Some(bootstrap.as_fd()))?;
     configure_child(&mut cmd, worker_groups, libc::SIGTERM);
     cmd.spawn().context("failed to spawn MCP worker")
@@ -2046,11 +2071,22 @@ fn summarize_session(info: &mut SessionInfo) {
 fn observe_client_message(handle: &SessionHandle, raw: &[u8]) {
     let now = unix_now_secs();
     let parsed = serde_json::from_slice::<Value>(raw).ok();
+    let method = parsed
+        .as_ref()
+        .and_then(|value| value.get("method"))
+        .and_then(Value::as_str);
+    // The stdio worker emits one response per frame (including parse errors),
+    // except for empty lines and the initialized notification.
+    if method != Some("notifications/initialized")
+        && !std::str::from_utf8(raw).is_ok_and(|line| line.trim().is_empty())
+    {
+        handle.replies_expected.fetch_add(1, Ordering::Relaxed);
+    }
     let mut info = handle.info.lock().unwrap_or_else(|e| e.into_inner());
     info.requests_received += 1;
     info.last_activity_at = now;
-    if let Some(value) = parsed {
-        match value.get("method").and_then(Value::as_str) {
+    if let Some(value) = parsed.as_ref() {
+        match method {
             Some("initialize") => {
                 if let Some(client) = value.pointer("/params/clientInfo") {
                     if let Some(name) = client.get("name").and_then(Value::as_str) {
@@ -2321,6 +2357,7 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             client_version: env!("CARGO_PKG_VERSION").into(),
             root: root.to_path_buf(),
+            caller_dir: None,
             db: None,
             languages: Vec::new(),
             no_refresh: true,
@@ -2360,6 +2397,7 @@ mod tests {
             outcome_wake,
             watcher_registered: AtomicBool::new(false),
             forced_stop: AtomicBool::new(false),
+            replies_expected: AtomicU64::new(0),
             stop_reason: Mutex::new(None),
             stderr_lines: Mutex::new(VecDeque::new()),
         })
@@ -2743,7 +2781,12 @@ mod tests {
         assert_eq!(&reply, b"reply");
 
         drop(remaining_reader);
-        assert!(peer_stopped_reading(&server)?);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !peer_stopped_reading(&server)? {
+            // A concurrent fork can hold the peer until its exec closes it.
+            assert!(Instant::now() < deadline, "peer did not disconnect");
+            thread::sleep(Duration::from_millis(10));
+        }
         Ok(())
     }
 
@@ -2801,7 +2844,7 @@ mod tests {
     fn shutdown_outcome_precedes_kill_all_even_when_worker_needs_sigkill() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let helper = dir.path().join("worker");
-        let key = super::super::runtime::RuntimeKey::resolve(dir.path(), None, &[], true)?;
+        let key = super::super::runtime::RuntimeKey::resolve(dir.path(), None, &[], true, None)?;
         let request = serde_json::json!({"protocol": PROTOCOL_VERSION, "runtime_key": key});
         let ready = serde_json::json!({ "protocol": PROTOCOL_VERSION, "version": env!("CARGO_PKG_VERSION") });
         fs::write(

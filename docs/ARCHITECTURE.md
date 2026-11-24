@@ -254,10 +254,13 @@ windows stops accepting new sessions. The next attachment gets a fresh owner,
 and pending clients can finish on the old one. After a successful startup,
 slow lookups never trip this cold-start deadline.
 
-The runtime key includes the canonical checkout, explicit database override
-(which disables repo pruning), normalized language filters, refresh policy,
-effective configuration digest, and executable image. Both the session worker
-and index owner compute the digest from their own loaded settings. Linux uses
+The runtime key includes the canonical checkout, caller's working directory,
+explicit database override and its canonical target, normalized language
+filters, refresh policy, effective configuration digest, and executable image.
+The caller directory preserves relative ignore-file semantics. The explicit
+database spelling preserves the direct client's writer lease and disables
+repo pruning. Both the session worker and index owner compute the digest from
+their own loaded settings. Linux uses
 the mapped executable's device and inode from `/proc/self/exe`. macOS uses the
 mapped executable UUID when available, falling back to executable-file metadata
 for a build without a usable UUID. A generation mismatch fails initialization

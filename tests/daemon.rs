@@ -39,12 +39,21 @@ impl McpSession {
         harness_name: &str,
         options: &[&str],
     ) -> Result<Self> {
-        let mut child = Command::new(BIN)
-            .arg("--socket")
-            .arg(socket)
-            .arg("--root")
-            .arg(root)
-            .args(options)
+        Self::connect_configured(socket, root, harness_name, |cmd| {
+            cmd.args(options);
+        })
+    }
+
+    fn connect_configured(
+        socket: &Path,
+        root: &Path,
+        harness_name: &str,
+        configure: impl FnOnce(&mut Command),
+    ) -> Result<Self> {
+        let mut command = Command::new(BIN);
+        command.arg("--socket").arg(socket).arg("--root").arg(root);
+        configure(&mut command);
+        let mut child = command
             .args(["serve", "--mcp", "--via-daemon"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -362,17 +371,13 @@ fn compatible_clients_share_indexing_and_keep_independent_mcp_sessions() -> Resu
     Ok(())
 }
 
-#[test]
-fn a_busy_indexed_client_leaves_new_sessions_and_live_primary_queries_responsive() -> Result<()> {
+fn block_indexed_requests(
+    busy: &mut McpSession,
+    root: &Path,
+) -> Result<tsindex::maintenance::FileLease> {
     use tsindex::maintenance::{
         FileLease, refresh_lease_path, refresh_marker_path, writer_lease_path,
     };
-    let dir = tempdir_in("/tmp")?;
-    let root = dir.path();
-    build_fixture(root, "lib.py", "def live_symbol():\n    pass\n")?;
-    let daemon = common::TestDaemon::start()?;
-    let mut busy = McpSession::connect_with(&daemon.socket, root, "busy", &[])?;
-    let pid = managed_session(&daemon, "busy")?.runtime_pid;
     let db = tsindex::config::db_path(root);
     let writer = FileLease::acquire(writer_lease_path(&db), Duration::from_secs(3))?;
     if let Err(e) = fs::remove_file(refresh_marker_path(&db))
@@ -396,6 +401,18 @@ fn a_busy_indexed_client_leaves_new_sessions_and_live_primary_queries_responsive
         );
         thread::sleep(Duration::from_millis(5));
     }
+    Ok(writer)
+}
+
+#[test]
+fn a_busy_indexed_client_leaves_new_sessions_and_live_primary_queries_responsive() -> Result<()> {
+    let dir = tempdir_in("/tmp")?;
+    let root = dir.path();
+    build_fixture(root, "lib.py", "def live_symbol():\n    pass\n")?;
+    let daemon = common::TestDaemon::start()?;
+    let mut busy = McpSession::connect_with(&daemon.socket, root, "busy", &[])?;
+    let pid = managed_session(&daemon, "busy")?.runtime_pid;
+    let writer = block_indexed_requests(&mut busy, root)?;
     // The indexed work still owns the refresh lock and waits for our writer
     // lease. A new session can attach and run a live primary query on that owner.
     let mut live = McpSession::connect_with(&daemon.socket, root, "live", &[])?;
@@ -414,6 +431,102 @@ fn a_busy_indexed_client_leaves_new_sessions_and_live_primary_queries_responsive
     busy.close_gracefully()?;
     live.close_gracefully()?;
     Ok(())
+}
+
+#[test]
+fn killing_a_session_with_blocked_lookups_leaves_capacity_for_its_replacement() -> Result<()> {
+    let dir = tempdir_in("/tmp")?;
+    let root = dir.path();
+    build_fixture(root, "lib.py", "def live_symbol():\n    pass\n")?;
+    let daemon = common::TestDaemon::start_with_env(&[("TSINDEX_MAX_SESSIONS", "1")])?;
+    let mut busy = McpSession::connect_with(&daemon.socket, root, "busy", &[])?;
+    let original = managed_session(&daemon, "busy")?;
+    let _writer = block_indexed_requests(&mut busy, root)?;
+    assert!(matches!(
+        busy.responses.recv_timeout(Duration::from_millis(150)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    daemon.client()?.kill_session(original.session_id)?;
+    let mut next = McpSession::connect_with(&daemon.socket, root, "replacement", &[])?;
+    assert_ne!(
+        managed_session(&daemon, "replacement")?.runtime_pid,
+        original.runtime_pid
+    );
+    let live = next.call_tool(
+        "query",
+        json!({"language":"python", "query":"(function_definition name: (identifier) @name)"}),
+    )?;
+    assert!(live.to_string().contains("live_symbol"), "{live}");
+    next.close_gracefully()
+}
+
+#[test]
+fn managed_indexes_resolve_extra_ignore_files_from_the_callers_directory() -> Result<()> {
+    let daemon = common::TestDaemon::start()?;
+    let dir = tempdir_in("/tmp")?;
+    let root = dir.path().join("repo");
+    let other_caller = dir.path().join("other");
+    fs::create_dir(&root)?;
+    fs::create_dir(&other_caller)?;
+    fs::write(root.join("visible.py"), "def visible():\n    pass\n")?;
+    fs::write(root.join("ignored.py"), "def excluded():\n    pass\n")?;
+    fs::write(dir.path().join("rules.txt"), "ignored.py\n")?;
+    fs::write(other_caller.join("rules.txt"), "\n")?;
+    let mut config = TsIndexConfig::default();
+    config.languages.include = vec!["python".into()];
+    config.ignore.extra = vec!["rules.txt".into()];
+    config.write(&root)?;
+    let mut filtered = McpSession::connect_configured(&daemon.socket, &root, "filtered", |cmd| {
+        cmd.current_dir(dir.path());
+    })?;
+    assert_eq!(
+        filtered.call_tool("get_symbol", json!({"name":"visible"}))?["total"],
+        1
+    );
+    assert_eq!(
+        filtered.call_tool("get_symbol", json!({"name":"excluded"}))?["total"],
+        0
+    );
+    let mut other = McpSession::connect_configured(&daemon.socket, &root, "other-base", |cmd| {
+        cmd.current_dir(&other_caller);
+    })?;
+    assert_ne!(
+        managed_session(&daemon, "filtered")?.runtime_pid,
+        managed_session(&daemon, "other-base")?.runtime_pid
+    );
+    assert_eq!(
+        other.call_tool("get_symbol", json!({"name":"excluded"}))?["total"],
+        1
+    );
+    other.close_gracefully()?;
+    filtered.close_gracefully()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_session_accepts_a_native_byte_database_path() -> Result<()> {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let daemon = common::TestDaemon::start()?;
+    let dir = tempdir_in("/tmp")?;
+    fs::write(dir.path().join("f.py"), "def native_path():\n    pass\n")?;
+    let db = dir
+        .path()
+        .join(OsString::from_vec(b"index-\xff.db".to_vec()));
+    let mut session =
+        McpSession::connect_configured(&daemon.socket, dir.path(), "native", |cmd| {
+            cmd.arg("--db").arg(&db);
+        })?;
+    assert_eq!(
+        daemon.client()?.list_sessions(false)?.0[0].db.as_ref(),
+        Some(&db)
+    );
+    assert_eq!(
+        session.call_tool("get_symbol", json!({"name":"native_path"}))?["total"],
+        1
+    );
+    session.close_gracefully()
 }
 
 #[test]
@@ -1045,7 +1158,7 @@ fn daemon_kill_terminates_single_session_and_kill_all_clears_remaining() -> Resu
 fn daemon_start_restart_and_stop_manage_detached_lifecycle_and_reap_workers() -> Result<()> {
     let dir = tempdir_in("/tmp")?;
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
-    let socket = dir.path().join("detached.sock");
+    let socket = dir.path().join("detached.sock ");
     let repo = dir.path().join("repo");
     build_fixture(&repo, "lib.py", "def booted():\n    return 1\n")?;
 
@@ -1483,6 +1596,58 @@ fn session_listing_pages_bounded_summaries_and_keeps_detail_separate() -> Result
     }
     drop(last);
     daemon.wait_active_sessions(0, Duration::from_secs(5))?;
+    Ok(())
+}
+
+#[test]
+fn session_listing_cursor_survives_an_earlier_session_exiting() -> Result<()> {
+    use std::os::unix::net::UnixStream;
+    let daemon = common::TestDaemon::start()?;
+    let root = tempdir_in("/tmp")?;
+    build_fixture(root.path(), "lib.py", "def target():\n    pass\n")?;
+    let mut sessions = Vec::new();
+    for _ in 0..9 {
+        let (stream, ready) = raw_session(&daemon.socket, root.path())?;
+        assert_eq!(ready["kind"], "session_ready");
+        sessions.push((
+            stream,
+            ready["session_id"]
+                .as_str()
+                .context("session ID")?
+                .to_owned(),
+        ));
+    }
+    let list = |offset| -> Result<Value> {
+        let mut stream = UnixStream::connect(&daemon.socket)?;
+        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+        writeln!(
+            stream,
+            "{}",
+            json!({"op":"list_sessions", "include_recent":true, "offset":offset})
+        )?;
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line)?;
+        Ok(serde_json::from_str(&line)?)
+    };
+    let first = list(0)?;
+    assert_eq!(
+        first["active"].as_array().context("active sessions")?.len(),
+        8
+    );
+    let cursor = first["next_offset"].as_u64().context("next page cursor")?;
+    assert_eq!(first["active"][0]["session_id"], sessions[0].1);
+    daemon.client()?.kill_session(sessions[0].1.clone())?;
+    let second = list(cursor)?;
+    assert_eq!(
+        second["active"]
+            .as_array()
+            .context("active sessions")?
+            .len(),
+        1
+    );
+    assert_eq!(second["active"][0]["session_id"], sessions[8].1);
+    assert_eq!(second["recent"], json!([]));
+    assert!(second["next_offset"].is_null());
     Ok(())
 }
 
@@ -1941,6 +2106,7 @@ fn session_detail_prunes_escaped_stderr_to_the_encoded_frame_budget() -> Result<
         protocol: tsindex::daemon::PROTOCOL_VERSION,
         client_version: env!("CARGO_PKG_VERSION").to_string(),
         root,
+        caller_dir: None,
         db: None,
         languages: Vec::new(),
         no_refresh: true,

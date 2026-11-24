@@ -401,8 +401,12 @@ fn directory_inputs(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-#[allow(deprecated)] // Match the pinned ignore crate's home-directory lookup.
 pub(crate) fn global_inputs() -> Vec<PathBuf> {
+    global_inputs_with_excludes().0
+}
+
+#[allow(deprecated)] // Match the pinned ignore crate's home-directory lookup.
+pub(crate) fn global_inputs_with_excludes() -> (Vec<PathBuf>, Option<PathBuf>) {
     let home = std::env::home_dir();
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|value| !value.is_empty())
@@ -415,10 +419,11 @@ pub(crate) fn global_inputs() -> Vec<PathBuf> {
     if let Some(config) = config {
         files.push(config.join("git/config"));
     }
-    if let Some(excludes) = ignore::gitignore::gitconfig_excludes_path() {
-        files.push(excludes);
+    let excludes = ignore::gitignore::gitconfig_excludes_path();
+    if let Some(excludes) = excludes.as_ref() {
+        files.push(excludes.clone());
     }
-    files
+    (files, excludes)
 }
 
 #[cfg(all(test, unix))]

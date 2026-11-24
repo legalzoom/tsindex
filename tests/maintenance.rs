@@ -1487,3 +1487,177 @@ fn equivalent_language_filters_share_watcher_lease_and_refresh_marker() -> Resul
     assert_eq!(refreshed.total, 1);
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn global_git_excludes_scope_freshness_by_matching_directory_for_symlink_aliases() -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::symlink;
+    use std::process::{Command, Stdio};
+
+    let dir = tempfile::tempdir_in("/tmp")?;
+    let root = dir.path().join("repo");
+    fs::create_dir_all(root.join(".git"))?;
+    fs::write(root.join("a.py"), "def keep_fn():\n    return 1\n")?;
+    fs::write(root.join("secret.py"), "def secret_fn():\n    return 9\n")?;
+
+    let mut config = TsIndexConfig::default();
+    config.languages.include = vec!["python".into()];
+    config.server.worktree_refresh_ms = 60_000;
+    config.write(&root)?;
+
+    let home = tempfile::tempdir_in("/tmp")?;
+    let xdg = tempfile::tempdir_in("/tmp")?;
+    fs::create_dir_all(xdg.path().join("git"))?;
+    fs::write(xdg.path().join("git/ignore"), "/repo/secret.py\n")?;
+
+    let db_dir = tempfile::tempdir_in("/tmp")?;
+    let real_db = db_dir.path().join("shared.db");
+    let alias_parent = dir.path().join("alias-parent.db");
+    let alias_inside = dir.path().join("alias-inside.db");
+    let alias_same_cwd = dir.path().join("alias-same-cwd.db");
+    symlink(&real_db, &alias_parent)?;
+    symlink(&real_db, &alias_inside)?;
+    symlink(&real_db, &alias_same_cwd)?;
+
+    // Compatible aliases still share sidecars while preserving the legacy
+    // per-spelling writer lease.
+    assert_eq!(
+        maintenance::refresh_marker_path(&alias_parent),
+        maintenance::refresh_marker_path(&alias_inside)
+    );
+    assert_eq!(
+        maintenance::writer_lease_path(&alias_parent),
+        alias_parent.with_extension("ingest.lock")
+    );
+    assert_ne!(
+        maintenance::writer_lease_path(&alias_parent),
+        maintenance::writer_lease_path(&alias_inside)
+    );
+
+    let run_mcp = |cwd: &Path, db: &Path, symbol: &str| -> Result<Value> {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_tsindex"))
+            .arg("--root")
+            .arg(&root)
+            .arg("--db")
+            .arg(db)
+            .args(["serve", "--mcp"])
+            .current_dir(cwd)
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", xdg.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        {
+            let stdin = child.stdin.as_mut().unwrap();
+            writeln!(
+                stdin,
+                "{}",
+                json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}})
+            )?;
+            writeln!(
+                stdin,
+                "{}",
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_symbol","arguments":{"name":symbol}}})
+            )?;
+            stdin.flush()?;
+        }
+        drop(child.stdin.take());
+        let output = child.wait_with_output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "mcp server failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let replies: Vec<Value> = std::str::from_utf8(&output.stdout)?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<_, _>>()?;
+        let reply = replies
+            .into_iter()
+            .find(|value| value["id"] == 2)
+            .context("missing lookup reply")?;
+        let text = reply["result"]["content"][0]["text"]
+            .as_str()
+            .context("missing tool content")?;
+        Ok(serde_json::from_str(text)?)
+    };
+
+    // 1. Parent-directory client anchors `/repo/secret.py` against `dir.path()`
+    // and excludes `secret.py`.
+    assert_eq!(run_mcp(dir.path(), &alias_parent, "keep_fn")?["total"], 1);
+    assert_eq!(run_mcp(dir.path(), &alias_parent, "secret_fn")?["total"], 0);
+
+    // 2. Compatible alias launched from the SAME working directory reuses the
+    // parent-directory refresh marker without re-scanning an out-of-band edit.
+    fs::write(root.join("a.py"), "def after_edit():\n    return 2\n")?;
+    assert_eq!(
+        run_mcp(dir.path(), &alias_same_cwd, "keep_fn")?["total"],
+        1,
+        "compatible same-cwd symlink alias did not reuse refresh marker"
+    );
+    fs::write(root.join("a.py"), "def keep_fn():\n    return 1\n")?;
+
+    // 3. Client started inside `repo` with a different `--db` symlink must NOT
+    // reuse the parent-directory marker and must index `secret_fn`.
+    assert_eq!(run_mcp(&root, &alias_inside, "secret_fn")?["total"], 1);
+
+    // 4. Refresh again from parent dir (0 hits), then launch an absolute-path
+    // client from a deleted working directory: it must succeed (not error on
+    // missing CWD) and must not reuse the parent-directory marker because
+    // `ignore` skips global excludes when CWD is unavailable.
+    assert_eq!(run_mcp(dir.path(), &alias_parent, "secret_fn")?["total"], 0);
+    let gone = dir.path().join("deleted-cwd");
+    fs::create_dir(&gone)?;
+    let mut deleted_cwd_child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("cd \"$1\" && rmdir \"$1\" && exec \"$2\" --root \"$3\" --db \"$4\" serve --mcp")
+        .arg("sh")
+        .arg(&gone)
+        .arg(env!("CARGO_BIN_EXE_tsindex"))
+        .arg(&root)
+        .arg(&alias_inside)
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    {
+        let stdin = deleted_cwd_child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}})
+        )?;
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_symbol","arguments":{"name":"secret_fn"}}})
+        )?;
+        stdin.flush()?;
+    }
+    drop(deleted_cwd_child.stdin.take());
+    let deleted_out = deleted_cwd_child.wait_with_output()?;
+    anyhow::ensure!(
+        deleted_out.status.success(),
+        "absolute-path MCP launch from deleted cwd failed: {}",
+        String::from_utf8_lossy(&deleted_out.stderr)
+    );
+    let deleted_replies: Vec<Value> = std::str::from_utf8(&deleted_out.stdout)?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<std::result::Result<_, _>>()?;
+    let deleted_reply = deleted_replies
+        .into_iter()
+        .find(|value| value["id"] == 2)
+        .context("missing deleted-cwd lookup reply")?;
+    let deleted_payload: Value = serde_json::from_str(
+        deleted_reply["result"]["content"][0]["text"]
+            .as_str()
+            .context("missing deleted-cwd tool content")?,
+    )?;
+    assert_eq!(deleted_payload["total"], 1);
+    Ok(())
+}

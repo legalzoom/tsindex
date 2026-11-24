@@ -171,7 +171,7 @@ fn configuration(runtime: &Runtime) -> Result<String> {
     // Global Git exclude inputs come from each process's environment (HOME,
     // XDG_CONFIG_HOME, core.excludesFile). Keep watcher leases and freshness
     // markers scoped to the effective rule sources this process evaluates.
-    let global_excludes = crate::ignore_inputs::global_inputs();
+    let (global_excludes, active_excludes) = crate::ignore_inputs::global_inputs_with_excludes();
     digest.update(b"\0global-git-excludes:");
     digest.update((global_excludes.len() as u64).to_le_bytes());
     for path in global_excludes {
@@ -179,6 +179,23 @@ fn configuration(runtime: &Runtime) -> Result<String> {
         let bytes = resolved.as_os_str().as_encoded_bytes();
         digest.update((bytes.len() as u64).to_le_bytes());
         digest.update(bytes);
+    }
+    // Pinned ignore 0.4.25 anchors active global Git excludes to the process
+    // working directory, and skips them when CWD is unavailable. Scope the
+    // digest accordingly without failing absolute-path launches on missing CWD.
+    if active_excludes.is_some_and(|path| path.is_file()) {
+        match std::env::current_dir() {
+            Ok(cwd) => {
+                let resolved = key(&cwd);
+                let bytes = resolved.as_os_str().as_encoded_bytes();
+                digest.update(b"\0global-git-excludes-cwd:some:");
+                digest.update((bytes.len() as u64).to_le_bytes());
+                digest.update(bytes);
+            }
+            Err(_) => {
+                digest.update(b"\0global-git-excludes-cwd:none");
+            }
+        }
     }
     // Every configured ignore file (`[ignore].extra` or `[[repos]].ignore`),
     // relative or absolute, is matched against the process working directory.

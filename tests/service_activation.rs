@@ -798,7 +798,7 @@ fn manager_commands_preserve_regular_and_symlink_endpoints_before_mutations() ->
 
 #[cfg(target_os = "linux")]
 #[test]
-fn manager_commands_reject_paths_that_cannot_be_represented_exactly() -> Result<()> {
+fn install_rejects_lossy_unit_paths_and_manual_control_still_requires_utf8() -> Result<()> {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
     for name in [
@@ -808,7 +808,14 @@ fn manager_commands_reject_paths_that_cannot_be_represented_exactly() -> Result<
         OsString::from("continuation.sock\\"),
         OsString::from_vec(b"non-utf8-\xff.sock".to_vec()),
     ] {
-        for action in ["install", "start", "restart"] {
+        let actions: &[&str] = if name.to_str().is_some() {
+            // Unit-only restrictions do not apply to manually bound sockets.
+            &["install"]
+        } else {
+            // Both modes persist the endpoint in UTF-8 JSON metadata.
+            &["install", "start", "restart"]
+        };
+        for &action in actions {
             let scratch = private_scratch()?;
             let socket = scratch.path().join(&name);
             let config = scratch.path().join("config/systemd/user");

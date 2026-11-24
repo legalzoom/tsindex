@@ -145,6 +145,13 @@ impl DaemonPaths {
                 .context("failed to resolve relative daemon socket path")?
                 .join(socket_path)
         };
+        // Endpoint names also go into the daemon's JSON status and state file.
+        // Reject unsupported byte paths before spawning a detached process.
+        if socket_path.to_str().is_none() {
+            bail!(
+                "daemon socket path cannot be represented safely in control metadata: expected UTF-8"
+            );
+        }
         let socket_bytes = socket_path.as_os_str().as_encoded_bytes().len();
         if socket_bytes > MAX_UNIX_SOCKET_PATH_BYTES {
             bail!(

@@ -418,6 +418,69 @@ fn invalid_replacement_executable_preserves_existing_installation() -> Result<()
 
 #[cfg(target_os = "linux")]
 #[test]
+fn failed_replacement_restores_runtime_only_socket_enablement() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = private_scratch()?;
+    let config = scratch.path().join("config/systemd/user");
+    fs::create_dir_all(&config)?;
+    let service = config.join("tsindex.service");
+    let socket_unit = config.join("tsindex.socket");
+    fs::write(&service, "[Service]\n# previous version\n")?;
+    fs::write(&socket_unit, "[Socket]\n# previous version\n")?;
+    let bin = scratch.path().join("bin");
+    fs::create_dir(&bin)?;
+    let manager = bin.join("systemctl");
+    fs::write(
+        &manager,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >>"$HOME/calls"
+case "$*" in
+  '--user is-enabled tsindex.socket') printf 'enabled-runtime\n' ;;
+  '--user is-active '*) printf 'inactive\n'; exit 3 ;;
+  '--user start tsindex.socket') printf 'replacement failed\n' >&2; exit 42 ;;
+esac
+"#,
+    )?;
+    fs::set_permissions(&manager, fs::Permissions::from_mode(0o700))?;
+    let output = Command::new(BIN)
+        .arg("--socket")
+        .arg(scratch.path().join("replacement.sock"))
+        .args(["daemon", "install"])
+        .env("XDG_CONFIG_HOME", scratch.path().join("config"))
+        .env("HOME", scratch.path())
+        .env("PATH", &bin)
+        .env_remove("TSINDEX_HOME")
+        .env_remove("TSINDEX_SOCKET")
+        .output()?;
+    let error = String::from_utf8_lossy(&output.stderr);
+    ensure!(
+        !output.status.success() && error.contains("restored the previous service configuration"),
+        "{error}"
+    );
+    ensure!(fs::read_to_string(service)? == "[Service]\n# previous version\n");
+    ensure!(fs::read_to_string(socket_unit)? == "[Socket]\n# previous version\n");
+    let calls = fs::read_to_string(scratch.path().join("calls"))?;
+    let (_, rollback) = calls
+        .split_once("--user start tsindex.socket\n")
+        .context("replacement was never started")?;
+    ensure!(calls.contains("--user enable tsindex.socket\n"), "{calls}");
+    ensure!(
+        rollback.contains("--user disable tsindex.socket\n"),
+        "{calls}"
+    );
+    ensure!(
+        !rollback.contains("--user enable tsindex.socket\n"),
+        "{calls}"
+    );
+    ensure!(
+        rollback.ends_with("--user --runtime enable tsindex.socket\n"),
+        "{calls}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn manager_outage_during_replacement_restores_durable_configuration() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let scratch = private_scratch()?;
@@ -1501,6 +1564,62 @@ fn pre_activation_replacement_binary_is_rejected_before_stopping_service() -> Re
 
 #[cfg(target_os = "macos")]
 #[test]
+fn socketless_legacy_launchd_job_discovers_manager_environment() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = private_scratch()?;
+    let agents = scratch.path().join("Library/LaunchAgents");
+    fs::create_dir_all(&agents)?;
+    fs::write(
+        agents.join("com.legalzoom.tsindex.daemon.plist"),
+        "<plist><dict><key>ProgramArguments</key><array><string>/usr/bin/tsindex</string><string>daemon</string><string>run</string></array></dict></plist>",
+    )?;
+    let bin = scratch.path().join("bin");
+    fs::create_dir(&bin)?;
+    let manager = bin.join("launchctl");
+    fs::write(
+        &manager,
+        r#"#!/bin/sh
+case "$*" in
+  'getenv TSINDEX_SOCKET') printf '%s\n' "$FAKE_SOCKET" ;;
+  'getenv TSINDEX_HOME') printf '%s\n' "$FAKE_HOME" ;;
+esac
+"#,
+    )?;
+    fs::set_permissions(&manager, fs::Permissions::from_mode(0o700))?;
+    let socket = scratch.path().join("legacy socket.sock");
+    let home = scratch.path().join("launchd home");
+    let default = scratch.path().join(".tsindex/run/daemon.sock");
+    let flat = home.join("daemon.sock");
+    for (manager_socket, manager_home, expected) in [
+        (socket.as_path(), home.as_path(), &socket),
+        (Path::new(""), home.as_path(), &flat),
+        (Path::new(""), Path::new(""), &default),
+    ] {
+        let output = Command::new(BIN)
+            .args(["daemon", "status", "--json"])
+            .env("HOME", scratch.path())
+            .env("PATH", &bin)
+            .env("FAKE_SOCKET", manager_socket)
+            .env("FAKE_HOME", manager_home)
+            .env_remove("TSINDEX_SOCKET")
+            .env_remove("TSINDEX_HOME")
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let status: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        ensure!(
+            status["socket"] == expected.to_string_lossy().as_ref(),
+            "{status}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn macos_start_recreates_missing_nested_socket_directories_before_bootstrap() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1578,15 +1697,16 @@ exit 1
 
 #[cfg(target_os = "linux")]
 #[test]
-fn socketless_legacy_linux_unit_discovers_manager_runtime_socket_without_shell_xdg() -> Result<()> {
+fn legacy_linux_unit_discovers_socket_using_service_context() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let scratch = private_scratch()?;
     let mgr_runtime = scratch.path().join("mgr-runtime");
     let config = scratch.path().join("config/systemd/user");
     fs::create_dir_all(&config)?;
+    let service = config.join("tsindex.service");
     fs::write(
-        config.join("tsindex.service"),
+        &service,
         format!(
             "[Unit]\nAfter=default.target\n[Service]\nExecStart={} daemon run\nRestart=on-failure\n[Install]\nWantedBy=default.target\n",
             serde_json::to_string(BIN)?
@@ -1598,34 +1718,60 @@ fn socketless_legacy_linux_unit_discovers_manager_runtime_socket_without_shell_x
     fs::write(
         &manager,
         format!(
-            "#!/bin/sh\ncase \"$*\" in\n  *show-environment*) printf 'XDG_RUNTIME_DIR={}\\n' ;;\n  *) exit 0 ;;\nesac\n",
+            "#!/bin/sh\ncase \"$*\" in\n  *show-environment*) printf 'XDG_RUNTIME_DIR={}\\n' ;;\n  *WorkingDirectory*) printf '!%s\\n' \"$FAKE_WORKING_DIRECTORY\" ;;\n  *) exit 0 ;;\nesac\n",
             mgr_runtime.display()
         ),
     )?;
     fs::set_permissions(&manager, fs::Permissions::from_mode(0o700))?;
 
-    let output = Command::new(BIN)
-        .args(["daemon", "status", "--json"])
-        .env("HOME", scratch.path())
-        .env("XDG_CONFIG_HOME", scratch.path().join("config"))
-        .env("PATH", &bin)
-        .env_remove("XDG_RUNTIME_DIR")
-        .env_remove("TSINDEX_HOME")
-        .env_remove("TSINDEX_SOCKET")
-        .output()?;
+    let status = |working_dir: &Path| -> Result<serde_json::Value> {
+        let output = Command::new(BIN)
+            .args(["daemon", "status", "--json"])
+            .current_dir(&config)
+            .env("HOME", scratch.path())
+            .env("XDG_CONFIG_HOME", scratch.path().join("config"))
+            .env("PATH", &bin)
+            .env("FAKE_WORKING_DIRECTORY", working_dir)
+            .env_remove("XDG_RUNTIME_DIR")
+            .env_remove("TSINDEX_HOME")
+            .env_remove("TSINDEX_SOCKET")
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(serde_json::from_slice(&output.stdout)?)
+    };
+    let default_status = status(Path::new(""))?;
     ensure!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let status: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    ensure!(
-        status["socket"]
+        default_status["socket"]
             == mgr_runtime
                 .join("tsindex/daemon.sock")
                 .to_string_lossy()
                 .as_ref(),
-        "expected manager runtime socket, got: {status}"
+        "expected manager runtime socket, got: {default_status}"
     );
+    fs::write(
+        service,
+        format!(
+            "[Service]\nExecStart={} daemon run --socket \".cache/private/legacy.sock\"\n",
+            serde_json::to_string(BIN)?,
+        ),
+    )?;
+    for (working_dir, expected_base) in [
+        (mgr_runtime.as_path(), mgr_runtime.as_path()),
+        (Path::new(""), scratch.path()),
+    ] {
+        let relative_status = status(working_dir)?;
+        ensure!(
+            relative_status["socket"]
+                == expected_base
+                    .join(".cache/private/legacy.sock")
+                    .to_string_lossy()
+                    .as_ref(),
+            "expected socket relative to the service, got: {relative_status}"
+        );
+    }
     Ok(())
 }

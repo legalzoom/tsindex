@@ -710,9 +710,15 @@ struct PreviousInstall {
     endpoint: Option<String>,
     active: bool,
     #[cfg(target_os = "linux")]
-    enabled: bool,
+    enablement: Option<SystemdEnablement>,
     #[cfg(target_os = "linux")]
     service_was_active: bool,
+}
+
+#[cfg(target_os = "linux")]
+enum SystemdEnablement {
+    Persistent,
+    Runtime,
 }
 
 fn read_definition(path: &Path) -> Result<Option<String>> {
@@ -735,20 +741,22 @@ fn restore_definition(path: &Path, contents: Option<&str>) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn systemd_unit_state(unit: &str, action: &str) -> Result<bool> {
+fn systemd_unit_state(unit: &str, action: &str) -> Result<Option<String>> {
     let output = Command::new("systemctl")
         .args(["--user", action, unit])
         .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let state = stdout.trim();
     if output.status.success() {
-        return Ok(true);
+        return Ok(Some(state.to_owned()));
     }
     // is-active and is-enabled use a nonzero exit for valid inactive states.
     // Other errors must abort before the working installation is changed.
     if matches!(
-        String::from_utf8_lossy(&output.stdout).trim(),
+        state,
         "inactive" | "deactivating" | "failed" | "unknown" | "disabled" | "not-found"
     ) {
-        return Ok(false);
+        return Ok(None);
     }
     bail!(
         "cannot inspect {unit} ({action}): {}",
@@ -770,16 +778,26 @@ impl PreviousInstall {
             } else {
                 LINUX_SERVICE_NAME
             };
-            let enabled = installed && systemd_unit_state(old_unit, "is-enabled")?;
-            let active = installed && systemd_unit_state(old_unit, "is-active")?;
+            let enablement = if installed {
+                systemd_unit_state(old_unit, "is-enabled")?.map(|state| {
+                    if state == "enabled-runtime" {
+                        SystemdEnablement::Runtime
+                    } else {
+                        SystemdEnablement::Persistent
+                    }
+                })
+            } else {
+                None
+            };
+            let active = installed && systemd_unit_state(old_unit, "is-active")?.is_some();
             let service_was_active = socket.is_some()
                 && service.is_some()
-                && systemd_unit_state(LINUX_SERVICE_NAME, "is-active")?;
+                && systemd_unit_state(LINUX_SERVICE_NAME, "is-active")?.is_some();
             Ok(Self {
                 service,
                 socket,
                 endpoint,
-                enabled,
+                enablement,
                 active,
                 service_was_active,
             })
@@ -816,7 +834,10 @@ impl PreviousInstall {
                 can_restart &= record(stop_os_service());
             }
             #[cfg(target_os = "linux")]
-            if path.with_extension("socket").is_file() && !(self.socket.is_some() && self.enabled) {
+            if path.with_extension("socket").is_file()
+                && !(self.socket.is_some()
+                    && matches!(self.enablement, Some(SystemdEnablement::Persistent)))
+            {
                 record(manager_output(
                     Command::new("systemctl").args(["--user", "disable", LINUX_SOCKET_NAME]),
                     "disable replacement activation socket",
@@ -840,14 +861,19 @@ impl PreviousInstall {
                     Command::new("systemctl").args(["--user", "daemon-reload"]),
                     "reload restored service definitions",
                 ));
-                if self.enabled {
+                if let Some(enablement) = &self.enablement {
                     let unit = if self.socket.is_some() {
                         LINUX_SOCKET_NAME
                     } else {
                         LINUX_SERVICE_NAME
                     };
+                    let mut command = Command::new("systemctl");
+                    command.arg("--user");
+                    if matches!(enablement, SystemdEnablement::Runtime) {
+                        command.arg("--runtime");
+                    }
                     record(manager_output(
-                        Command::new("systemctl").args(["--user", "enable", unit]),
+                        command.args(["enable", unit]),
                         "restore previous login enablement",
                     ));
                 }
@@ -1257,18 +1283,13 @@ fn endpoint_from_systemd_unit(
         return Ok(PathBuf::from(socket));
     }
     if let Some(home) = lookup("TSINDEX_HOME") {
-        let modern = PathBuf::from(&home).join("run").join("daemon.sock");
-        if socket_activated {
-            return Ok(modern);
-        }
-        // The original socketless unit layout placed TSINDEX_HOME sockets at
-        // `$TSINDEX_HOME/daemon.sock`; prefer `$TSINDEX_HOME/run/daemon.sock`
-        // only when only the newer path exists on disk.
-        let legacy = PathBuf::from(&home).join("daemon.sock");
-        if modern.exists() && !legacy.exists() {
-            return Ok(modern);
-        }
-        return Ok(legacy);
+        // Do not infer the layout from an existing socket: it might belong
+        // to an independent daemon rather than this installed service.
+        return Ok(PathBuf::from(home).join(if socket_activated {
+            "run/daemon.sock"
+        } else {
+            "daemon.sock"
+        }));
     }
     let xdg_runtime_dir = if unit_env.contains_key("XDG_RUNTIME_DIR") {
         unit_env
@@ -1305,22 +1326,73 @@ fn endpoint_from_systemd_unit(
 #[cfg(target_os = "linux")]
 fn endpoint_from_service() -> Result<PathBuf> {
     let source = fs::read_to_string(service_file_path())?;
-    endpoint_from_systemd_unit(
+    let socket = endpoint_from_systemd_unit(
         &source,
         systemd_user_environment,
         env::var_os("XDG_RUNTIME_DIR"),
         &home_path(".tsindex"),
         crate::daemon::current_uid(),
-    )
+    )?;
+    if socket.is_absolute() {
+        return Ok(socket);
+    }
+    // Relative arguments belong to the service's cwd, including any
+    // WorkingDirectory override. A stock user unit defaults to the login home.
+    Ok(systemd_service_working_dir()
+        .unwrap_or_else(|| home_path(""))
+        .join(socket))
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_service_working_dir() -> Option<PathBuf> {
+    let output = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            "--property=WorkingDirectory",
+            "--value",
+            LINUX_SERVICE_NAME,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);
+    // systemd prefixes the property with '!' when a missing directory is
+    // allowed. A value of '~' falls back to the login home.
+    let path = Path::new(std::ffi::OsStr::from_bytes(
+        value.strip_prefix(b"!").unwrap_or(value),
+    ));
+    path.is_absolute().then(|| path.to_path_buf())
 }
 
 #[cfg(target_os = "macos")]
 fn endpoint_from_service() -> Result<PathBuf> {
-    endpoint_from_launchd_plist(&fs::read_to_string(service_file_path())?)
+    endpoint_from_launchd_plist(
+        &fs::read_to_string(service_file_path())?,
+        launchd_user_environment,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_user_environment(key: &str) -> Option<PathBuf> {
+    let output = Command::new("launchctl")
+        .args(["getenv", key])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);
+    (!value.is_empty()).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(value)))
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn endpoint_from_launchd_plist(source: &str) -> Result<PathBuf> {
+fn endpoint_from_launchd_plist(
+    source: &str,
+    manager_env: impl Fn(&str) -> Option<PathBuf>,
+) -> Result<PathBuf> {
     let args = source
         .split_once("<key>ProgramArguments</key>")
         .and_then(|(_, value)| value.split_once("<array>"))
@@ -1340,11 +1412,23 @@ fn endpoint_from_launchd_plist(source: &str) -> Result<PathBuf> {
                 .replace("&amp;", "&")
         })
         .collect();
-    Ok(values
+    if let Some(socket) = values
         .windows(2)
         .find(|pair| pair[0] == "--socket")
         .map(|pair| PathBuf::from(&pair[1]))
-        .unwrap_or_else(legacy_default_socket))
+    {
+        return Ok(socket);
+    }
+    if !values.iter().any(|arg| arg == "--socket-activated") {
+        // The original job inherited these overrides instead of persisting
+        // them in the plist. Its TSINDEX_HOME layout was flat.
+        if let Some(socket) = manager_env("TSINDEX_SOCKET")
+            .or_else(|| manager_env("TSINDEX_HOME").map(|home| home.join("daemon.sock")))
+        {
+            return Ok(Path::new("/").join(socket));
+        }
+    }
+    Ok(legacy_default_socket())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1764,7 +1848,7 @@ mod tests {
 <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
 </dict></plist>"#;
         assert_eq!(
-            endpoint_from_launchd_plist(legacy)?,
+            endpoint_from_launchd_plist(legacy, |_| panic!("explicit socket skips launchd"))?,
             PathBuf::from("/private/a&b/sock\"name")
         );
         Ok(())
@@ -1885,7 +1969,8 @@ mod tests {
         )?;
         assert_eq!(socket, PathBuf::from("/opt/tsindex-home/run/daemon.sock"));
 
-        // If only `$TSINDEX_HOME/run/daemon.sock` exists on disk, prefer it.
+        // The newer endpoint may belong to an independent daemon. A legacy
+        // service still used the flat path even when its socket is absent.
         let temp_home = tempfile::tempdir_in("/tmp")?;
         fs::create_dir_all(temp_home.path().join("run"))?;
         fs::write(temp_home.path().join("run/daemon.sock"), "")?;
@@ -1896,7 +1981,7 @@ mod tests {
             home,
             1000,
         )?;
-        assert_eq!(socket, temp_home.path().join("run/daemon.sock"));
+        assert_eq!(socket, temp_home.path().join("daemon.sock"));
 
         // `systemctl --user show-environment` shell-quotes paths with spaces or special chars.
         let socket = endpoint_from_systemd_unit(
@@ -1968,6 +2053,7 @@ mod tests {
             1000,
         )?;
         assert_eq!(socket, PathBuf::from("/tmp/custom.sock"));
+
         Ok(())
     }
 

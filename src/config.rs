@@ -189,18 +189,61 @@ impl TsIndexConfig {
         fs::create_dir_all(&config_dir)
             .with_context(|| format!("failed to create {}", config_dir.display()))?;
         let path = config_dir.join("config.toml");
+        let target = match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let resolved = crate::maintenance::canonical_target(&path)
+                    .with_context(|| format!("failed to resolve {}", path.display()))?;
+                if fs::symlink_metadata(&resolved)
+                    .is_ok_and(|target_meta| target_meta.file_type().is_symlink())
+                {
+                    anyhow::bail!(
+                        "failed to resolve {}: too many levels of symbolic links",
+                        path.display()
+                    );
+                }
+                resolved
+            }
+            Ok(_) => path.clone(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => path.clone(),
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to write {}", path.display()));
+            }
+        };
+        let existing_permissions = match fs::metadata(&target) {
+            Ok(meta) if meta.is_dir() => {
+                anyhow::bail!("failed to write {}: target is a directory", path.display());
+            }
+            Ok(meta) => Some(meta.permissions()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to write {}", path.display()));
+            }
+        };
+        let target_dir = target
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("failed to write {}: missing parent", path.display()))?;
+        let target_name = target
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .ok_or_else(|| {
+                anyhow::anyhow!("failed to write {}: missing file name", path.display())
+            })?;
         let raw = toml::to_string_pretty(self).context("failed to serialize config")?;
         // Publish atomically so concurrent readers (e.g. managed clients joining
         // a linked checkout during preparation) never see an empty or partial file.
         let pid = std::process::id();
         let (temporary, mut file) = loop {
             let seq = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-            let candidate = config_dir.join(format!(".config.toml.{pid}.{seq}.tmp"));
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&candidate)
+            let candidate = target_dir.join(format!(".{target_name}.{pid}.{seq}.tmp"));
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
             {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&candidate) {
                 Ok(file) => break (candidate, file),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => {
@@ -212,13 +255,16 @@ impl TsIndexConfig {
         let result = (|| -> Result<()> {
             file.write_all(raw.as_bytes())?;
             file.sync_all()?;
+            if let Some(permissions) = existing_permissions {
+                file.set_permissions(permissions)?;
+            }
             drop(file);
-            match fs::rename(&temporary, &path) {
+            match fs::rename(&temporary, &target) {
                 Ok(()) => Ok(()),
                 #[cfg(windows)]
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let _ = fs::remove_file(&path);
-                    fs::rename(&temporary, &path)?;
+                    let _ = fs::remove_file(&target);
+                    fs::rename(&temporary, &target)?;
                     Ok(())
                 }
                 Err(error) => Err(error.into()),
@@ -300,6 +346,97 @@ mod tests {
             leftovers.is_empty(),
             "unexpected temporary config files left behind: {leftovers:?}"
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_write_preserves_permissions_and_follows_symlinks() -> Result<()> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        // 1. New config files are created privately and existing modes are preserved.
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().to_path_buf();
+        let mut config = TsIndexConfig::default();
+        config.repos.push(RepoConfig {
+            name: "alpha".into(),
+            path: ".".into(),
+            languages: vec!["rust".into()],
+            ignore: vec![],
+        });
+        let path = config.write(&root)?;
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        config.repos.push(RepoConfig {
+            name: "beta".into(),
+            path: "beta".into(),
+            languages: vec![],
+            ignore: vec![],
+        });
+        config.write(&root)?;
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640))?;
+        config.write(&root)?;
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o640);
+
+        // 2. Existing config symlink updates the resolved target and preserves
+        // both the symlink and the target's mode.
+        let linked_root = dir.path().join("linked-root");
+        let shared_dir = dir.path().join("shared");
+        fs::create_dir_all(linked_root.join(".tsindex"))?;
+        fs::create_dir_all(&shared_dir)?;
+        let shared_target = shared_dir.join("team-config.toml");
+        fs::write(&shared_target, "")?;
+        fs::set_permissions(&shared_target, fs::Permissions::from_mode(0o600))?;
+        let link_path = linked_root.join(".tsindex").join("config.toml");
+        symlink(&shared_target, &link_path)?;
+
+        let written = config.write(&linked_root)?;
+        assert_eq!(written, link_path);
+        assert!(
+            fs::symlink_metadata(&link_path)?.file_type().is_symlink(),
+            "config.toml symlink was replaced instead of updating its target"
+        );
+        assert_eq!(fs::read_link(&link_path)?, shared_target);
+        assert_eq!(
+            fs::metadata(&shared_target)?.permissions().mode() & 0o777,
+            0o600
+        );
+        let target_raw = fs::read_to_string(&shared_target)?;
+        let target_parsed: TsIndexConfig = toml::from_str(&target_raw)?;
+        assert_eq!(target_parsed.repos.len(), 2);
+
+        // 3. Dangling config symlink publishes to its resolved target without
+        // replacing the symlink.
+        let dangling_root = dir.path().join("dangling-root");
+        fs::create_dir_all(dangling_root.join(".tsindex"))?;
+        let later_target = shared_dir.join("later-config.toml");
+        let dangling_link = dangling_root.join(".tsindex").join("config.toml");
+        symlink(&later_target, &dangling_link)?;
+        config.write(&dangling_root)?;
+        assert!(
+            fs::symlink_metadata(&dangling_link)?
+                .file_type()
+                .is_symlink()
+        );
+        assert!(later_target.is_file());
+        assert_eq!(
+            fs::metadata(&later_target)?.permissions().mode() & 0o777,
+            0o600
+        );
+
+        // 4. Symlink loop fails cleanly without replacing the symlink.
+        let loop_root = dir.path().join("loop-root");
+        fs::create_dir_all(loop_root.join(".tsindex"))?;
+        let loop_a = loop_root.join(".tsindex").join("config.toml");
+        let loop_b = loop_root.join(".tsindex").join("loop-b.toml");
+        symlink(&loop_b, &loop_a)?;
+        symlink(&loop_a, &loop_b)?;
+        assert!(config.write(&loop_root).is_err());
+        assert!(fs::symlink_metadata(&loop_a)?.file_type().is_symlink());
+
         Ok(())
     }
 }

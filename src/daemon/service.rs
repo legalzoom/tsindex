@@ -417,7 +417,6 @@ fn verify_service_binary(binary: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn write_file_atomically(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -590,6 +589,10 @@ pub fn install_service(
     if endpoint_exists && owner.is_none() && !installed_endpoint_matches(paths).unwrap_or(false) {
         check_socket(paths)?;
     }
+    // Verify the target user manager is reachable before stopping any healthy
+    // manual daemon on a first-time install (where capture had no definitions
+    // to query the manager about).
+    probe_user_manager()?;
     let mut installing_definitions = false;
     let result = (|| -> Result<DaemonStatus> {
         if previous.service.is_some() {
@@ -812,7 +815,10 @@ impl PreviousInstall {
             })
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        bail!("unsupported user service manager")
+        {
+            let _ = (service, endpoint);
+            bail!("unsupported user service manager")
+        }
     }
 
     fn restore(&self, definitions_changed: bool) -> Result<()> {
@@ -934,40 +940,73 @@ pub fn client_paths(socket: Option<&Path>) -> Result<DaemonPaths> {
         return Ok(selected);
     }
     if let Some(install) = installed_endpoint()? {
-        let ordinary_login = match &install.default_socket {
-            Some(default) => {
-                *default == selected.socket_path
-                    || ordinary_linux_defaults(default, &selected.socket_path)
-            }
-            // Legacy metadata lacks its install-time runtime directory. A
-            // custom Linux XDG directory remains isolated until reinstallation.
-            None => {
-                !cfg!(target_os = "linux")
-                    || env::var_os("XDG_RUNTIME_DIR")
-                        .filter(|value| !value.is_empty())
-                        .is_none_or(|dir| {
-                            Path::new(&dir)
-                                == Path::new(&format!("/run/user/{}", crate::daemon::current_uid()))
-                        })
-            }
-        };
-        if ordinary_login {
+        let xdg_runtime_dir = env::var_os("XDG_RUNTIME_DIR");
+        if matches_installed_login_context(
+            install.default_socket.as_deref(),
+            &selected.socket_path,
+            xdg_runtime_dir.as_deref(),
+            &home_path(".tsindex"),
+            crate::daemon::current_uid(),
+            cfg!(target_os = "linux"),
+        ) {
             return DaemonPaths::resolve(Some(&install.socket));
         }
     }
     Ok(selected)
 }
 
-fn ordinary_linux_defaults(installed: &Path, selected: &Path) -> bool {
-    if !cfg!(target_os = "linux") {
-        return false;
-    }
-    let uid = crate::daemon::current_uid();
-    let home = home_path(".tsindex");
-    let session =
-        crate::daemon::default_socket_path(Some(format!("/run/user/{uid}").into()), &home, uid);
-    let fallback = crate::daemon::default_socket_path(None, &home, uid);
+fn is_ordinary_linux_runtime_dir(xdg_runtime_dir: Option<&std::ffi::OsStr>, uid: u32) -> bool {
+    xdg_runtime_dir
+        .filter(|value| !value.is_empty())
+        .is_none_or(|dir| Path::new(dir) == Path::new(&format!("/run/user/{uid}")))
+}
+
+fn ordinary_linux_defaults(installed: &Path, selected: &Path, home: &Path, uid: u32) -> bool {
+    let session = PathBuf::from(format!("/run/user/{uid}"))
+        .join("tsindex")
+        .join("daemon.sock");
+    let fallback = crate::daemon::default_socket_path(None, home, uid);
     (installed == session && selected == fallback) || (installed == fallback && selected == session)
+}
+
+fn matches_installed_login_context(
+    installed_default: Option<&Path>,
+    selected_socket: &Path,
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    home: &Path,
+    uid: u32,
+    is_linux: bool,
+) -> bool {
+    let ordinary_runtime = !is_linux || is_ordinary_linux_runtime_dir(xdg_runtime_dir, uid);
+    match installed_default {
+        Some(default) => {
+            if !is_linux {
+                return default == selected_socket;
+            }
+            if ordinary_runtime {
+                return default == selected_socket
+                    || ordinary_linux_defaults(default, selected_socket, home, uid);
+            }
+            // A custom XDG_RUNTIME_DIR only matches an install from that same
+            // runtime directory. If it exceeded the socket path limit and fell
+            // back to the ordinary home/tmp path, keep it isolated.
+            let custom_fits = xdg_runtime_dir
+                .filter(|value| !value.is_empty())
+                .is_some_and(|dir| {
+                    PathBuf::from(dir)
+                        .join("tsindex")
+                        .join("daemon.sock")
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .len()
+                        <= super::MAX_UNIX_SOCKET_PATH_BYTES
+                });
+            custom_fits && default == selected_socket
+        }
+        // Legacy metadata lacks its install-time runtime directory. A
+        // custom Linux XDG directory remains isolated until reinstallation.
+        None => ordinary_runtime,
+    }
 }
 
 fn installed_endpoint_matches(paths: &DaemonPaths) -> Result<bool> {
@@ -1389,6 +1428,16 @@ fn launchd_user_environment(key: &str) -> Option<PathBuf> {
 }
 
 #[cfg(any(target_os = "macos", test))]
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn endpoint_from_launchd_plist(
     source: &str,
     manager_env: impl Fn(&str) -> Option<PathBuf>,
@@ -1403,21 +1452,21 @@ fn endpoint_from_launchd_plist(
         .split("<string>")
         .skip(1)
         .filter_map(|part| part.split_once("</string>").map(|(value, _)| value))
-        .map(|value| {
-            value
-                .replace("&lt;", "<")
-                .replace("&gt;", ">")
-                .replace("&quot;", "\"")
-                .replace("&apos;", "'")
-                .replace("&amp;", "&")
-        })
+        .map(xml_unescape)
         .collect();
+    // launchd defaults WorkingDirectory to `/` unless the plist overrides it.
+    let working_dir = source
+        .split_once("<key>WorkingDirectory</key>")
+        .and_then(|(_, rest)| rest.trim_start().strip_prefix("<string>"))
+        .and_then(|rest| rest.split_once("</string>"))
+        .map(|(value, _)| Path::new("/").join(xml_unescape(value)))
+        .unwrap_or_else(|| PathBuf::from("/"));
     if let Some(socket) = values
         .windows(2)
         .find(|pair| pair[0] == "--socket")
         .map(|pair| PathBuf::from(&pair[1]))
     {
-        return Ok(socket);
+        return Ok(working_dir.join(socket));
     }
     if !values.iter().any(|arg| arg == "--socket-activated") {
         // The original job inherited these overrides instead of persisting
@@ -1425,7 +1474,7 @@ fn endpoint_from_launchd_plist(
         if let Some(socket) = manager_env("TSINDEX_SOCKET")
             .or_else(|| manager_env("TSINDEX_HOME").map(|home| home.join("daemon.sock")))
         {
-            return Ok(Path::new("/").join(socket));
+            return Ok(working_dir.join(socket));
         }
     }
     Ok(legacy_default_socket())
@@ -1436,6 +1485,7 @@ fn endpoint_from_service() -> Result<PathBuf> {
     Ok(legacy_default_socket())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn manager_output(command: &mut Command, operation: &str) -> Result<()> {
     let output = command
         .output()
@@ -1448,6 +1498,28 @@ fn manager_output(command: &mut Command, operation: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn probe_user_manager() -> Result<()> {
+    manager_output(
+        Command::new("systemctl").args(["--user", "show-environment"]),
+        "connect to systemd user manager",
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn probe_user_manager() -> Result<()> {
+    let domain = format!("gui/{}", crate::daemon::current_uid());
+    manager_output(
+        Command::new("launchctl").args(["print", &domain]),
+        &format!("inspect launchd domain {domain}"),
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn probe_user_manager() -> Result<()> {
+    bail!("login service installation requires launchd or systemd --user")
 }
 
 #[cfg(target_os = "linux")]
@@ -1852,6 +1924,123 @@ mod tests {
             PathBuf::from("/private/a&b/sock\"name")
         );
         Ok(())
+    }
+
+    #[test]
+    fn legacy_launchd_relative_socket_resolves_against_service_working_directory() -> Result<()> {
+        let default_cwd = r#"<plist><dict>
+<key>ProgramArguments</key><array>
+<string>/usr/local/bin/tsindex</string><string>daemon</string><string>run</string>
+<string>--socket</string><string>var/tmp/tsindex.sock</string>
+</array>
+</dict></plist>"#;
+        assert_eq!(
+            endpoint_from_launchd_plist(default_cwd, |_| panic!("explicit socket skips launchd"))?,
+            PathBuf::from("/var/tmp/tsindex.sock")
+        );
+
+        let custom_cwd = r#"<plist><dict>
+<key>WorkingDirectory</key>
+<string>/private/tmp/work&amp;dir</string>
+<key>ProgramArguments</key><array>
+<string>/usr/local/bin/tsindex</string><string>daemon</string><string>run</string>
+<string>--socket</string><string>run/daemon.sock</string>
+</array>
+</dict></plist>"#;
+        assert_eq!(
+            endpoint_from_launchd_plist(custom_cwd, |_| panic!("explicit socket skips launchd"))?,
+            PathBuf::from("/private/tmp/work&dir/run/daemon.sock")
+        );
+
+        let env_with_cwd = r#"<plist><dict>
+<key>WorkingDirectory</key>
+<string>/private/tmp/svc</string>
+<key>ProgramArguments</key><array>
+<string>/usr/local/bin/tsindex</string><string>daemon</string><string>run</string>
+</array>
+</dict></plist>"#;
+        assert_eq!(
+            endpoint_from_launchd_plist(env_with_cwd, |key| {
+                (key == "TSINDEX_SOCKET").then(|| PathBuf::from("rel.sock"))
+            })?,
+            PathBuf::from("/private/tmp/svc/rel.sock")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn linux_login_discovery_isolates_oversized_custom_xdg_runtime_dir() {
+        let uid = 1000;
+        let home = Path::new("/home/dev/.tsindex");
+        let session = Path::new("/run/user/1000/tsindex/daemon.sock");
+        let fallback = Path::new("/home/dev/.tsindex/run/daemon.sock");
+        let long_custom = std::ffi::OsString::from(format!("/tmp/{}", "x".repeat(95)));
+        let short_custom = std::ffi::OsStr::new("/tmp/custom-xdg");
+        let short_custom_socket = Path::new("/tmp/custom-xdg/tsindex/daemon.sock");
+
+        // Ordinary Linux login contexts remain equivalent across session and unset XDG_RUNTIME_DIR.
+        assert!(matches_installed_login_context(
+            Some(session),
+            fallback,
+            None,
+            home,
+            uid,
+            true
+        ));
+        assert!(matches_installed_login_context(
+            Some(fallback),
+            session,
+            Some(std::ffi::OsStr::new("/run/user/1000")),
+            home,
+            uid,
+            true
+        ));
+
+        // An oversized custom XDG_RUNTIME_DIR falls back to `fallback`, but must
+        // never alias an ordinary login install (session, fallback, or legacy).
+        assert!(!matches_installed_login_context(
+            Some(session),
+            fallback,
+            Some(long_custom.as_os_str()),
+            home,
+            uid,
+            true
+        ));
+        assert!(!matches_installed_login_context(
+            Some(fallback),
+            fallback,
+            Some(long_custom.as_os_str()),
+            home,
+            uid,
+            true
+        ));
+        assert!(!matches_installed_login_context(
+            None,
+            fallback,
+            Some(long_custom.as_os_str()),
+            home,
+            uid,
+            true
+        ));
+
+        // A short custom XDG_RUNTIME_DIR still matches an install made in that
+        // exact runtime directory, and stays isolated from others.
+        assert!(matches_installed_login_context(
+            Some(short_custom_socket),
+            short_custom_socket,
+            Some(short_custom),
+            home,
+            uid,
+            true
+        ));
+        assert!(!matches_installed_login_context(
+            Some(session),
+            short_custom_socket,
+            Some(short_custom),
+            home,
+            uid,
+            true
+        ));
     }
 
     #[test]

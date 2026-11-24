@@ -300,6 +300,8 @@ fn login_clients_discover_installed_socket_and_preserve_explicit_isolation() -> 
     };
     ensure!(status_socket(&mut command())? == socket);
     let standard_runtime = PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() }));
+    let home_fallback = scratch.path().join(".tsindex/run/daemon.sock");
+    let oversized_runtime = scratch.path().join("x".repeat(95));
     let endpoint = |default: &Path| -> Result<()> {
         fs::write(
             config.join("tsindex.json"),
@@ -312,8 +314,10 @@ fn login_clients_discover_installed_socket_and_preserve_explicit_isolation() -> 
     endpoint(&standard_runtime.join("tsindex/daemon.sock"))?;
     ensure!(status_socket(command().env_remove("XDG_RUNTIME_DIR"))? == socket);
     ensure!(status_socket(&mut command())? == runtime.join("tsindex/daemon.sock"));
-    endpoint(&scratch.path().join(".tsindex/run/daemon.sock"))?;
+    ensure!(status_socket(command().env("XDG_RUNTIME_DIR", &oversized_runtime))? == home_fallback);
+    endpoint(&home_fallback)?;
     ensure!(status_socket(command().env("XDG_RUNTIME_DIR", &standard_runtime))? == socket);
+    ensure!(status_socket(command().env("XDG_RUNTIME_DIR", &oversized_runtime))? == home_fallback);
     endpoint(&runtime.join("tsindex/daemon.sock"))?;
     let independent = scratch.path().join("independent.sock");
     ensure!(status_socket(command().arg("--socket").arg(&independent))? == independent);
@@ -1559,6 +1563,67 @@ fn pre_activation_replacement_binary_is_rejected_before_stopping_service() -> Re
         !calls.exists(),
         "preflight must reject incompatible binaries before invoking the service manager"
     );
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn install_probes_user_manager_before_stopping_manual_daemon() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let scratch = private_scratch()?;
+    let socket = scratch.path().join("d.sock");
+    let repo = scratch.path().join("repo");
+    let _daemon = Daemon(
+        Command::new(BIN)
+            .arg("--socket")
+            .arg(&socket)
+            .args(["daemon", "run"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    let daemon_pid = wait_ready(&socket)?;
+    let (mut proxy, worker_pid) = active_worker(&socket, &repo)?;
+
+    let bin = scratch.path().join("bin");
+    fs::create_dir(&bin)?;
+    let calls = scratch.path().join("manager-calls");
+    for manager_name in ["systemctl", "launchctl"] {
+        let manager = bin.join(manager_name);
+        fs::write(
+            &manager,
+            "#!/bin/sh\nprintf \"%s\\n\" \"$*\" >>\"$FAKE_MANAGER_CALLS\"\nprintf 'manager unavailable\\n' >&2\nexit 42\n",
+        )?;
+        fs::set_permissions(&manager, fs::Permissions::from_mode(0o700))?;
+    }
+
+    let output = Command::new(BIN)
+        .arg("--socket")
+        .arg(&socket)
+        .args(["daemon", "install"])
+        .env("HOME", scratch.path())
+        .env("XDG_CONFIG_HOME", scratch.path().join("config"))
+        .env("PATH", &bin)
+        .env("FAKE_MANAGER_CALLS", &calls)
+        .env_remove("TSINDEX_HOME")
+        .env_remove("TSINDEX_SOCKET")
+        .output()?;
+    ensure!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    ensure!(
+        stderr.contains("manager unavailable"),
+        "expected manager probe failure, got: {stderr}"
+    );
+    ensure!(calls.is_file(), "install must probe the user manager");
+
+    // The healthy manual daemon and its live MCP worker must remain untouched.
+    let status = client(&socket)?.ping()?;
+    ensure!(status.daemon_pid == daemon_pid);
+    ensure!(status.active_sessions == 1);
+    ensure!(proxy.0.try_wait()?.is_none());
+    ensure!(unsafe { libc::kill(worker_pid as libc::pid_t, 0) } == 0);
     Ok(())
 }
 

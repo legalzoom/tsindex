@@ -1301,3 +1301,189 @@ fn global_git_excludes_scope_watcher_leases_and_freshness_markers() -> Result<()
     assert_eq!(mcp_lookup(xdg_excluding.path(), "secret_fn")?["total"], 0);
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn pruning_and_non_pruning_symlink_aliases_do_not_share_maintenance_state() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir_in("/tmp")?;
+    let root = dir.path().join("catalog");
+    let repo_a = root.join("a");
+    let repo_b = root.join("b");
+    fs::create_dir_all(&repo_a)?;
+    fs::create_dir_all(&repo_b)?;
+    fs::write(repo_a.join("a.py"), "def alpha():\n    return 1\n")?;
+    fs::write(repo_b.join("b.py"), "def beta():\n    return 2\n")?;
+
+    let mut two_repos = TsIndexConfig::default();
+    two_repos.languages.include = vec!["python".into()];
+    two_repos.server.worktree_refresh_ms = 60_000;
+    two_repos.repos = vec![
+        RepoConfig {
+            name: "a".into(),
+            path: "a".into(),
+            languages: vec![],
+            ignore: vec![],
+        },
+        RepoConfig {
+            name: "b".into(),
+            path: "b".into(),
+            languages: vec![],
+            ignore: vec![],
+        },
+    ];
+    two_repos.write(&root)?;
+
+    let default_db = db_path(&root);
+    let alias_dir = tempfile::tempdir_in("/tmp")?;
+    let alias_db = alias_dir.path().join("alias.db");
+    symlink(&default_db, &alias_db)?;
+
+    // Build initial two-repo index.
+    let initial = Runtime::new(root.clone(), default_db.clone(), two_repos, vec![]);
+    initial.build(false, None)?;
+
+    // Remove repo `b` from the catalog.
+    let mut one_repo = TsIndexConfig::default();
+    one_repo.languages.include = vec!["python".into()];
+    one_repo.server.worktree_refresh_ms = 60_000;
+    one_repo.repos = vec![RepoConfig {
+        name: "a".into(),
+        path: "a".into(),
+        languages: vec![],
+        ignore: vec![],
+    }];
+    one_repo.write(&root)?;
+
+    let alias_non_pruning = Runtime::new(root.clone(), alias_db.clone(), one_repo.clone(), vec![])
+        .with_repo_pruning(false);
+    let real_non_pruning = Runtime::new(root.clone(), default_db.clone(), one_repo.clone(), vec![])
+        .with_repo_pruning(false);
+    let default_pruning = Runtime::new(root.clone(), default_db.clone(), one_repo, vec![]);
+
+    // Compatible symlinked paths still coalesce when pruning policy matches,
+    // while pruning and non-pruning runtimes stay separate.
+    assert_eq!(
+        maintenance::watcher_lease_path(&alias_non_pruning)?,
+        maintenance::watcher_lease_path(&real_non_pruning)?
+    );
+    assert_ne!(
+        maintenance::watcher_lease_path(&alias_non_pruning)?,
+        maintenance::watcher_lease_path(&default_pruning)?
+    );
+
+    // Refresh via the non-pruning `--db` symlink leaves removed repo `b` intact.
+    maintenance::reconcile_if_due(&alias_non_pruning)?;
+    let lookup_beta = |runtime: &Runtime| -> Result<usize> {
+        Ok(runtime
+            .get_symbol(tsindex::index::GetSymbolArgs {
+                name: Some("beta".into()),
+                names: None,
+                kind: None,
+                file_glob: None,
+                repo: None,
+                include_body: false,
+                context_lines: 0,
+                max_body_lines: None,
+                limit: Some(10),
+                offset: None,
+            })?
+            .total)
+    };
+    assert_eq!(lookup_beta(&alias_non_pruning)?, 1);
+
+    // A default pruning runtime must NOT accept the non-pruning alias marker;
+    // it reconciles and prunes repo `b`.
+    maintenance::reconcile_if_due(&default_pruning)?;
+    assert_eq!(
+        lookup_beta(&default_pruning)?,
+        0,
+        "pruning runtime reused non-pruning alias refresh marker"
+    );
+    Ok(())
+}
+
+#[test]
+fn equivalent_language_filters_share_watcher_lease_and_refresh_marker() -> Result<()> {
+    let (_dir, root) = fixture()?;
+    fs::write(root.join("lib.rs"), "pub fn rust_before() {}\n")?;
+    let mut config = TsIndexConfig::default();
+    config.server.worktree_refresh_ms = 60_000;
+    config.write(&root)?;
+    let db = db_path(&root);
+
+    let direct_order = Runtime::new(
+        root.clone(),
+        db.clone(),
+        config.clone(),
+        vec!["rust".into(), "python".into()],
+    );
+    let sorted_order = Runtime::new(
+        root.clone(),
+        db.clone(),
+        config.clone(),
+        vec!["python".into(), "rust".into()],
+    );
+    let duplicate_order = Runtime::new(
+        root.clone(),
+        db.clone(),
+        config.clone(),
+        vec!["rust".into(), "python".into(), "rust".into()],
+    );
+    let python_only = Runtime::new(root.clone(), db.clone(), config, vec!["python".into()]);
+
+    assert_eq!(
+        maintenance::watcher_lease_path(&direct_order)?,
+        maintenance::watcher_lease_path(&sorted_order)?
+    );
+    assert_eq!(
+        maintenance::watcher_lease_path(&direct_order)?,
+        maintenance::watcher_lease_path(&duplicate_order)?
+    );
+    assert_ne!(
+        maintenance::watcher_lease_path(&direct_order)?,
+        maintenance::watcher_lease_path(&python_only)?
+    );
+
+    maintenance::reconcile_if_due(&direct_order)?;
+    fs::write(
+        root.join("a.py"),
+        "def after_shared_lang_refresh():\n    return 2\n",
+    )?;
+    maintenance::reconcile_if_due(&sorted_order)?;
+
+    let still_old = sorted_order.get_symbol(tsindex::index::GetSymbolArgs {
+        name: Some("before_edit".into()),
+        names: None,
+        kind: None,
+        file_glob: None,
+        repo: None,
+        include_body: false,
+        context_lines: 0,
+        max_body_lines: None,
+        limit: Some(10),
+        offset: None,
+    })?;
+    assert_eq!(
+        still_old.total, 1,
+        "equivalent sorted language filter did not reuse refresh marker"
+    );
+
+    // A genuinely narrower filter must NOT reuse the broader marker.
+    maintenance::reconcile_if_due(&python_only)?;
+    let refreshed = python_only.get_symbol(tsindex::index::GetSymbolArgs {
+        name: Some("after_shared_lang_refresh".into()),
+        names: None,
+        kind: None,
+        file_glob: None,
+        repo: None,
+        include_body: false,
+        context_lines: 0,
+        max_body_lines: None,
+        limit: Some(10),
+        offset: None,
+    })?;
+    assert_eq!(refreshed.total, 1);
+    Ok(())
+}

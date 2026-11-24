@@ -151,6 +151,9 @@ impl Reconciliation {
 
 fn configuration(runtime: &Runtime) -> Result<String> {
     let database = key(&runtime.db_path);
+    let mut languages = runtime.languages.clone();
+    languages.sort();
+    languages.dedup();
     let input = serde_json::to_vec(&(
         // Generations are local to one database. A copied or misplaced marker
         // must not certify another index with an equal generation number.
@@ -158,7 +161,8 @@ fn configuration(runtime: &Runtime) -> Result<String> {
         database.as_os_str().as_encoded_bytes(),
         &runtime.root,
         &runtime.config,
-        &runtime.languages,
+        &languages,
+        runtime.prune_repos,
         env!("CARGO_PKG_VERSION"),
         crate::index::SCHEMA_VERSION,
     ))?;
